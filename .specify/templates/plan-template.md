@@ -40,7 +40,12 @@
 
 *GATE: Must pass before Phase 0 research. Re-check after Phase 1 design.*
 
-[Gates determined based on constitution file]
+Verify compliance with:
+- All 7 **Core Principles** (immutable DNA — I through VII)
+- All applicable **Architecture Directives** (A1 through A8 — strong constraints)
+- Relevant **Technical Constraints** and **Development Process** rules
+
+Document any deviations in Complexity Tracking below.
 
 ## Project Structure
 

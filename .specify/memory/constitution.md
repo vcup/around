@@ -1,23 +1,42 @@
 <!--
   Sync Impact Report
   ==================
-  Version change: 1.7.0 → 1.8.0
-  Bump rationale: MINOR — architecture constraints expanded (LAN device sync,
-                   literate programming docs, ADR process).
-  Modified principles: None
-  Added sections: None
-  Removed sections: None
+  Version change: 1.8.0 → 2.0.0
+  Bump rationale: MAJOR — governance restructured from flat 16-principle list to
+                   three-layer hierarchy (Core Principles / Architecture Directives /
+                   Technical Constraints). Nine items demoted from principle status to
+                   directive or constraint level. This is a backward-incompatible
+                   governance change per the amendment procedure.
+  Restructuring map:
+    Retained as Core Principles:
+      I, II, III, IV → I, II, III, IV
+      VII → V (Unobtrusive Presence)
+      XII → VI (Privacy by Design)
+      XIII → VII (Beyond Local vs. Cloud)
+    Demoted to Architecture Directives:
+      VI (Powerful Configuration), VIII (Comprehensive Media Library),
+      IX (Protocol Diversity), X (Extreme Performance), XI (Data Resilience),
+      XIV (Federated Cloud Backend), XV (Comprehensive Observability),
+      XVI (Universal Audio Content)
+    Moved to Technical Constraints (Development Process):
+      V (Test-First Discipline, NON-NEGOTIABLE)
+  Removed sections: None (all content preserved, re-categorized)
   Templates requiring updates:
-    ✅ .specify/templates/plan-template.md — no changes needed
+    ⚠ .specify/templates/plan-template.md — Constitution Check should reference
+      the new Core Principles + Architecture Directives layer names
     ✅ .specify/templates/spec-template.md — no changes needed
     ✅ .specify/templates/tasks-template.md — no changes needed
     ✅ .specify/templates/checklist-template.md — no changes needed
-  Follow-up TODOs: None
+  Follow-up TODOs: Update plan-template.md Constitution Check section
 -->
 
 # around music player constitution
 
 ## Core Principles
+
+Core Principles define the immutable DNA of the `around` project. They are
+philosophical commitments that cannot be compromised without ceasing to be
+`around`. Changes to this section require a MAJOR version bump.
 
 ### I. Format Universality
 
@@ -104,53 +123,7 @@ rich GUI; a tiling WM user should have a TUI. Separating form-factor logic
 from the core playback engine keeps the binary size small for constrained
 environments.
 
-### V. Test-First Discipline (NON-NEGOTIABLE)
-
-All new functionality MUST follow Test-Driven Development:
-
-1. Write tests that define the expected behavior.
-2. Verify tests fail against the current implementation.
-3. Implement the minimum code to make tests pass.
-4. Refactor while keeping tests green.
-
-Contract tests for each `Decoder` and `Source` extension are mandatory —
-they MUST validate that every implementation satisfies its trait contract.
-Integration tests MUST cover end-to-end playback pipelines (source → decode →
-output) for at least one format per decoder family.
-
-**Rationale**: Audio playback involves complex pipelines with many failure modes
-(corrupt files, network interruptions, format edge cases). TDD ensures that
-every behavior is specified before implementation and that regressions are
-caught immediately.
-
-### VI. Powerful Configuration
-
-The configuration system MUST satisfy two competing goals simultaneously:
-**simplicity by default** and **extensibility without limit**.
-
-- **Zero-config startup**: The player MUST work out of the box with sensible
-  defaults. A first-time user MUST be able to play a file without touching any
-  configuration.
-- **Layered overrides**: Configuration MUST be read from a stack of sources
-  (hardcoded defaults → system-wide config → user config → environment variables
-  → CLI flags), with each layer overriding the previous.
-- **Hot reload**: Configuration changes MUST take effect at runtime without a
-  restart, wherever technically feasible. File-based config MUST be watched for
-  changes via filesystem events.
-- **Schema-driven**: The config schema MUST be formally defined (e.g., via
-  `serde` + a documented struct). Unknown keys MUST be rejected with a clear
-  error. Validation MUST happen at load time.
-- **Extension config**: Extensions MUST be able to declare their own
-  configuration namespaces. The core MUST merge and validate extension config
-  transparently.
-
-**Rationale**: A music player that works "anywhere" — from a headless server
-controlled via API to a desktop GUI — needs a config system that is dead-simple
-for the 90% case yet unbounded for power users. Layered overrides let the same
-binary behave as a server daemon, a TUI jukebox, or a desktop mini-player
-depending solely on configuration.
-
-### VII. Unobtrusive Presence ("around")
+### V. Unobtrusive Presence ("around")
 
 The player MUST embody the "around" philosophy: always available, never in the
 way.
@@ -176,138 +149,7 @@ philosophy. The player should feel ambient, present in the user's environment
 without demanding attention. Decoupling the engine from the UI is the
 architectural foundation for this: one engine, many faces.
 
-### VIII. Comprehensive Media Library
-
-around MUST maintain a full-featured media database that unifies all sources
-— local files, remote URLs, network streams, and attached devices — into a
-single coherent collection.
-
-- **Automatic indexing**: The library MUST scan configured directories and
-  remote endpoints, extracting and storing metadata for every track.
-- **Audio fingerprinting**: Acoustic fingerprints (via Chromaprint/AcoustID or
-  equivalent) MUST be computed for all tracks to (a) identify untagged or
-  mislabeled files and (b) detect duplicates across different formats, bitrates,
-  and encodings.
-- **Fuzzy rematching**: When files move or are renamed, the library MUST
-  re-associate them using a combination of path heuristics, metadata matching,
-  and acoustic fingerprints — not relying on fragile absolute paths alone.
-- **Unified view**: Whether a track resides on the local SSD, a mounted NAS, or
-  a remote HTTP endpoint, it MUST appear as an equal citizen in the library.
-  Remote tracks that become unavailable MUST be clearly indicated without
-  blocking the UI.
-- **Smart collections**: The library MUST support rule-based smart playlists,
-  tag hierarchies, ratings, play counts, skip counts, and last-played
-  timestamps. Recommendations based on listening history are a goal, not a
-  mandate for v1.
-- **Multi-layered discovery**: Discovery MUST operate at three independent
-  layers — (a) **local acoustic analysis** using extracted audio features
-  (BPM, key, spectral centroid, MFCCs) for similarity clustering and offline
-  radio; (b) **self-built recommendation models** trained on local play
-  history using collaborative filtering and content-based approaches, running
-  entirely offline; (c) **external service backends** (Last.fm, ListenBrainz,
-  streaming APIs) as pluggable extensions. Users MAY contribute anonymized
-  acoustic feature vectors and listening patterns to a shared analytics pool
-  to improve recommendations for all users — strictly opt-in.
-- **Scalability**: The library MUST perform acceptably with collections of
-  100,000+ tracks. Indexing and querying MUST use efficient on-disk structures
-  (SQLite or equivalent) rather than in-memory approaches.
-
-**Rationale**: A music player that unifies "all sources" needs a brain. Without
-a library, the player is merely a file opener with a remote fetcher — two
-disconnected experiences. The library is the gravitational center that makes
-"around" feel like one product, not a collection of features.
-
-### IX. Protocol Diversity
-
-The remote control surface of around MUST expose multiple protocols, each
-serving a different segment of the ecosystem:
-
-- **CLI**: A native `around` subcommand (e.g., `around play`, `around next`,
-  `around status --json`) for scripting and terminal users. MUST support both
-  human-readable and machine-parseable (JSON) output.
-- **HTTP REST + WebSocket**: A self-hosted HTTP server providing a RESTful API
-  for state query and mutation, plus a WebSocket endpoint for real-time events
-  (track change, playback progress, library scan status). This enables web
-  frontends and mobile companion apps.
-- **gRPC / Protobuf**: A binary protocol option using protobuf schemas for
-  clients that prioritize bandwidth efficiency and parsing speed over HTTP
-  verbosity. The protobuf schema MUST be the canonical data model for all
-  internal IPC.
-- **MPRIS**: Full D-Bus MPRIS2 compliance on Linux, enabling integration with
-  desktop environments, status bars, and other MPRIS-aware tools.
-- **Pluggable protocol extensions**: The IPC layer MUST expose a `Protocol`
-  trait so that additional control protocols (e.g., MQTT for IoT, REST for
-  smart speakers) can be added as extensions.
-
-All protocols MUST share a single backend — the same command dispatcher that
-processes a "play" request from CLI also serves the REST and gRPC endpoints.
-
-**Rationale**: "Any location" extends to any way of controlling the player. A
-user on SSH needs CLI; a web dashboard needs REST; a mobile app needs efficient
-binary framing; a Linux desktop expects MPRIS. Building one backend and
-projecting it through many protocol facades avoids the maintenance nightmare of
-parallel implementations.
-
-### X. Extreme Performance
-
-Performance is NOT an optimization target — it is a non-negotiable design
-constraint from day one.
-
-- **Audio pipeline latency**: End-to-end latency from source read to audio
-  output MUST be under 10ms on consumer hardware. DSP chains MUST add sub-1ms
-  per effect at typical settings.
-- **Memory budget**: The core engine MUST consume under 50MB resident memory
-  at idle (no playback, no library scan). Full playback with DSP chain MUST
-  stay under 100MB. The library index MUST use memory-mapped I/O rather than
-  loading datasets into RAM.
-- **CPU overhead**: At idle, the engine MUST consume under 0.1% CPU on modern
-  hardware. During playback with a typical DSP chain, CPU utilization MUST
-  stay under 5% of a single core (excluding format decoding, which varies by
-  codec).
-- **Startup time**: The engine MUST reach ready state in under 500ms cold
-  start, under 100ms warm start (process already resident).
-- **Binary size**: The minimal headless binary (core engine + basic transports)
-  MUST be under 10MB stripped. Feature-gated optional components (GUI, extended
-  codecs) may increase size proportionally.
-- **Benchmarking**: Every release MUST include benchmark results for the above
-  metrics. Regressions beyond 10% MUST be treated as blocking bugs.
-
-**Rationale**: A music player that runs "anywhere" includes constrained
-environments — Raspberry Pi, low-power home servers, ancient laptops.
-Bloat and latency are the enemies of ubiquity. Building performance in from
-the start prevents the inevitable "it got slow" rewrite.
-
-### XI. Data Resilience
-
-around MUST treat user data as sacred. No crash, power loss, disk failure, or
-user mistake should result in permanent loss of playlists, library metadata,
-or playback history.
-
-- **Crash safety**: All persistent state MUST be written atomically (write to
-  temp file, fsync, rename). SQLite with WAL mode is the recommended backend.
-  Corrupted state MUST be automatically detected and recovered from the last
-  known-good checkpoint.
-- **Automatic backups**: The library database MUST be backed up automatically
-  on a configurable schedule. Playlists MUST be exportable to standard formats
-  (M3U, XSPF). Backups MUST be self-contained — a single file or directory.
-- **Disk change resilience**: If a monitored directory is moved, renamed, or
-  remounted at a different path, the library MUST detect the change and
-  re-associate tracks using metadata and acoustic fingerprints. Users MUST be
-  able to remap mount points without losing their library.
-- **Graceful degradation**: If a remote source becomes unreachable, tracks from
-  that source MUST be marked as unavailable but NOT removed from the library.
-  Playlists containing unavailable tracks MUST continue to function, skipping
-  only the missing entries.
-- **No silent data loss**: Any operation that would delete user data (e.g.,
-  removing a library directory, clearing play history) MUST require explicit
-  confirmation and provide an undo path where technically feasible.
-
-**Rationale**: Music collections are built over decades. Losing a library
-database to a crash or disk migration should be unacceptable for any serious
-player. around positions itself as the user's music companion — that trust
-requires treating their data with the same care as a database system.
-
-### XII. Privacy by Design
+### VI. Privacy by Design
 
 around MUST be offline-first and privacy-respecting by default.
 
@@ -335,7 +177,7 @@ come from both the local-library world (privacy-sensitive) and the streaming
 world (convenience-oriented). around earns trust by defaulting to local-only and
 letting the user choose which bridges to the network they want to build.
 
-### XIII. Beyond Local vs. Cloud
+### VII. Beyond Local vs. Cloud
 
 around MUST reject the false dichotomy between "local-library-only" and
 "cloud-streaming-only" music players. Both paradigms have proven strengths, and
@@ -373,7 +215,164 @@ because each camp lacks what the other excels at. around's mission is to make
 switching unnecessary. By absorbing both paradigms, around eliminates the
 trade-off entirely: own what you love, discover what you don't yet know.
 
-### XIV. Federated Cloud Backend
+## Architecture Directives
+
+Architecture Directives define the strong architectural commitments that guide
+implementation. They are deliberately chosen and deeply considered, but MAY
+evolve as the project matures. Changes to this section require a MINOR version
+bump. Directives often reference Core Principles for their philosophical
+foundation.
+
+### A1. Powerful Configuration
+
+The configuration system MUST satisfy two competing goals simultaneously:
+**simplicity by default** and **extensibility without limit**.
+
+- **Zero-config startup**: The player MUST work out of the box with sensible
+  defaults. A first-time user MUST be able to play a file without touching any
+  configuration.
+- **Layered overrides**: Configuration MUST be read from a stack of sources
+  (hardcoded defaults → system-wide config → user config → environment variables
+  → CLI flags), with each layer overriding the previous.
+- **Hot reload**: Configuration changes MUST take effect at runtime without a
+  restart, wherever technically feasible. File-based config MUST be watched for
+  changes via filesystem events.
+- **Schema-driven**: The config schema MUST be formally defined (e.g., via
+  `serde` + a documented struct). Unknown keys MUST be rejected with a clear
+  error. Validation MUST happen at load time.
+- **Extension config**: Extensions MUST be able to declare their own
+  configuration namespaces. The core MUST merge and validate extension config
+  transparently.
+
+**Foundation**: Core Principle IV (Cross-Platform & Form-Factor) — the same
+binary must adapt to server, desktop, and terminal contexts. Core Principle V
+(Unobtrusive Presence) — configuration changes must not interrupt playback.
+
+### A2. Comprehensive Media Library
+
+around MUST maintain a full-featured media database that unifies all sources
+— local files, remote URLs, network streams, and attached devices — into a
+single coherent collection.
+
+- **Automatic indexing**: The library MUST scan configured directories and
+  remote endpoints, extracting and storing metadata for every track.
+- **Audio fingerprinting**: Acoustic fingerprints (via Chromaprint/AcoustID or
+  equivalent) MUST be computed for all tracks to (a) identify untagged or
+  mislabeled files and (b) detect duplicates across different formats, bitrates,
+  and encodings.
+- **Fuzzy rematching**: When files move or are renamed, the library MUST
+  re-associate them using a combination of path heuristics, metadata matching,
+  and acoustic fingerprints — not relying on fragile absolute paths alone.
+- **Unified view**: Whether a track resides on the local SSD, a mounted NAS, or
+  a remote HTTP endpoint, it MUST appear as an equal citizen in the library.
+  Remote tracks that become unavailable MUST be clearly indicated without
+  blocking the UI.
+- **Smart collections**: The library MUST support rule-based smart playlists,
+  tag hierarchies, ratings, play counts, skip counts, and last-played
+  timestamps.
+- **Multi-layered discovery**: Discovery MUST operate at three independent
+  layers — (a) **local acoustic analysis** using extracted audio features
+  (BPM, key, spectral centroid, MFCCs) for similarity clustering and offline
+  radio; (b) **self-built recommendation models** trained on local play
+  history using collaborative filtering and content-based approaches, running
+  entirely offline; (c) **external service backends** (Last.fm, ListenBrainz,
+  streaming APIs) as pluggable extensions. Users MAY contribute anonymized
+  acoustic feature vectors and listening patterns to a shared analytics pool
+  to improve recommendations for all users — strictly opt-in.
+- **Scalability**: The library MUST perform acceptably with collections of
+  100,000+ tracks. Indexing and querying MUST use efficient on-disk structures
+  (SQLite or equivalent) rather than in-memory approaches.
+
+**Foundation**: Core Principle II (Source Agnosticism), Core Principle VII
+(Beyond Local vs. Cloud). The library is the gravitational center that makes
+`around` feel like one product, not a collection of features.
+
+### A3. Protocol Diversity
+
+The remote control surface of around MUST expose multiple protocols, each
+serving a different segment of the ecosystem:
+
+- **CLI**: A native `around` subcommand (e.g., `around play`, `around next`,
+  `around status --json`) for scripting and terminal users. MUST support both
+  human-readable and machine-parseable (JSON) output.
+- **HTTP REST + WebSocket**: A self-hosted HTTP server providing a RESTful API
+  for state query and mutation, plus a WebSocket endpoint for real-time events
+  (track change, playback progress, library scan status). This enables web
+  frontends and mobile companion apps.
+- **gRPC / Protobuf**: A binary protocol option using protobuf schemas for
+  clients that prioritize bandwidth efficiency and parsing speed over HTTP
+  verbosity. The protobuf schema MUST be the canonical data model for all
+  internal IPC.
+- **MPRIS**: Full D-Bus MPRIS2 compliance on Linux, enabling integration with
+  desktop environments, status bars, and other MPRIS-aware tools.
+- **Pluggable protocol extensions**: The IPC layer MUST expose a `Protocol`
+  trait so that additional control protocols can be added as extensions.
+
+All protocols MUST share a single backend — the same command dispatcher that
+processes a "play" request from CLI also serves the REST and gRPC endpoints.
+
+**Foundation**: Core Principle IV (Cross-Platform & Form-Factor) — the player
+must be controllable from SSH, web dashboards, mobile apps, or desktop
+environments without duplicating logic.
+
+### A4. Extreme Performance
+
+Performance is NOT an optimization target — it is a non-negotiable design
+constraint from day one.
+
+- **Audio pipeline latency**: End-to-end latency from source read to audio
+  output MUST be under 10ms on consumer hardware. DSP chains MUST add sub-1ms
+  per effect at typical settings.
+- **Memory budget**: The core engine MUST consume under 50MB resident memory
+  at idle (no playback, no library scan). Full playback with DSP chain MUST
+  stay under 100MB. The library index MUST use memory-mapped I/O rather than
+  loading datasets into RAM.
+- **CPU overhead**: At idle, the engine MUST consume under 0.1% CPU on modern
+  hardware. During playback with a typical DSP chain, CPU utilization MUST
+  stay under 5% of a single core (excluding format decoding, which varies by
+  codec).
+- **Startup time**: The engine MUST reach ready state in under 500ms cold
+  start, under 100ms warm start (process already resident).
+- **Binary size**: The minimal headless binary (core engine + basic transports)
+  MUST be under 10MB stripped. Feature-gated optional components (GUI, extended
+  codecs) may increase size proportionally.
+- **Benchmarking**: Every release MUST include benchmark results for the above
+  metrics. Regressions beyond 10% MUST be treated as blocking bugs.
+
+**Foundation**: Core Principle III (Zero-Overhead Extensibility), Core
+Principle IV (Cross-Platform & Form-Factor — the player must run on constrained
+hardware like Raspberry Pi).
+
+### A5. Data Resilience
+
+around MUST treat user data as sacred. No crash, power loss, disk failure, or
+user mistake should result in permanent loss of playlists, library metadata,
+or playback history.
+
+- **Crash safety**: All persistent state MUST be written atomically (write to
+  temp file, fsync, rename). SQLite with WAL mode is the recommended backend.
+  Corrupted state MUST be automatically detected and recovered from the last
+  known-good checkpoint.
+- **Automatic backups**: The library database MUST be backed up automatically
+  on a configurable schedule. Playlists MUST be exportable to standard formats
+  (M3U, XSPF). Backups MUST be self-contained — a single file or directory.
+- **Disk change resilience**: If a monitored directory is moved, renamed, or
+  remounted at a different path, the library MUST detect the change and
+  re-associate tracks using metadata and acoustic fingerprints. Users MUST be
+  able to remap mount points without losing their library.
+- **Graceful degradation**: If a remote source becomes unreachable, tracks from
+  that source MUST be marked as unavailable but NOT removed from the library.
+  Playlists containing unavailable tracks MUST continue to function, skipping
+  only the missing entries.
+- **No silent data loss**: Any operation that would delete user data (e.g.,
+  removing a library directory, clearing play history) MUST require explicit
+  confirmation and provide an undo path where technically feasible.
+
+**Foundation**: Core Principle VI (Privacy by Design) — data sovereignty
+includes resilience. Core Principle VII (Beyond Local vs. Cloud) — a unified
+library that survives infrastructure changes.
+
+### A6. Federated Cloud Backend
 
 around MUST ship with an open-source, self-hostable cloud backend as part of
 the same repository. This backend provides all services that commercial music
@@ -415,19 +414,15 @@ shared playlists — but without platform lock-in.
   architecture MUST assume zero trust in any specific instance. Data
   portability between instances MUST be trivial.
 
-**Rationale**: The best music experiences today are locked inside walled
-gardens. Spotify knows what you love but won't let you take it anywhere; your
-local library is yours forever but lacks discovery. around's answer is not to
-build a better walled garden — it is to make the garden's blueprint public,
-let anyone run it, and connect them. Federation means a user's social graph
-and discovery network survive any single instance going offline. Open source
-means no rent-seeking on basic features.
+**Foundation**: Core Principle VI (Privacy by Design), Core Principle VII
+(Beyond Local vs. Cloud). Federation is the architectural answer to walled
+gardens — not a better walled garden, but a world where gardens connect.
 
-### XV. Comprehensive Observability
+### A7. Comprehensive Observability
 
 around MUST provide deep visibility into every layer of the system — from the
 audio pipeline to the federated backend — without degrading the performance
-guarantees of Principle X.
+guarantees of Directive A4.
 
 - **Structured logging**: All components MUST emit structured, machine-parseable
   log events via `tracing`. Log levels MUST be dynamically adjustable at runtime
@@ -450,16 +445,14 @@ guarantees of Principle X.
   state: current latency at each pipeline stage, DSP processing time per effect,
   buffer fill levels, and format decode throughput.
 - **Observability as data**: All metrics, traces, and profiles are themselves
-  subject to the data privacy guarantees of Principle XII. Telemetry of
+  subject to the data privacy guarantees of Core Principle VI. Telemetry of
   observability data to external services is opt-in only.
 
-**Rationale**: In a system this layered — codecs → DSP graph → routing matrix →
-IPC → protocol facade → federated backend — silent failures are the enemy.
-Without deep observability, a user reporting "playback stutters" could be
-debugging anything from a flaky network source to a misbehaving DSP plugin to
-CPU throttling. Structured observability makes the invisible visible.
+**Foundation**: Core Principle VI (Privacy by Design) — observability without
+surveillance. Directive A4 (Extreme Performance) — profiling must not degrade
+the thing being profiled.
 
-### XVI. Universal Audio Content
+### A8. Universal Audio Content
 
 around MUST treat all forms of audio content as first-class citizens.
 Artificial distinctions between "music," "podcasts," and "audiobooks" are
@@ -483,12 +476,20 @@ user-level conventions, not architectural boundaries.
   types. A smart playlist MAY mix music and podcast episodes. The queue MUST
   accept any content type. Filtering by type is available but never mandatory.
 
-**Rationale**: A user who listens to music, podcasts, and audiobooks does not
-want three separate applications with three separate play queues, three
-configuration systems, and three keyboard shortcut sets. Content is content.
-around's job is to play it — the user decides what "it" is.
+**Foundation**: Core Principle I (Format Universality) — if "all formats" is
+the commitment, "all content types" is the natural extension. Core Principle
+VII (Beyond Local vs. Cloud) — a podcast from an RSS feed should sit next
+to an album from local storage.
 
-## Architecture & Technology Constraints
+## Technical Constraints
+
+Technical Constraints define specific technology choices, engineering
+practices, and concrete quality thresholds. They are the most frequently
+updated layer — chosen deliberately for current context but expected to
+evolve with the ecosystem. Changes typically require a PATCH bump, but
+structural additions to this section require MINOR.
+
+### Language & Frameworks
 
 - **Language**: Rust (stable channel). The project targets the latest stable
   Rust compiler. The cloud backend shares the same Rust codebase — no
@@ -496,12 +497,37 @@ around's job is to play it — the user decides what "it" is.
 - **GUI Framework**: The desktop GUI MUST use `iced` — a pure-Rust, retained-mode
   GUI framework with no external rendering dependencies. All UI components MUST
   be `iced` widgets.
+- **Dependency Policy**: Pure Rust crates are preferred for all functionality.
+  C FFI bindings are acceptable only when no production-quality pure Rust
+  alternative exists in the target domain (e.g., certain audio codecs).
+  Each non-Rust dependency MUST be documented with its justification.
+  Transitive dependency trees MUST be audited for supply chain hygiene.
+
+### Audio Pipeline
+
 - **Audio Output & Routing**: Platform-native backends (CoreAudio on macOS,
   PulseAudio/ALSA/PipeWire on Linux, WASAPI on Windows). A cross-platform
   abstraction (e.g., `cpal`) may serve as the initial device interface. The
   audio graph MUST support a **routing matrix** — any source MAY be routed to
   any combination of output sinks (local device, virtual patchbay, network
   stream), with independent DSP chains per route.
+- **Playback Transitions**: The playback engine MUST support sample-accurate
+  gapless transitions (critical for classical, live albums, and DJ mixes).
+  Configurable crossfade duration with independent fade curves per track.
+  Beat-matched transitions (BPM-aware crossfading) are a goal for v1.
+  Transition effects MUST be implementable as extensions via the `Effect` trait.
+- **Lyrics Engine**: Lyrics MUST be sourced from embedded ID3/Vorbis tags,
+  external `.lrc` files, and pluggable online search backends. Display MUST
+  support synced word-by-word highlighting (karaoke mode) and translated
+  lyrics in a secondary language.
+- **Audio Visualization**: The GUI MUST include a GPU shader-driven audio
+  visualization engine. Real-time audio features (FFT bins, waveform samples,
+  beat detection) MUST be streamed to a GPU buffer. Users MAY write custom
+  GLSL/WGSL shaders for visualization. Visualization MUST have negligible
+  impact on playback performance.
+
+### Extension Ecosystem
+
 - **Plugin System**: Compile-time trait dispatch is the primary extension
   mechanism. Dynamic loading (`libloading`) is supported for third-party binary
   extensions. A stable C ABI is required at binary extension boundaries.
@@ -514,26 +540,33 @@ around's job is to play it — the user decides what "it" is.
   core. Security relies on user-audited trust: code signatures verify
   authorship and integrity, but no runtime sandboxing is enforced. The
   extension manager MUST display signature status and source provenance before
-  loading. Users are responsible for vetting extensions they install — the
-  tooling makes this information visible but does not make trust decisions on
-  the user's behalf.
+  loading.
+
+### Data & State
+
 - **Metadata**: The player MUST extract and display metadata (title, artist,
   album, cover art) via a shared `Metadata` trait. Metadata reading is part of
   the decoder contract. Audio fingerprinting MUST use an established acoustic
   fingerprinting library.
-- **Error Handling**: All fallible operations MUST return `Result` types. Panics
-  in extension code MUST be caught at the extension boundary and converted to
-  errors. The core MUST never crash due to a misbehaving extension.
-- **Concurrency**: Audio decoding and playback MUST occur off the main thread.
-  The UI thread MUST remain responsive at all times. The IPC dispatcher MUST
-  use a multi-producer, single-consumer channel architecture.
 - **Configuration Backend**: Configuration MUST use a layered, mergeable backend
   (e.g., `figment` or a custom merge chain). Schema MUST be defined via `serde`
   with exhaustive validation. Filesystem watching MUST use a cross-platform
   abstraction (e.g., `notify`).
+- **Error Handling**: All fallible operations MUST return `Result` types. Panics
+  in extension code MUST be caught at the extension boundary and converted to
+  errors. The core MUST never crash due to a misbehaving extension.
+
+### Concurrency & IPC
+
 - **Engine/UI Separation**: The playback engine MUST run in its own process or
   thread, exposing a structured IPC or in-process channel API that UIs consume.
   No UI code (TUI, GUI, CLI output) may live in the engine crate.
+- **Concurrency**: Audio decoding and playback MUST occur off the main thread.
+  The UI thread MUST remain responsive at all times. The IPC dispatcher MUST
+  use a multi-producer, single-consumer channel architecture.
+
+### Cross-Cutting Capabilities
+
 - **Internationalization**: All user-visible strings MUST be translatable via a
   standard i18n framework (e.g., Fluent). The architecture MUST support RTL
   languages. English is the fallback and default locale. Translations are
@@ -542,7 +575,21 @@ around's job is to play it — the user decides what "it" is.
   compatible with screen readers (NVDA, VoiceOver, Orca). TUI interfaces MUST
   function correctly in accessible terminal emulators. All interactive elements
   MUST expose accessible labels.
-- **Distribution**: The project MUST be distributable via: `cargo install`,
+- **Multi-Device Sync**: Two complementary models:
+  - **LAN Sync**: Local network synchronized playback across multiple around
+    instances on the same subnet. Uses multicast clock synchronization (PTP
+    or custom protocol) for sub-millisecond timing accuracy. No internet
+    required.
+  - **Federated Sync**: Cross-internet synchronized playback via the federated
+    backend (Directive A6). Clock synchronization over WAN with adaptive
+    buffering.
+  The audio routing matrix MUST support directing output to another around
+  instance (local or remote) as a first-class output sink. LAN sync is a v1
+  stretch goal; federated sync is deferred.
+
+### Distribution
+
+- **Distribution Channels**: The project MUST be distributable via: `cargo install`,
   pre-built GitHub Release binaries, Flatpak, AppImage, Homebrew, Docker, and
   system package managers (apt, rpm, pacman). The standard product name is the
   all-lowercase string `around` — never capitalized, never suffixed.
@@ -551,64 +598,112 @@ around's job is to play it — the user decides what "it" is.
   `cargo run`. The backend exposes the same gRPC/protobuf API that the CLI
   and GUI use internally — clients connect to a local or remote engine
   transparently.
-- **Playback Transitions**: The playback engine MUST support sample-accurate
-  gapless transitions (critical for classical, live albums, and DJ mixes).
-  Configurable crossfade duration with independent fade curves per track.
-  Beat-matched transitions (BPM-aware crossfading) are a goal for v1.
-  Transition effects MUST be implementable as extensions via the `Effect` trait.
-- **Lyrics Engine**: Lyrics MUST be sourced from embedded ID3/Vorbis tags,
-  external `.lrc` files, and pluggable online search backends. Display MUST
-  support synced word-by-word highlighting (karaoke mode) and translated
-  lyrics in a secondary language.
-- **Dependency Policy**: Pure Rust crates are preferred for all functionality.
-  C FFI bindings are acceptable only when no production-quality pure Rust
-  alternative exists in the target domain (e.g., certain audio codecs).
-  Each non-Rust dependency MUST be documented with its justification.
-  Transitive dependency trees MUST be audited for supply chain hygiene.
 - **Supply Chain Security**: Builds MUST be byte-reproducible. Every release
   MUST ship with a signed SBOM (Software Bill of Materials). Release
   artifacts MUST be cryptographically signed. CI MUST run `cargo vet` and
   `cargo deny` to block known-vulnerable or unvetted dependencies.
   Dependencies SHOULD be vendored for offline reproducibility.
-- **Audio Visualization**: The GUI MUST include a GPU shader-driven audio
-  visualization engine. Real-time audio features (FFT bins, waveform samples,
-  beat detection) MUST be streamed to a GPU buffer. Users MAY write custom
-  GLSL/WGSL shaders for visualization. Visualization MUST have negligible
-  impact on playback performance.
-- **Multi-Device Sync**: Two complementary models:
-  - **LAN Sync**: Local network synchronized playback across multiple around
-    instances on the same subnet. Uses multicast clock synchronization (PTP
-    or custom protocol) for sub-millisecond timing accuracy. No internet
-    required. Primary use case: multi-room or multi-speaker setups within a
-    single home.
-  - **Federated Sync**: Cross-internet synchronized playback via the federated
-    backend (Principle XIV). Clock synchronization over WAN with adaptive
-    buffering.
-  The audio routing matrix MUST support directing output to another around
-  instance (local or remote) as a first-class output sink. LAN sync is a v1
-  stretch goal; federated sync is deferred.
 - **Licensing**: The core and built-in extensions are licensed under the MIT
   license (see `LICENSE`). Third-party extensions may use any license.
 
-## Development Workflow & Quality Gates
+## Development Process
+
+These process-level rules govern how the project is built. They are not
+product commitments but engineering discipline standards.
+
+### Test-First Discipline (NON-NEGOTIABLE)
+
+All new functionality MUST follow Test-Driven Development:
+
+1. Write tests that define the expected behavior.
+2. Verify tests fail against the current implementation.
+3. Implement the minimum code to make tests pass.
+4. Refactor while keeping tests green.
+
+Contract tests for each `Decoder`, `Source`, `Effect`, and `Sink`
+implementation are mandatory — they MUST validate that every implementation
+satisfies its trait contract. Integration tests MUST cover end-to-end playback
+pipelines (source → decode → output) for at least one format per decoder
+family.
+
+**Rationale**: Audio playback involves complex pipelines with many failure modes
+(corrupt files, network interruptions, format edge cases). TDD ensures that
+every behavior is specified before implementation and that regressions are
+caught immediately.
+### Strive for Ideal Implementation
+
+Every implementation decision MUST push toward the most ideal outcome
+achievable within current constraints. When two goals appear to conflict,
+the preferred resolution is one that satisfies both — not a compromise
+that sacrifices one for the other.
+
+**Guidance by domain**:
+
+- **Testing**: Test infrastructure MUST be self-contained within the
+  repository. A developer MUST be able to clone and run `cargo test`
+  with zero system modifications beyond the Rust toolchain and platform
+  audio libraries. When a test requires infrastructure not available on
+  all systems (audio hardware, network services, GPU), provide
+  project-local virtual alternatives (null audio devices, mock servers)
+  that enable the test to run everywhere.
+
+- **Build**: Build scripts and tooling MUST NOT require system-level
+  packages beyond the target platform's standard offerings. Rarely-used
+  tools MUST have a documented fallback path.
+
+- **Configuration**: Defaults MUST work without creating files in the
+  user's home directory, system paths, or global state. User-controlled
+  config paths (e.g., `~/.config/around/config.kdl`) are acceptable when
+  explicitly documented as opt-in.
+
+- **Runtime**: The process MUST clean up artifacts it creates (IPC
+  sockets, temporary files, lock files). It MUST NOT modify global state
+  (environment variables, kernel modules, shared library paths) beyond
+  what is necessary for its documented function. On exit, the system
+  state MUST be equivalent to its state before invocation.
+
+**Scope**: This principle guides design decisions — it does not block
+them. When a genuine conflict exists (e.g., a required system library
+is unavailable), the implementation MUST degrade gracefully with a
+clear diagnostic, never crash or silently fail.
+
+**Enforcement**: Violations at review time are discussed, not
+automatically rejected. The principle sets the direction; each
+increment moves closer to the ideal.
+
+**Rationale**: Software that demands system modifications or leaves
+hidden state is fragile, non-portable, and hostile to contributors.
+Self-contained projects are forkable, CI-friendly, and trustworthy.
+The example of the ALSA null device (`ci/alsa-null.conf`) demonstrates
+that full-featured testing with zero system intrusion is achievable —
+it is the standard to which all infrastructure decisions are held.
+### Quality Gates
 
 - **Branching**: Feature branches are named `###-feature-name` and created via
   the speckit workflow. Direct commits to `master` are prohibited.
 - **Code Review**: Every change MUST be reviewed before merge. Reviews MUST
-  verify compliance with all applicable constitution principles.
+  verify compliance with all applicable Core Principles and Architecture
+  Directives.
 - **Architecture Decisions**: Major technical decisions (trait design, protocol
   choices, cross-cutting architectural changes) MUST be documented as ADRs
   (Architecture Decision Records) in `docs/adr/`. Each ADR captures the
   context, considered alternatives, chosen approach, and consequences.
   ADRs are immutable once merged; superseded ADRs reference their replacement.
-- **CI Gates** (applied to every PR and merge):
-  1. `cargo fmt --check` — formatting compliance.
-  2. `cargo clippy -- -D warnings` — lint compliance.
-  3. `cargo test` — all tests pass.
-  4. `cargo build --release` — release build succeeds on all target platforms.
-  5. `cargo bench` — performance benchmarks pass (no >10% regression).
-  6. `cargo vet` — all dependencies vetted.
-  7. `cargo deny check` — no banned licenses, no known vulnerabilities.
+
+### CI Gates
+
+Applied to every PR and merge:
+
+1. `cargo fmt --check` — formatting compliance.
+2. `cargo clippy -- -D warnings` — lint compliance.
+3. `cargo test` — all tests pass.
+4. `cargo build --release` — release build succeeds on all target platforms.
+5. `cargo bench` — performance benchmarks pass (no >10% regression vs. A4).
+6. `cargo vet` — all dependencies vetted.
+7. `cargo deny check` — no banned licenses, no known vulnerabilities.
+
+### Documentation & API Stability
+
 - **Test Coverage**: Contract tests are mandatory for every new `Decoder`,
   `Source`, `Effect`, or `Sink` implementation. Integration tests are mandatory
   for end-to-end playback pipelines. Unit tests are mandatory for all
@@ -623,7 +718,7 @@ around's job is to play it — the user decides what "it" is.
   `Effect`, or `Sink` are breaking and require a MAJOR version bump. Extension
   API additions require a MINOR bump. Internal refactors and fixes require a
   PATCH bump.
-- **API Stability**: During the pre-1.0 development phase, core traits may
+- **API Stability Path**: During the pre-1.0 development phase, core traits may
   evolve rapidly with no backward compatibility guarantees. Once the project
   reaches 1.0 maturity, the project transitions to a strict SemVer +
   deprecation-cycle model: breaking changes to stable traits MUST be
@@ -635,8 +730,10 @@ around's job is to play it — the user decides what "it" is.
 ## Governance
 
 This constitution supersedes all other development practices and conventions.
-Any deviation from these principles MUST be explicitly documented with a
-justification in the implementation plan's Complexity Tracking table.
+Any deviation from Core Principles MUST be explicitly documented with a
+justification. Deviations from Architecture Directives or Technical Constraints
+require an ADR. All deviations MUST be recorded in the implementation plan's
+Complexity Tracking table.
 
 **Project Governance**: around operates under a BDFL (Benevolent Dictator For
 Life) model. The project founder holds final decision-making authority on
@@ -651,15 +748,17 @@ architectural coherence and prevent design-by-committee.
 3. Update the version and `LAST_AMENDED_DATE`.
 4. Propagate changes to affected templates and guidance documents.
 
-**Versioning Policy**: `MAJOR.MINOR.PATCH` following semantic versioning:
-- **MAJOR**: Backward-incompatible governance changes, principle removals, or
-  trait contract changes.
-- **MINOR**: New principles, new sections, materially expanded guidance.
-- **PATCH**: Clarifications, wording fixes, non-semantic refinements.
+**Layer-Specific Versioning**:
+- **MAJOR**: Backward-incompatible governance changes, Core Principle removals
+  or redefinitions, or trait contract changes.
+- **MINOR**: New Architecture Directives, new Technical Constraints sections,
+  materially expanded guidance at any layer.
+- **PATCH**: Clarifications, wording fixes, Technical Constraint threshold
+  adjustments, non-semantic refinements.
 
 **Compliance Review**: Every PR description MUST include a "Constitution
-Compliance" section confirming adherence to each principle. Reviewers MUST
-reject PRs that violate non-negotiable principles without documented
-justification.
+Compliance" section confirming adherence to each Core Principle and relevant
+Architecture Directives. Reviewers MUST reject PRs that violate non-negotiable
+process rules (see Development Process) without documented justification.
 
-**Version**: 1.8.0 | **Ratified**: 2026-05-26 | **Last Amended**: 2026-05-26
+**Version**: 2.0.0 | **Ratified**: 2026-05-26 | **Last Amended**: 2026-05-26
