@@ -4,6 +4,8 @@ use around_core::Source;
 use around_engine::{Engine, EngineConfig};
 use around_source_file::FileSource;
 use clap::{Parser, Subcommand};
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -26,6 +28,25 @@ enum Commands {
     /// Path to the audio file
     path: PathBuf,
   },
+
+  /// Pause playback
+  Pause,
+
+  /// Resume playback
+  Resume,
+
+  /// Seek to a position (in seconds)
+  Seek {
+    /// Position in seconds
+    #[arg(short, long)]
+    position: f64,
+  },
+
+  /// Stop playback
+  Stop,
+
+  /// Show playback status
+  Status,
 }
 
 fn main() {
@@ -42,6 +63,36 @@ fn main() {
   match cli.command {
     Commands::Play { path } => {
       if let Err(e) = cmd_play(path) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+      }
+    }
+    Commands::Pause => {
+      if let Err(e) = cmd_pause() {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+      }
+    }
+    Commands::Resume => {
+      if let Err(e) = cmd_resume() {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+      }
+    }
+    Commands::Seek { position } => {
+      if let Err(e) = cmd_seek(position) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+      }
+    }
+    Commands::Stop => {
+      if let Err(e) = cmd_stop() {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+      }
+    }
+    Commands::Status => {
+      if let Err(e) = cmd_status() {
         eprintln!("error: {}", e);
         std::process::exit(1);
       }
@@ -88,5 +139,58 @@ fn cmd_play(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     }
   }
 
+  Ok(())
+}
+
+/// Send a JSON command to the engine via Unix socket and read the response.
+fn send_ipc_command(
+  req: &serde_json::Value,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+  let mut stream = UnixStream::connect("/tmp/around.sock")?;
+
+  let request = req.to_string();
+  stream.write_all(request.as_bytes())?;
+  stream.write_all(b"\n")?;
+
+  let mut buf = String::new();
+  stream.read_to_string(&mut buf)?;
+
+  let response: serde_json::Value = serde_json::from_str(&buf)?;
+  Ok(response)
+}
+
+fn cmd_pause() -> Result<(), Box<dyn std::error::Error>> {
+  let req = serde_json::json!({"command": "pause"});
+  let resp = send_ipc_command(&req)?;
+  println!("{}", resp);
+  Ok(())
+}
+
+fn cmd_resume() -> Result<(), Box<dyn std::error::Error>> {
+  let req = serde_json::json!({"command": "resume"});
+  let resp = send_ipc_command(&req)?;
+  println!("{}", resp);
+  Ok(())
+}
+
+fn cmd_seek(position: f64) -> Result<(), Box<dyn std::error::Error>> {
+  let position_ms = (position * 1000.0) as u64;
+  let req = serde_json::json!({"command": "seek", "position_ms": position_ms});
+  let resp = send_ipc_command(&req)?;
+  println!("{}", resp);
+  Ok(())
+}
+
+fn cmd_stop() -> Result<(), Box<dyn std::error::Error>> {
+  let req = serde_json::json!({"command": "stop"});
+  let resp = send_ipc_command(&req)?;
+  println!("{}", resp);
+  Ok(())
+}
+
+fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
+  let req = serde_json::json!({"command": "status"});
+  let resp = send_ipc_command(&req)?;
+  println!("{}", serde_json::to_string_pretty(&resp)?);
   Ok(())
 }
