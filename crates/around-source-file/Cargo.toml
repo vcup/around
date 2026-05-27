@@ -1,0 +1,10 @@
+[package]
+name = "around-source-file"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[dependencies]
+around-core = { path = "../around-core" }

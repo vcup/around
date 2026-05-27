@@ -1,0 +1,10 @@
+[package]
+name = "around-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[dependencies]
+bitflags = "2"

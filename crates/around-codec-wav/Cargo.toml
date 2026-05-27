@@ -1,0 +1,14 @@
+[package]
+name = "around-codec-wav"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+around-core = { path = "../around-core" }
+symphonia = { version = "0.5", default-features = false, features = ["wav"] }

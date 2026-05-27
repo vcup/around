@@ -1,0 +1,13 @@
+[package]
+name = "simple-decoder"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+around-core = { path = "../../crates/around-core" }
