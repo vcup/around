@@ -2,6 +2,7 @@
 
 use crate::config::{select_decoder, EngineConfig};
 use around_core::Decoder;
+use around_core::DecoderFactory;
 use around_core::{AroundError, Metadata, SampleSpec, Source};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

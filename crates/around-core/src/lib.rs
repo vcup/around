@@ -12,6 +12,7 @@ pub mod types;
 
 // Re-export all public types at crate root for convenience
 pub use decoder::{Decoder, SourceRequirements};
+pub use decoder::{DecoderFactory, ErasedDecoder};
 pub use error::AroundError;
 pub use metadata::Metadata;
 pub use source::{FormatSignature, Source, SourceCapabilities};

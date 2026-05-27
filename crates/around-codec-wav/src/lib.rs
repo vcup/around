@@ -1,7 +1,8 @@
 //! around-codec-wav: Built-in WAV decoder.
 
 use around_core::{
-  AroundError, Decoder, FormatSignature, Metadata, SampleSpec, Source, SourceRequirements,
+  AroundError, Decoder, DecoderFactory, FormatSignature, Metadata, SampleSpec, Source,
+  SourceRequirements,
 };
 use std::io::Read;
 use std::sync::LazyLock;
@@ -150,7 +151,7 @@ impl WavDecoder {
   }
 }
 
-impl Decoder for WavDecoder {
+impl DecoderFactory for WavDecoder {
   fn supported_formats() -> &'static [FormatSignature] {
     &WAV_FORMATS
   }
@@ -182,7 +183,9 @@ impl Decoder for WavDecoder {
       position: 0,
     })
   }
+}
 
+impl Decoder for WavDecoder {
   fn read(&mut self, buf: &mut [f32]) -> Result<Option<usize>, AroundError> {
     if self.position >= self.samples.len() {
       return Ok(None);

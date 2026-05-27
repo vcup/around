@@ -47,6 +47,14 @@ enum Commands {
 
   /// Show playback status
   Status,
+
+  /// Load a decoder extension from a shared library file
+  LoadDecoder {
+    /// Path to the shared library (.so/.dylib/.dll)
+    path: PathBuf,
+  },
+  /// List all loaded decoder extensions
+  ListDecoders,
 }
 
 fn main() {
@@ -93,6 +101,18 @@ fn main() {
     }
     Commands::Status => {
       if let Err(e) = cmd_status() {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+      }
+    }
+    Commands::LoadDecoder { path } => {
+      if let Err(e) = cmd_load_decoder(path) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+      }
+    }
+    Commands::ListDecoders => {
+      if let Err(e) = cmd_list_decoders() {
         eprintln!("error: {}", e);
         std::process::exit(1);
       }
@@ -192,5 +212,31 @@ fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
   let req = serde_json::json!({"command": "status"});
   let resp = send_ipc_command(&req)?;
   println!("{}", serde_json::to_string_pretty(&resp)?);
+  Ok(())
+}
+
+fn cmd_load_decoder(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+  let req = serde_json::json!({"command": "load_decoder", "path": path.display().to_string()});
+  let resp = send_ipc_command(&req)?;
+  if resp["status"] == "ok" {
+    println!("decoder loaded: {}", serde_json::to_string_pretty(&resp)?);
+  } else {
+    eprintln!("error: {} - {}", resp["code"], resp["message"]);
+    std::process::exit(1);
+  }
+  Ok(())
+}
+
+fn cmd_list_decoders() -> Result<(), Box<dyn std::error::Error>> {
+  let req = serde_json::json!({"command": "list_decoders"});
+  let resp = send_ipc_command(&req)?;
+  if resp["status"] == "ok" {
+    if let Some(decoders) = resp.get("decoders") {
+      println!("{}", serde_json::to_string_pretty(decoders)?);
+    }
+  } else {
+    eprintln!("error: {} - {}", resp["code"], resp["message"]);
+    std::process::exit(1);
+  }
   Ok(())
 }

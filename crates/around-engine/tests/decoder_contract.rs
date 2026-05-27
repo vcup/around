@@ -1,3 +1,4 @@
+use around_core::DecoderFactory;
 use around_core::{Decoder, Source, SourceRequirements};
 use around_source_file::FileSource;
 use std::path::PathBuf;

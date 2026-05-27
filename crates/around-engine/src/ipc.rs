@@ -4,6 +4,7 @@
 //! Each connection processes commands sequentially; multiple concurrent
 //! connections are supported via per-connection tasks.
 
+use crate::extensions::ExtensionManager;
 use crate::pipeline::Engine;
 use around_core::{AroundError, SampleSpec};
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,10 @@ pub enum IpcCommand {
   Status,
   #[serde(rename = "list_decoders")]
   ListDecoders,
+  #[serde(rename = "load_decoder")]
+  LoadDecoder { path: String },
+  #[serde(rename = "load_decoder_bytes")]
+  LoadDecoderBytes { data: String, name: String },
 }
 
 /// Outgoing IPC response; all fields optional except `status`.
@@ -111,13 +116,15 @@ pub async fn run_ipc_server(
   tracing::info!("IPC server listening on {}", socket_path);
 
   let state = Arc::new(Mutex::new(PlaybackState::default()));
+  let ext_mgr = Arc::new(ExtensionManager::new());
 
   loop {
     let (stream, _) = listener.accept().await?;
     let eng = engine.clone();
     let st = state.clone();
+    let ext = ext_mgr.clone();
     tokio::spawn(async move {
-      if let Err(e) = handle_connection(stream, eng, st).await {
+      if let Err(e) = handle_connection(stream, eng, st, ext).await {
         tracing::error!(?e, "IPC connection error");
       }
     });
@@ -132,6 +139,7 @@ async fn handle_connection(
   stream: UnixStream,
   engine: Arc<Engine>,
   state: Arc<Mutex<PlaybackState>>,
+  ext_mgr: Arc<ExtensionManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   let (reader, mut writer) = stream.into_split();
   let mut lines = BufReader::new(reader).lines();
@@ -151,7 +159,7 @@ async fn handle_connection(
       }
     };
 
-    let resp = handle_command(cmd, &engine, &state).await;
+    let resp = handle_command(cmd, &engine, &state, &ext_mgr).await;
     send_response(&mut writer, &resp).await?;
   }
 
@@ -177,6 +185,7 @@ async fn handle_command(
   cmd: IpcCommand,
   engine: &Arc<Engine>,
   state: &Arc<Mutex<PlaybackState>>,
+  ext_mgr: &Arc<ExtensionManager>,
 ) -> IpcResponse {
   match cmd {
     IpcCommand::Play { path } => handle_play(engine, state, path).await,
@@ -185,7 +194,9 @@ async fn handle_command(
     IpcCommand::Seek { position_ms } => handle_seek(state, position_ms),
     IpcCommand::Stop => handle_stop(engine, state),
     IpcCommand::Status => handle_status(state),
-    IpcCommand::ListDecoders => handle_list_decoders(),
+    IpcCommand::ListDecoders => handle_list_decoders(ext_mgr),
+    IpcCommand::LoadDecoder { path } => handle_load_decoder(ext_mgr, &path),
+    IpcCommand::LoadDecoderBytes { data, name } => handle_load_decoder_bytes(ext_mgr, &data, &name),
   }
 }
 
@@ -301,14 +312,71 @@ fn handle_status(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
   resp
 }
 
-fn handle_list_decoders() -> IpcResponse {
+fn handle_list_decoders(ext_mgr: &Arc<ExtensionManager>) -> IpcResponse {
+  let decoders = ext_mgr.list_decoders();
   let mut resp = IpcResponse::ok();
-  resp.decoders = Some(vec![serde_json::json!({
-      "name": "wav-builtin",
-      "formats": ["WAV"],
-      "source": "builtin",
-  })]);
+  resp.decoders = Some(
+    decoders
+      .iter()
+      .map(|d| {
+        serde_json::json!({
+            "name": d.name,
+            "formats": d.formats,
+            "source": d.source,
+        })
+      })
+      .collect(),
+  );
   resp
+}
+
+fn handle_load_decoder(ext_mgr: &Arc<ExtensionManager>, path: &str) -> IpcResponse {
+  match ext_mgr.load_path(std::path::Path::new(path)) {
+    Ok(info) => {
+      let mut resp = IpcResponse::ok();
+      resp.decoders = Some(vec![serde_json::json!({
+          "name": info.name,
+          "formats": info.formats,
+          "source": info.source,
+          "path": info.path.map(|p| p.display().to_string()),
+      })]);
+      resp
+    }
+    Err(e) => {
+      let (code, msg) = map_decoder_error(&e);
+      IpcResponse::error(code, &msg)
+    }
+  }
+}
+
+fn handle_load_decoder_bytes(
+  ext_mgr: &Arc<ExtensionManager>,
+  data: &str,
+  name: &str,
+) -> IpcResponse {
+  match ext_mgr.load_bytes(data.as_bytes(), name) {
+    Ok(info) => {
+      let mut resp = IpcResponse::ok();
+      resp.decoders = Some(vec![serde_json::json!({
+          "name": info.name,
+          "formats": info.formats,
+          "source": info.source,
+      })]);
+      resp
+    }
+    Err(e) => {
+      let (code, msg) = map_decoder_error(&e);
+      IpcResponse::error(code, &msg)
+    }
+  }
+}
+
+/// Map a decoder-related error to an IPC error code.
+fn map_decoder_error(e: &AroundError) -> (&'static str, String) {
+  match e {
+    AroundError::DecoderLoadFailed { .. } => ("DECODER_LOAD_FAILED", e.to_string()),
+    _ => ("INTERNAL", e.to_string()),
+  }
 }
 
 // ---------------------------------------------------------------------------
