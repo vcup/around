@@ -5,19 +5,22 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license-file.workspace = true
+rust-version.workspace = true
+[lints]
+workspace = true
 
 [[bin]]
 name = "around"
 path = "src/main.rs"
 
 [dependencies]
-around-core = { path = "../around-core" }
-around-engine = { path = "../around-engine" }
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["net", "io-util", "rt", "sync", "macros"] }
-serde_json = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+around-core = { workspace = true }
+around-engine = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "macros"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
-around-source-file = { path = "../around-source-file" }
-ctrlc = "3"
+around-source-file = { workspace = true }
+ctrlc = { workspace = true }

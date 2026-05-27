@@ -5,9 +5,12 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license-file.workspace = true
+rust-version.workspace = true
+[lints]
+workspace = true
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-around-core = { path = "../../crates/around-core" }
+around-core = { workspace = true }

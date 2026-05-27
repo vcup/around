@@ -1,0 +1,3 @@
+[alias]
+lint = "clippy --workspace --all-targets -- -D warnings"
+fmtcheck = "fmt --all -- --check"

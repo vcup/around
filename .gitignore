@@ -1,2 +1,16 @@
-target/
-/.idea
+/target
+**/*.rs.bk
+
+# macOS junk
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+.fleet/
+.helix/
+*.code-workspace
+
+# direnv
+.direnv/
+.envrc

@@ -5,10 +5,14 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license-file.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
 
 [lib]
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
-around-core = { path = "../around-core" }
-symphonia = { version = "0.5", default-features = false, features = ["wav"] }
+around-core = { workspace = true }
+symphonia = { workspace = true, features = ["wav"] }

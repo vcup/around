@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 repository.workspace = true
 license-file.workspace = true
+rust-version.workspace = true
 
+[lints]
+workspace = true
 [dependencies]
-around-core = { path = "../around-core" }
+around-core = { workspace = true }
