@@ -59,7 +59,9 @@ impl fmt::Display for AroundError {
         }
       }
       Self::Internal { message } => write!(f, "internal error: {}", message),
-      Self::SourceAlreadyConsumed { source } => write!(f, "source '{}' already consumed", source),
+      Self::SourceAlreadyConsumed { source } => {
+        write!(f, "source '{}' already consumed", source)
+      }
     }
   }
 }

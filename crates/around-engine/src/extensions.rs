@@ -37,6 +37,12 @@ pub struct ExtensionManager {
   entries: Mutex<HashMap<String, DecoderEntry>>,
 }
 
+impl Default for ExtensionManager {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
 impl ExtensionManager {
   pub fn new() -> Self {
     Self {
@@ -154,7 +160,7 @@ impl ExtensionManager {
           let path = entry.path();
           if path
             .extension()
-            .map_or(false, |e| e == "so" || e == "dylib" || e == "dll")
+            .is_some_and(|e| e == "so" || e == "dylib" || e == "dll")
           {
             if let Ok(mut info) = self.load_path(&path) {
               let mut entries = self.entries.lock().unwrap();
