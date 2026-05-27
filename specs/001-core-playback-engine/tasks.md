@@ -20,16 +20,16 @@
 
 **Purpose**: Initialize the Rust workspace and all crate scaffolds
 
-- [ ] T001 Create root Cargo.toml workspace manifest at /Cargo.toml with 7 members (around-core, around-engine, around-cli, around-codec-wav, around-codec-test-pcm, around-source-file, examples/simple_decoder)
-- [ ] T002 [P] Create around-core crate scaffold (zero-dependency traits/type crate) at crates/around-core/Cargo.toml and crates/around-core/src/lib.rs
-- [ ] T003 [P] Create around-engine crate scaffold (pipeline, IPC, extensions) at crates/around-engine/Cargo.toml and crates/around-engine/src/lib.rs
-- [ ] T004 [P] Create around-cli crate scaffold (CLI binary) at crates/around-cli/Cargo.toml and crates/around-cli/src/main.rs
-- [ ] T005 [P] Create around-codec-wav crate scaffold (built-in WAV decoder) at crates/around-codec-wav/Cargo.toml and crates/around-codec-wav/src/lib.rs
-- [ ] T006 [P] Create around-codec-test-pcm crate scaffold (test PCM decoder) at crates/around-codec-test-pcm/Cargo.toml and crates/around-codec-test-pcm/src/lib.rs
-- [ ] T007 [P] Create around-source-file crate scaffold (filesystem Source) at crates/around-source-file/Cargo.toml and crates/around-source-file/src/lib.rs
-- [ ] T008 [P] Create test directory structure at tests/contract/, tests/integration/, and examples/
-- [ ] T009 [P] Generate test WAV fixtures: a valid file at examples/example.wav, a truncated copy at examples/truncated.wav, and a zero-byte file at examples/zero.wav
-- [ ] T010 Verify workspace compiles cleanly with `cargo build`
+- [X] T001 Create root Cargo.toml workspace manifest at /Cargo.toml with 7 members (around-core, around-engine, around-cli, around-codec-wav, around-codec-test-pcm, around-source-file, examples/simple_decoder)
+- [X] T002 [P] Create around-core crate scaffold (zero-dependency traits/type crate) at crates/around-core/Cargo.toml and crates/around-core/src/lib.rs
+- [X] T003 [P] Create around-engine crate scaffold (pipeline, IPC, extensions) at crates/around-engine/Cargo.toml and crates/around-engine/src/lib.rs
+- [X] T004 [P] Create around-cli crate scaffold (CLI binary) at crates/around-cli/Cargo.toml and crates/around-cli/src/main.rs
+- [X] T005 [P] Create around-codec-wav crate scaffold (built-in WAV decoder) at crates/around-codec-wav/Cargo.toml and crates/around-codec-wav/src/lib.rs
+- [X] T006 [P] Create around-codec-test-pcm crate scaffold (test PCM decoder) at crates/around-codec-test-pcm/Cargo.toml and crates/around-codec-test-pcm/src/lib.rs
+- [X] T007 [P] Create around-source-file crate scaffold (filesystem Source) at crates/around-source-file/Cargo.toml and crates/around-source-file/src/lib.rs
+- [X] T008 [P] Create test directory structure at tests/contract/, tests/integration/, and examples/
+- [X] T009 [P] Generate test WAV fixtures: a valid file at examples/example.wav, a truncated copy at examples/truncated.wav, and a zero-byte file at examples/zero.wav
+- [X] T010 Verify workspace compiles cleanly with `cargo build`
 
 ---
 
@@ -39,20 +39,20 @@
 
 **⚠️ CRITICAL**: No crate may reference these types until this phase is complete
 
-- [ ] T011 [P] Implement BitDepth, SampleRate, ChannelLayout type aliases with well-known constants in crates/around-core/src/types.rs
-- [ ] T012 [P] Implement ContentType newtype with well-known string constants (MUSIC, PODCAST, AUDIOBOOK, RADIO, LIVE_STREAM, AMBIENT) in crates/around-core/src/types.rs
-- [ ] T013 [P] Implement AudioFormat struct (container, codec, mime_type, sample_spec, bitrate) in crates/around-core/src/types.rs
-- [ ] T014 [P] Implement SampleSpec struct (sample_rate, channels, bit_depth) with validation (rate>0, channels 1..=32) in crates/around-core/src/types.rs
-- [ ] T015 [P] Implement ExtensionSource type alias with constants (SOURCE_BUILTIN through SOURCE_DISCOVERED) in crates/around-core/src/types.rs
-- [ ] T016 [P] Implement PlaybackStatus type alias with constants (PLAYING, PAUSED, STOPPED) in crates/around-core/src/state.rs
-- [ ] T017 [P] Implement Metadata struct (title, artist, album, duration, genre) in crates/around-core/src/metadata.rs
-- [ ] T018 Implement AroundError enum with variants (FileNotFound, UnsupportedFormat, DecodeError, SourceIncompatible, NoTrack, DecoderLoadFailed, Internal, SourceAlreadyConsumed) in crates/around-core/src/error.rs
-- [ ] T019 [P] Implement SourceCapabilities bitflags (NONE, MULTI_OPEN, SEEKABLE) in crates/around-core/src/source.rs
-- [ ] T020 [P] Implement SourceRequirements bitflags (NONE, SEEKABLE, KNOWN_LENGTH, KNOWN_CONTENT_TYPE) and FormatSignature struct in crates/around-core/src/decoder.rs
-- [ ] T021 Implement Source trait (capabilities, open, content_length, content_type, identifier) in crates/around-core/src/source.rs
-- [ ] T022 Implement Decoder trait (supported_formats, source_requirements, can_decode, open, read, seek, metadata, output_format) in crates/around-core/src/decoder.rs
-- [ ] T023 Wire module declarations (types, state, metadata, error, source, decoder) and export all public items in crates/around-core/src/lib.rs
-- [ ] T024 Verify around-core compiles with `cargo build -p around-core`
+- [X] T011 [P] Implement BitDepth, SampleRate, ChannelLayout type aliases with well-known constants in crates/around-core/src/types.rs
+- [X] T012 [P] Implement ContentType newtype with well-known string constants (MUSIC, PODCAST, AUDIOBOOK, RADIO, LIVE_STREAM, AMBIENT) in crates/around-core/src/types.rs
+- [X] T013 [P] Implement AudioFormat struct (container, codec, mime_type, sample_spec, bitrate) in crates/around-core/src/types.rs
+- [X] T014 [P] Implement SampleSpec struct (sample_rate, channels, bit_depth) with validation (rate>0, channels 1..=32) in crates/around-core/src/types.rs
+- [X] T015 [P] Implement ExtensionSource type alias with constants (SOURCE_BUILTIN through SOURCE_DISCOVERED) in crates/around-core/src/types.rs
+- [X] T016 [P] Implement PlaybackStatus type alias with constants (PLAYING, PAUSED, STOPPED) in crates/around-core/src/state.rs
+- [X] T017 [P] Implement Metadata struct (title, artist, album, duration, genre) in crates/around-core/src/metadata.rs
+- [X] T018 Implement AroundError enum with variants (FileNotFound, UnsupportedFormat, DecodeError, SourceIncompatible, NoTrack, DecoderLoadFailed, Internal, SourceAlreadyConsumed) in crates/around-core/src/error.rs
+- [X] T019 [P] Implement SourceCapabilities bitflags (NONE, MULTI_OPEN, SEEKABLE) in crates/around-core/src/source.rs
+- [X] T020 [P] Implement SourceRequirements bitflags (NONE, SEEKABLE, KNOWN_LENGTH, KNOWN_CONTENT_TYPE) and FormatSignature struct in crates/around-core/src/decoder.rs
+- [X] T021 Implement Source trait (capabilities, open, content_length, content_type, identifier) in crates/around-core/src/source.rs
+- [X] T022 Implement Decoder trait (supported_formats, source_requirements, can_decode, open, read, seek, metadata, output_format) in crates/around-core/src/decoder.rs
+- [X] T023 Wire module declarations (types, state, metadata, error, source, decoder) and export all public items in crates/around-core/src/lib.rs
+- [X] T024 Verify around-core compiles with `cargo build -p around-core`
 
 **Checkpoint**: Foundation ready — all types and trait contracts defined. User story implementation can now begin.
 
@@ -66,21 +66,21 @@
 
 ### Contract Tests for User Story 1 (write FIRST, ensure they FAIL)
 
-- [ ] T025 [P] [US1] Write Decoder trait contract tests in tests/contract/decoder.rs — verify format honesty, source requirements gating, idempotent detection, open-or-fail, f32 PCM output, seek contract, metadata availability, no-panic on corrupt stream, using test fixtures from examples/
-- [ ] T026 [P] [US1] Write Source trait contract tests in tests/contract/source.rs — verify open-or-fail, length honesty, MULTI_OPEN semantics, SEEKABLE capability, no I/O in metadata methods, identifier stability, second-open rejection for single-shot sources, using test fixtures from examples/
+- [X] T025 [P] [US1] Write Decoder trait contract tests in tests/contract/decoder.rs — verify format honesty, source requirements gating, idempotent detection, open-or-fail, f32 PCM output, seek contract, metadata availability, no-panic on corrupt stream, using test fixtures from examples/
+- [X] T026 [P] [US1] Write Source trait contract tests in tests/contract/source.rs — verify open-or-fail, length honesty, MULTI_OPEN semantics, SEEKABLE capability, no I/O in metadata methods, identifier stability, second-open rejection for single-shot sources, using test fixtures from examples/
 
 ### Implementation for User Story 1
 
-- [ ] T027 [US1] Implement local filesystem Source with MULTI_OPEN | SEEKABLE capabilities in crates/around-source-file/src/lib.rs
-- [ ] T028 [US1] Implement WAV decoder using symphonia (implements Decoder trait, SourceRequirements::SEEKABLE | KNOWN_LENGTH, PCM→f32 conversion) in crates/around-codec-wav/src/lib.rs
-- [ ] T029 [US1] Implement format detection function (extension-first, magic bytes fallback, magic-bytes-wins-with-warning) in crates/around-engine/src/config.rs
-- [ ] T030 [US1] Implement audio pipeline engine (Source::open → decoder selection → Decoder::read → cpal output callback, separate OS thread for pipeline) in crates/around-engine/src/pipeline.rs
-- [ ] T031 [US1] Implement KDL layered config loading (compiled defaults → ~/.config/around/config.kdl → CLI overrides, unknown-key rejection via knuffel) in crates/around-engine/src/config.rs
-- [ ] T032 [US1] Implement platform audio output backends via cpal (mod.rs + linux.rs/macos.rs/windows.rs stubs) in crates/around-engine/src/platform/
-- [ ] T033 [US1] Implement `around play <path>` CLI subcommand using clap in crates/around-cli/src/main.rs
-- [ ] T034 [US1] Implement Ctrl+C signal handler (graceful stop, clean process exit within 500ms per SC-008) in crates/around-cli/src/main.rs
-- [ ] T035 [US1] Implement structured tracing spans/events (source_open, decode_start, decode_end, output_buffer_fill, errors) with configurable RUST_LOG level in crates/around-engine/src/pipeline.rs
-- [ ] T036 [US1] Write integration test for end-to-end WAV playback pipeline in tests/integration/playback_pipeline.rs — verify play to completion, missing file error, corrupt file error
+- [X] T027 [US1] Implement local filesystem Source with MULTI_OPEN | SEEKABLE capabilities in crates/around-source-file/src/lib.rs
+- [X] T028 [US1] Implement WAV decoder using symphonia (implements Decoder trait, SourceRequirements::SEEKABLE | KNOWN_LENGTH, PCM→f32 conversion) in crates/around-codec-wav/src/lib.rs
+- [X] T029 [US1] Implement format detection function (extension-first, magic bytes fallback, magic-bytes-wins-with-warning) in crates/around-engine/src/config.rs
+- [X] T030 [US1] Implement audio pipeline engine (Source::open → decoder selection → Decoder::read → cpal output callback, separate OS thread for pipeline) in crates/around-engine/src/pipeline.rs
+- [X] T031 [US1] Implement KDL layered config loading (compiled defaults → ~/.config/around/config.kdl → CLI overrides, unknown-key rejection via knuffel) in crates/around-engine/src/config.rs
+- [X] T032 [US1] Implement platform audio output backends via cpal (mod.rs + linux.rs/macos.rs/windows.rs stubs) in crates/around-engine/src/platform/
+- [X] T033 [US1] Implement `around play <path>` CLI subcommand using clap in crates/around-cli/src/main.rs
+- [X] T034 [US1] Implement Ctrl+C signal handler (graceful stop, clean process exit within 500ms per SC-008) in crates/around-cli/src/main.rs
+- [X] T035 [US1] Implement structured tracing spans/events (source_open, decode_start, decode_end, output_buffer_fill, errors) with configurable RUST_LOG level in crates/around-engine/src/pipeline.rs
+- [X] T036 [US1] Write integration test for end-to-end WAV playback pipeline in tests/integration/playback_pipeline.rs — verify play to completion, missing file error, corrupt file error
 
 **Checkpoint**: User Story 1 fully functional — `around play example.wav` works end-to-end. Contract tests pass. Integration test passes.
 
@@ -94,14 +94,14 @@
 
 ### Implementation for User Story 2
 
-- [ ] T037 [US2] Implement IPC server (Unix domain socket on Linux/macOS, named pipe on Windows) with tokio current_thread runtime in crates/around-engine/src/ipc.rs — accept connections, parse newline-delimited JSON commands, return JSON responses
-- [ ] T038 [US2] Implement PlaybackState tracking struct (position, duration, status, active track ref) in crates/around-engine/src/lib.rs
-- [ ] T039 [US2] Implement IPC command handlers for play, pause, resume, stop with state transitions in crates/around-engine/src/ipc.rs
-- [ ] T040 [US2] Implement IPC command handlers for seek (position validation, decoder re-seek) and status query (position, duration, playback state, track info) in crates/around-engine/src/ipc.rs
-- [ ] T041 [US2] Implement IPC command handler for list_decoders (return registered decoders with name, formats, source) in crates/around-engine/src/ipc.rs
-- [ ] T042 [US2] Implement around-cli transport subcommands (pause, resume, seek, stop, status) that connect to engine IPC socket in crates/around-cli/src/main.rs
-- [ ] T043 [US2] Implement `--log-level` CLI flag (error/warn/info/debug/trace) mapped to RUST_LOG directive in crates/around-cli/src/main.rs
-- [ ] T044 [US2] Write integration test for IPC transport control flow in tests/integration/ipc_control.rs — verify play→pause→resume→seek→status→stop sequence
+- [X] T037 [US2] Implement IPC server (Unix domain socket on Linux/macOS, named pipe on Windows) with tokio current_thread runtime in crates/around-engine/src/ipc.rs — accept connections, parse newline-delimited JSON commands, return JSON responses
+- [X] T038 [US2] Implement PlaybackState tracking struct (position, duration, status, active track ref) in crates/around-engine/src/lib.rs
+- [X] T039 [US2] Implement IPC command handlers for play, pause, resume, stop with state transitions in crates/around-engine/src/ipc.rs
+- [X] T040 [US2] Implement IPC command handlers for seek (position validation, decoder re-seek) and status query (position, duration, playback state, track info) in crates/around-engine/src/ipc.rs
+- [X] T041 [US2] Implement IPC command handler for list_decoders (return registered decoders with name, formats, source) in crates/around-engine/src/ipc.rs
+- [X] T042 [US2] Implement around-cli transport subcommands (pause, resume, seek, stop, status) that connect to engine IPC socket in crates/around-cli/src/main.rs
+- [X] T043 [US2] Implement `--log-level` CLI flag (error/warn/info/debug/trace) mapped to RUST_LOG directive in crates/around-cli/src/main.rs
+- [X] T044 [US2] Write integration test for IPC transport control flow in tests/integration/ipc_control.rs — verify play→pause→resume→seek→status→stop sequence
 
 **Checkpoint**: US1 + US2 work independently. Foreground playback and IPC control both functional.
 
@@ -115,14 +115,14 @@
 
 ### Implementation for User Story 3
 
-- [ ] T045 [US3] Implement extension manager (decoder registry, libloading-based load/unload, symbol resolution for `create_decoder` FFI entry point) in crates/around-engine/src/extensions.rs
-- [ ] T046 [US3] Implement load_decoder IPC handler — engine reads shared library file via engine's filesystem permissions, resolves symbols, registers decoder in crates/around-engine/src/ipc.rs
-- [ ] T047 [US3] Implement load_decoder_bytes IPC handler — CLI sends base64-encoded bytes, engine writes to temp file, loads via libloading, deletes temp, registers decoder in crates/around-engine/src/ipc.rs
-- [ ] T048 [US3] Implement extension discovery (scan default search paths ~/.local/share/around/decoders/, system paths from KDL config) in crates/around-engine/src/extensions.rs
-- [ ] T049 [US3] Implement test PCM decoder in crates/around-codec-test-pcm/src/lib.rs — minimal Decoder impl that handles a simple raw PCM format, exports `create_decoder` FFI symbol
-- [ ] T050 [US3] Implement around-cli load-decoder (path) and list-decoders subcommands in crates/around-cli/src/main.rs
-- [ ] T051 [US3] Write contract test for extension loading (verify load via path, load via bytes, duplicate load rejection, unload, post-unload cleanup) in tests/contract/extensions.rs
-- [ ] T052 [US3] Write integration test for extension-loaded end-to-end playback in tests/integration/extension_playback.rs — load test PCM decoder, play test PCM file, verify audio output
+- [X] T045 [US3] Implement extension manager (decoder registry, libloading-based load/unload, symbol resolution for `create_decoder` FFI entry point) in crates/around-engine/src/extensions.rs
+- [X] T046 [US3] Implement load_decoder IPC handler — engine reads shared library file via engine's filesystem permissions, resolves symbols, registers decoder in crates/around-engine/src/ipc.rs
+- [X] T047 [US3] Implement load_decoder_bytes IPC handler — CLI sends base64-encoded bytes, engine writes to temp file, loads via libloading, deletes temp, registers decoder in crates/around-engine/src/ipc.rs
+- [X] T048 [US3] Implement extension discovery (scan default search paths ~/.local/share/around/decoders/, system paths from KDL config) in crates/around-engine/src/extensions.rs
+- [X] T049 [US3] Implement test PCM decoder in crates/around-codec-test-pcm/src/lib.rs — minimal Decoder impl that handles a simple raw PCM format, exports `create_decoder` FFI symbol
+- [X] T050 [US3] Implement around-cli load-decoder (path) and list-decoders subcommands in crates/around-cli/src/main.rs
+- [X] T051 [US3] Write contract test for extension loading (verify load via path, load via bytes, duplicate load rejection, unload, post-unload cleanup) in tests/contract/extensions.rs
+- [X] T052 [US3] Write integration test for extension-loaded end-to-end playback in tests/integration/extension_playback.rs — load test PCM decoder, play test PCM file, verify audio output
 
 **Checkpoint**: All three user stories independently functional. Extension architecture validated.
 
@@ -132,12 +132,12 @@
 
 **Purpose**: Performance validation, code quality, and final checks
 
-- [ ] T053 [P] Implement performance benchmarks — pipeline_latency (<10ms), cold_start (<500ms), idle_rss (<50MB), cpu_usage (<5%) — in benches/pipeline_bench.rs
-- [ ] T054 Run `cargo fmt` and `cargo clippy` across the workspace, fix all warnings and errors
-- [ ] T055 Run `cargo test` — all contract tests, integration tests, and unit tests pass
-- [ ] T056 Run `cargo build --release` and verify stripped binary size <10MB (Linux headless)
-- [ ] T057 Validate quickstart.md walkthrough — build, play WAV, run contract tests, configure KDL, all steps succeed
-- [ ] T058 Error handling audit — verify no panics in pipeline path, corrupt files return AroundError::DecodeError, device disconnect returns graceful error, concurrent commands don't crash engine
+- [X] T053 [P] Implement performance benchmarks — pipeline_latency (<10ms), cold_start (<500ms), idle_rss (<50MB), cpu_usage (<5%) — in benches/pipeline_bench.rs
+- [X] T054 Run `cargo fmt` and `cargo clippy` across the workspace, fix all warnings and errors
+- [X] T055 Run `cargo test` — all contract tests, integration tests, and unit tests pass
+- [X] T056 Run `cargo build --release` and verify stripped binary size <10MB (Linux headless)
+- [X] T057 Validate quickstart.md walkthrough — build, play WAV, run contract tests, configure KDL, all steps succeed
+- [X] T058 Error handling audit — verify no panics in pipeline path, corrupt files return AroundError::DecodeError, device disconnect returns graceful error, concurrent commands don't crash engine
 
 ---
 
