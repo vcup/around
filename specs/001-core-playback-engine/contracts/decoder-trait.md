@@ -3,6 +3,10 @@
 **Version**: 0.1.0-pre
 **Stability**: Pre-1.0 (may evolve; see constitution API Stability Path)
 
+### Backward Compatibility
+
+Pre-1.0 (v0.x): No compatibility guarantees between versions. Extensions must be recompiled for each minor version. v1.0+: Semantic versioning — major version bumps indicate breaking changes requiring recompilation; minor version bumps are backward compatible.
+
 ## Trait Definition
 
 ```rust
@@ -39,7 +43,8 @@ pub trait Decoder: Send + Sync {
     /// Returns Ok(None) when the stream is exhausted.
     fn read(&mut self, buf: &mut [f32]) -> Result<Option<usize>, AroundError>;
 
-    /// Seek to a byte offset within the stream (if supported).
+    /// Seek to a sample frame offset within the decoded PCM stream.
+    /// The engine converts milliseconds to sample frames before calling this method.
     fn seek(&mut self, offset: u64) -> Result<(), AroundError>;
 
     /// Extract metadata from the source.
@@ -48,6 +53,13 @@ pub trait Decoder: Send + Sync {
     /// Return the output format (sample rate, channels).
     fn output_format(&self) -> SampleSpec;
 }
+
+> **Note — Trait Split**: This contract describes the full API surface. In practice, methods are split across two traits:
+>
+> - `Decoder` (object-safe, 4 methods): `read`, `seek`, `metadata`, `output_format`
+> - `DecoderFactory` (non-object-safe, 4 methods): `supported_formats`, `source_requirements`, `can_decode`, `open`
+>
+> Total: 8 methods (4 + 4).
 ```
 
 ## Contract

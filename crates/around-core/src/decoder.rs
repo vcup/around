@@ -25,7 +25,8 @@ pub trait Decoder: Send + Sync {
   /// Returns Ok(None) when the stream is exhausted.
   fn read(&mut self, buf: &mut [f32]) -> Result<Option<usize>, AroundError>;
 
-  /// Seek to a sample offset within the stream (if supported).
+  /// Seek to a sample frame offset within the decoded PCM stream.
+  /// The engine converts milliseconds to sample frames before calling this method.
   fn seek(&mut self, offset: u64) -> Result<(), AroundError>;
 
   /// Extract metadata from the source.

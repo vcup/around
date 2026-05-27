@@ -1,7 +1,7 @@
 # Contract: Source Trait
 
 **Version**: 0.1.0-pre
-**Stability**: Pre-1.0
+**Stability**: Pre-1.0 (may evolve; see constitution API Stability Path — parity with Decoder trait stability policy).
 
 ## Trait Definition
 

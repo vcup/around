@@ -29,6 +29,14 @@ pub enum AroundError {
   SourceAlreadyConsumed {
     source: String,
   },
+  InvalidPosition {
+    position_ms: u64,
+    duration_ms: Option<u64>,
+  },
+  CodecNotSupported {
+    codec: String,
+    reason: String,
+  },
 }
 
 impl fmt::Display for AroundError {
@@ -61,6 +69,20 @@ impl fmt::Display for AroundError {
       Self::Internal { message } => write!(f, "internal error: {}", message),
       Self::SourceAlreadyConsumed { source } => {
         write!(f, "source '{}' already consumed", source)
+      }
+      Self::InvalidPosition { position_ms, duration_ms } => {
+        if let Some(dur) = duration_ms {
+          write!(
+            f,
+            "invalid position {}ms (duration: {}ms)",
+            position_ms, dur
+          )
+        } else {
+          write!(f, "invalid position {}ms (no duration available)", position_ms)
+        }
+      }
+      Self::CodecNotSupported { codec, reason } => {
+        write!(f, "codec '{}' not supported: {}", codec, reason)
       }
     }
   }

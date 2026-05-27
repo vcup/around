@@ -63,13 +63,21 @@ impl Engine {
 
     let mut buf = vec![0.0f32; 4096];
     let mut total_samples = 0usize;
+    let mut consecutive_errors = 0u32;
     while running.load(Ordering::SeqCst) {
       match decoder.read(&mut buf) {
-        Ok(Some(n)) => total_samples += n,
+        Ok(Some(n)) => {
+          total_samples += n;
+          consecutive_errors = 0;
+        }
         Ok(None) => break,
         Err(e) => {
-          tracing::error!(?e, "decode error during playback");
-          return Err(e);
+          consecutive_errors += 1;
+          tracing::warn!(?e, consecutive_errors, "decode error during playback");
+          if consecutive_errors >= 3 {
+            tracing::error!(?e, "too many consecutive decode errors, stopping");
+            return Err(e);
+          }
         }
       }
     }

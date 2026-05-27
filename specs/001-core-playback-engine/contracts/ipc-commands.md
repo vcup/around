@@ -56,10 +56,11 @@
       "format": "WAV",
       "duration_ms": 245000
     },
-    "position_ms": 12345,
-    "volume": 1.0
+    "position_ms": 12345
   }
 ```
+
+Valid states: `"playing"`, `"paused"`, `"stopped"`, `"buffering"`.
 
 ### Load Decoder
 
@@ -86,6 +87,7 @@ without host mount, binary fetched over network).
 → {"status": "error", "code": "DECODER_LOAD_FAILED", "message": "Binary is not a valid shared library"}
 ```
 
+### List Decoders
 
 ```json
 {"command": "list_decoders"}
@@ -98,6 +100,16 @@ without host mount, binary fetched over network).
     ]
   }
 ```
+
+### Cleanup
+
+```json
+{"command": "cleanup"}
+→ {"status": "ok", "removed_files": ["/tmp/around-decoder-abc123.so"]}
+→ {"status": "ok", "removed_files": []}
+```
+
+Remove stale temporary files from aborted decoder loads. Safe to run at any time.
 
 ## Error Codes
 

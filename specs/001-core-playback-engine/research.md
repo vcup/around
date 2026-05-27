@@ -42,13 +42,12 @@ The performance equivalence requirement (FR-003a: "identical per-call performanc
 
 ## Decision: KDL Configuration Parsing
 
-**Decision**: Use `knuffel` for KDL parsing.
+**Decision**: Use `kdl-rs` for KDL parsing.
 
-**Rationale**: `knuffel` provides derive-macro-based decoding of KDL documents into Rust structs (similar to `serde`), with compile-time schema validation. This aligns with the constitutional requirement for schema-driven, unknown-key rejection (FR-014). Its node-based model handles nested configuration (e.g., `[decoders]` sections with default paths) naturally in KDL's syntax.
+**Rationale**: `kdl-rs` provides manual KDL document tree traversal. This enables strict validation of core configuration keys while allowing the `[extensions]` node's children to be passed through to extensions without core-side validation. This resolves the conflict between FR-014 (unknown key rejection) and FR-007 (extension-declared config keys).
 
 **Alternatives considered**:
-- `kdl-rs` — more complete KDL spec compliance but lower-level API requiring manual tree traversal. Better for complex use cases; `knuffel` is the pragmatic choice for typed config.
-- TOML with `toml` crate — more mature ecosystem but nested config is syntactically awkward; rejected in favor of KDL per constitutional decision.
+- `knuffel` — derive-macro-based decoding with compile-time schema validation. Rejected because its compile-time model cannot accommodate runtime-loaded extensions declaring their own configuration keys. Suitable for projects without plugin-config needs.
 
 ## Decision: IPC Mechanism
 

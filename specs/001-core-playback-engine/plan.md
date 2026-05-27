@@ -15,7 +15,7 @@ Build the foundational audio playback engine for `around`: format decoding via a
 **Primary Dependencies**:
 - `symphonia` — WAV decoding (pure Rust, multi-format capable for future)
 - `libloading` — runtime shared library loading for extensions
-- `knuffel` — KDL configuration parsing (derive macro, typed)
+- `kdl-rs` — KDL configuration parsing (manual tree traversal; strict core validation + extension config passthrough)
 - `tracing` — structured logging (spans, events, configurable levels)
 - `cpal` — cross-platform audio output abstraction (CoreAudio/PulseAudio/WASAPI)
 - `tokio` — async runtime for IPC (Unix domain sockets / named pipes)
