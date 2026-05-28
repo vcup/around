@@ -1,8 +1,6 @@
 //! Audio pipeline: Source → Decoder → Output Sink.
 
-use crate::config::{select_decoder, EngineConfig};
-use around_core::Decoder;
-use around_core::DecoderFactory;
+use crate::config::{select_decoder, try_open_decoder, EngineConfig};
 use around_core::{AroundError, Metadata, SampleSpec, Source};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,6 +9,7 @@ use std::sync::Arc;
 pub struct Engine {
   config: EngineConfig,
   running: Arc<AtomicBool>,
+  device_lost: Arc<AtomicBool>,
 }
 
 /// Handle for controlling an active playback session.
@@ -37,17 +36,16 @@ impl Engine {
   pub fn new(config: EngineConfig) -> Self {
     Self {
       config,
+      device_lost: Arc::new(AtomicBool::new(false)),
       running: Arc::new(AtomicBool::new(false)),
     }
   }
 
   /// Play a source. Blocks until playback completes or [`PlaybackHandle::stop`] is called.
   pub fn play(&self, source: Box<dyn Source>) -> Result<PlaybackHandle, AroundError> {
-    let _decoder_name = select_decoder(source.as_ref())?;
+    let decoder_name = select_decoder(source.as_ref())?;
 
-    let mut decoder = around_codec_wav::WavDecoder::open(source)?;
-    let output_format = decoder.output_format();
-    let metadata = decoder.metadata().clone();
+    let (mut decoder, output_format, metadata) = try_open_decoder(source, decoder_name)?;
 
     let running = Arc::clone(&self.running);
     running.store(true, Ordering::SeqCst);
@@ -65,6 +63,15 @@ impl Engine {
     let mut total_samples = 0usize;
     let mut consecutive_errors = 0u32;
     while running.load(Ordering::SeqCst) {
+      if self.device_lost.load(Ordering::SeqCst) {
+        tracing::warn!("playback paused: audio device lost");
+        if self.config.output_auto_reconnect {
+          self.device_lost.store(false, Ordering::SeqCst);
+          continue;
+        } else {
+          break;
+        }
+      }
       match decoder.read(&mut buf) {
         Ok(Some(n)) => {
           total_samples += n;
@@ -92,6 +99,16 @@ impl Engine {
   /// Signal the engine to stop playback.
   pub fn stop(&self) {
     self.running.store(false, Ordering::SeqCst);
+  }
+
+  /// Notify the engine that the audio output device was disconnected.
+  /// This triggers auto-pause behavior per config.
+  pub fn notify_device_lost(&self) {
+    self.device_lost.store(true, Ordering::SeqCst);
+    tracing::warn!("audio output device disconnected");
+    if !self.config.output_auto_reconnect {
+      self.stop();
+    }
   }
   pub fn config(&self) -> &EngineConfig {
     &self.config

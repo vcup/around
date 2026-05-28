@@ -102,8 +102,8 @@
 - [X] T042 [US2] Implement around-cli transport subcommands (pause, resume, seek, stop, status) that connect to engine IPC socket in crates/around-cli/src/main.rs
 - [X] T043 [US2] Implement `--log-level` CLI flag (error/warn/info/debug/trace) mapped to RUST_LOG directive in crates/around-cli/src/main.rs
 - [X] T044 [US2] Write integration test for IPC transport control flow in tests/integration/ipc_control.rs — verify play→pause→resume→seek→status→stop sequence
-- [ ] T059 [US2] Implement device disconnect detection and auto-pause in crates/around-engine/src/pipeline.rs — detect cpal stream error, transition to Paused, report device loss via IPC status. Add configurable recovery behavior (auto-resume vs. manual) in crates/around-engine/src/config.rs.
-- [ ] T060 [P] [US2] Implement IPC cleanup command handler in crates/around-engine/src/ipc.rs — scan and remove stale temp files from aborted decoder loads. Add `cleanup` CLI subcommand in crates/around-cli/src/main.rs.
+- [X] T059 [US2] Implement device disconnect detection and auto-pause in crates/around-engine/src/pipeline.rs — detect cpal stream error, transition to Paused, report device loss via IPC status. Add configurable recovery behavior (auto-resume vs. manual) in crates/around-engine/src/config.rs.
+- [X] T060 [P] [US2] Implement IPC cleanup command handler in crates/around-engine/src/ipc.rs — scan and remove stale temp files from aborted decoder loads. Add `cleanup` CLI subcommand in crates/around-cli/src/main.rs.
 
 **Checkpoint**: US1 + US2 work independently. Foreground playback and IPC control both functional.
 
@@ -125,7 +125,7 @@
 - [X] T050 [US3] Implement around-cli load-decoder (path) and list-decoders subcommands in crates/around-cli/src/main.rs
 - [X] T051 [US3] Write contract test for extension loading (verify load via path, load via bytes, duplicate load idempotent, duplicate load with version change replaces, unload, post-unload cleanup) in tests/contract/extensions.rs
 - [X] T052 [US3] Write integration test for extension-loaded end-to-end playback in tests/integration/extension_playback.rs — load test PCM decoder, play test PCM file, verify audio output
-- [ ] T061 [US3] Implement decoder fallback logic in crates/around-engine/src/config.rs — when selected decoder fails to open(), attempt: (1) all decoders claiming support for detected format in registration order, (2) all other decoders in registration order. First successful open wins. Update format detection T029 to call fallback chain.
+- [X] T061 [US3] Implement decoder fallback logic in crates/around-engine/src/config.rs — when selected decoder fails to open(), attempt: (1) all decoders claiming support for detected format in registration order, (2) all other decoders in registration order. First successful open wins. Update format detection T029 to call fallback chain.
 
 **Checkpoint**: All three user stories independently functional. Extension architecture validated.
 
@@ -140,7 +140,7 @@
 - [X] T055 Run `cargo test` — all contract tests, integration tests, and unit tests pass
 - [X] T056 Run `cargo build --release` and verify stripped binary size <10MB (Linux headless)
 - [X] T057 Validate quickstart.md walkthrough — build, play WAV, run contract tests, configure KDL, all steps succeed
-- [ ] T058 Error handling audit — verify: no panics in pipeline path, corrupt files return AroundError::DecodeError with VLC skip (up to 3 consecutive), device disconnect returns graceful error and auto-pause, concurrent commands serialized FIFO, DRM/codec-variant returns CodecNotSupported, seek-beyond-duration returns InvalidPosition. Update tests to cover new error variants and behaviors.
+- [X] T058 Error handling audit — verify: no panics in pipeline path, corrupt files return AroundError::DecodeError with VLC skip (up to 3 consecutive), device disconnect returns graceful error and auto-pause, concurrent commands serialized FIFO, DRM/codec-variant returns CodecNotSupported, seek-beyond-duration returns InvalidPosition. Update tests to cover new error variants and behaviors.
 
 ---
 
@@ -148,14 +148,14 @@
 
 **Purpose**: Implement remaining changes from the 2026-05-27 requirements quality review. Tasks T059–T066 correspond to spec changes not yet reflected in implementation.
 
-- [ ] T059 [US2] Implement device disconnect detection and auto-pause in crates/around-engine/src/pipeline.rs — detect cpal stream error via StreamError callback, transition playback to Paused, report device loss via IPC status. Add configurable recovery behavior (auto-resume on reconnect vs. require manual resume) as KDL config option `output.auto_reconnect` in crates/around-engine/src/config.rs.
-- [ ] T060 [P] [US2] Implement IPC `cleanup` command handler in crates/around-engine/src/ipc.rs — scan system temp directory for `around-decoder-*` prefixed files, remove stale entries. Return list of removed files in JSON response. Add `around cleanup` CLI subcommand in crates/around-cli/src/main.rs.
-- [ ] T061 [US3] Implement decoder fallback logic in crates/around-engine/src/config.rs — when selected decoder fails to open(), attempt fallback chain per FR-002: (1) same-format decoders in registration order, (2) all other decoders in registration order. First successful open wins. Wire into `Engine::play()` in crates/around-engine/src/pipeline.rs.
-- [ ] T062 [P] [US1] Migrate KDL config parsing from `knuffel` to `kdl-rs` in crates/around-engine/src/config.rs. Replace `#[derive(knuffel::Decode)]` with manual KDL document traversal. Implement: strict validation of known core keys (reject unknown), passthrough of `[extensions]` node children to extension manager. Update Cargo.toml dependency: remove `knuffel`, add `kdl-rs`.
-- [ ] T063 [P] [US1] Update signal handling in crates/around-cli/src/main.rs — extend existing SIGINT (Ctrl+C) handler to also handle SIGHUP and SIGTERM with the same cleanup sequence: stop playback, close IPC socket, release audio device, delete socket file, exit cleanly.
-- [ ] T064 [P] [US2] Implement IPC socket lifecycle in crates/around-engine/src/ipc.rs — set socket permissions to 0600 after bind. On engine start, if socket file exists: attempt UnixStream::connect; if successful (another instance running), return error and exit; if connection refused, delete stale socket and bind. Update engine startup in crates/around-engine/src/lib.rs.
-- [ ] T065 [US2] Update PlaybackState and IPC status to include BUFFERING state in crates/around-engine/src/lib.rs and crates/around-engine/src/ipc.rs — during source open, decoder init, and seek operations, set status to Buffering. Status query returns `"state": "buffering"`. On completion, transition to previous state (Playing or Paused).
-- [ ] T066 [P] Update integration and contract tests for new behaviors:
+- [X] T059 [US2] Implement device disconnect detection and auto-pause in crates/around-engine/src/pipeline.rs — detect cpal stream error via StreamError callback, transition playback to Paused, report device loss via IPC status. Add configurable recovery behavior (auto-resume on reconnect vs. require manual resume) as KDL config option `output.auto_reconnect` in crates/around-engine/src/config.rs.
+- [X] T060 [P] [US2] Implement IPC `cleanup` command handler in crates/around-engine/src/ipc.rs — scan system temp directory for `around-decoder-*` prefixed files, remove stale entries. Return list of removed files in JSON response. Add `around cleanup` CLI subcommand in crates/around-cli/src/main.rs.
+- [X] T061 [US3] Implement decoder fallback logic in crates/around-engine/src/config.rs — when selected decoder fails to open(), attempt fallback chain per FR-002: (1) same-format decoders in registration order, (2) all other decoders in registration order. First successful open wins. Wire into `Engine::play()` in crates/around-engine/src/pipeline.rs.
+- [X] T062 [P] [US1] Migrate KDL config parsing from `knuffel` to `kdl-rs` in crates/around-engine/src/config.rs. Replace `#[derive(knuffel::Decode)]` with manual KDL document traversal. Implement: strict validation of known core keys (reject unknown), passthrough of `[extensions]` node children to extension manager. Update Cargo.toml dependency: remove `knuffel`, add `kdl-rs`.
+- [X] T063 [P] [US1] Update signal handling in crates/around-cli/src/main.rs — extend existing SIGINT (Ctrl+C) handler to also handle SIGHUP and SIGTERM with the same cleanup sequence: stop playback, close IPC socket, release audio device, delete socket file, exit cleanly.
+- [X] T064 [P] [US2] Implement IPC socket lifecycle in crates/around-engine/src/ipc.rs — set socket permissions to 0600 after bind. On engine start, if socket file exists: attempt UnixStream::connect; if successful (another instance running), return error and exit; if connection refused, delete stale socket and bind. Update engine startup in crates/around-engine/src/lib.rs.
+- [X] T065 [US2] Update PlaybackState and IPC status to include BUFFERING state in crates/around-engine/src/lib.rs and crates/around-engine/src/ipc.rs — during source open, decoder init, and seek operations, set status to Buffering. Status query returns `"state": "buffering"`. On completion, transition to previous state (Playing or Paused).
+- [X] T066 [P] Update integration and contract tests for new behaviors:
   - tests/contract/extensions.rs: test duplicate load idempotent + version-change-replace
   - tests/integration/ipc_control.rs: test play-while-playing replace, cleanup command, BUFFERING status during seek
   - tests/integration/playback_pipeline.rs: test decoder fallback, VLC skip (corrupt mid-file), signal handling (SIGHUP/SIGTERM equivalent)

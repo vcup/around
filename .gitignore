@@ -14,3 +14,10 @@
 # direnv
 .direnv/
 .envrc
+# Rust build artifacts
+*.rlib
+*.prof*
+
+# Environment / logs
+.env
+*.log

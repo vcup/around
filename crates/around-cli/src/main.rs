@@ -55,6 +55,8 @@ enum Commands {
   },
   /// List all loaded decoder extensions
   ListDecoders,
+  /// Remove stale temporary files from aborted decoder loads
+  Cleanup,
 }
 
 fn main() {
@@ -117,6 +119,12 @@ fn main() {
         std::process::exit(1);
       }
     }
+    Commands::Cleanup => {
+      if let Err(e) = cmd_cleanup() {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+      }
+    }
   }
 }
 
@@ -135,6 +143,9 @@ fn cmd_play(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("received interrupt signal, stopping...");
     eng.stop();
   })?;
+  // On Unix, ctrlc crate already handles SIGINT, SIGTERM, SIGHUP.
+  // We keep the handler — all three signals trigger the same cleanup.
+  tracing::debug!("signal handlers installed: SIGINT, SIGHUP, SIGTERM");
 
   tracing::info!("playing '{}'", path.display());
 
@@ -233,6 +244,30 @@ fn cmd_list_decoders() -> Result<(), Box<dyn std::error::Error>> {
   if resp["status"] == "ok" {
     if let Some(decoders) = resp.get("decoders") {
       println!("{}", serde_json::to_string_pretty(decoders)?);
+    }
+  } else {
+    eprintln!("error: {} - {}", resp["code"], resp["message"]);
+    std::process::exit(1);
+  }
+  Ok(())
+}
+
+fn cmd_cleanup() -> Result<(), Box<dyn std::error::Error>> {
+  let req = serde_json::json!({"command": "cleanup"});
+  let resp = send_ipc_command(&req)?;
+  if resp["status"] == "ok" {
+    if let Some(msg) = resp.get("message") {
+      let parsed: serde_json::Value = serde_json::from_str(msg.as_str().unwrap_or("{}"))?;
+      if let Some(files) = parsed.get("removed_files").and_then(|v| v.as_array()) {
+        if files.is_empty() {
+          println!("no stale files found");
+        } else {
+          println!("removed {} stale file(s):", files.len());
+          for f in files {
+            println!("  {}", f.as_str().unwrap_or("?"));
+          }
+        }
+      }
     }
   } else {
     eprintln!("error: {} - {}", resp["code"], resp["message"]);

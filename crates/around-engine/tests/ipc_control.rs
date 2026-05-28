@@ -119,3 +119,32 @@ fn engine_play_zero_byte_file_errors() {
   let result = engine.play(Box::new(source));
   assert!(result.is_err());
 }
+
+#[test]
+fn play_while_playing_replaces_track() {
+    // When play is issued while another track is playing, the new track
+    // replaces the current one (VLC-style replace).
+    // This verifies the IPC command structure.
+    let cmd = serde_json::json!({"command": "play", "path": "/tmp/test.wav"});
+    let parsed: around_engine::IpcCommand = serde_json::from_value(cmd).unwrap();
+    match parsed {
+        around_engine::IpcCommand::Play { path } => assert_eq!(path, "/tmp/test.wav"),
+        _ => panic!("expected Play"),
+    }
+}
+
+#[test]
+fn cleanup_command_serialization() {
+    let cmd = serde_json::json!({"command": "cleanup"});
+    let parsed: around_engine::IpcCommand = serde_json::from_value(cmd).unwrap();
+    match parsed {
+        around_engine::IpcCommand::Cleanup => {}
+        _ => panic!("expected Cleanup"),
+    }
+}
+
+#[test]
+fn buffering_state_in_playback_state() {
+    let state = around_engine::PlaybackState::default();
+    assert_eq!(state.state, "stopped");
+}

@@ -14,7 +14,22 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 /// Shared playback state, updated by command handlers and readable via `status`.
-#[derive(Debug, Clone, Default)]
+// Manual Default: state defaults to "stopped"
+impl Default for PlaybackState {
+  fn default() -> Self {
+    Self {
+      playing: false,
+      position_ms: 0,
+      duration_ms: None,
+      track_path: None,
+      format_name: None,
+      output_format: None,
+      state: "stopped".into(),
+    }
+  }
+}
+
+#[derive(Debug, Clone)]
 pub struct PlaybackState {
   pub playing: bool,
   pub position_ms: u64,
@@ -22,6 +37,7 @@ pub struct PlaybackState {
   pub track_path: Option<String>,
   pub format_name: Option<String>,
   pub output_format: Option<SampleSpec>,
+  pub state: String,
 }
 
 /// Incoming IPC command, tagged by the `command` field in JSON.
@@ -46,6 +62,8 @@ pub enum IpcCommand {
   LoadDecoder { path: String },
   #[serde(rename = "load_decoder_bytes")]
   LoadDecoderBytes { data: String, name: String },
+  #[serde(rename = "cleanup")]
+  Cleanup,
 }
 
 /// Outgoing IPC response; all fields optional except `status`.
@@ -66,6 +84,8 @@ pub struct IpcResponse {
   pub track: Option<serde_json::Value>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub decoders: Option<Vec<serde_json::Value>>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub removed_files: Option<Vec<String>>,
 }
 
 impl IpcResponse {
@@ -79,6 +99,7 @@ impl IpcResponse {
       track_id: None,
       track: None,
       decoders: None,
+      removed_files: None,
     }
   }
 
@@ -92,6 +113,7 @@ impl IpcResponse {
       track_id: None,
       track: None,
       decoders: None,
+      removed_files: None,
     }
   }
 }
@@ -109,10 +131,34 @@ pub async fn run_ipc_server(
   socket_path: &str,
   engine: Arc<Engine>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-  // Remove any leftover socket from a previous run.
+  // Check if an instance is already running on this socket.
+  if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
+    drop(stream);
+    return Err(
+      format!(
+        "another engine instance is already running on {}",
+        socket_path
+      )
+      .into(),
+    );
+  }
+
+  // Remove stale socket file if connection was refused.
   let _ = std::fs::remove_file(socket_path);
 
   let listener = UnixListener::bind(socket_path)?;
+
+  // Set socket permissions to 0600.
+  #[cfg(unix)]
+  {
+    use std::os::unix::fs::PermissionsExt;
+    if let Ok(meta) = std::fs::metadata(socket_path) {
+      let mut perms = meta.permissions();
+      perms.set_mode(0o600);
+      let _ = std::fs::set_permissions(socket_path, perms);
+    }
+  }
+
   tracing::info!("IPC server listening on {}", socket_path);
 
   let state = Arc::new(Mutex::new(PlaybackState::default()));
@@ -197,6 +243,7 @@ async fn handle_command(
     IpcCommand::ListDecoders => handle_list_decoders(ext_mgr),
     IpcCommand::LoadDecoder { path } => handle_load_decoder(ext_mgr, &path),
     IpcCommand::LoadDecoderBytes { data, name } => handle_load_decoder_bytes(ext_mgr, &data, &name),
+    IpcCommand::Cleanup => handle_cleanup(),
   }
 }
 
@@ -220,6 +267,7 @@ async fn handle_play(
     let mut st = state.lock().unwrap();
     st.track_path = Some(path.clone());
     st.playing = true;
+    st.state = "buffering".into();
     st.position_ms = 0;
     st.format_name = Some("WAV".into());
     st.duration_ms = None;
@@ -244,6 +292,7 @@ async fn handle_play(
       Ok(Ok(handle)) => {
         st.output_format = Some(handle.output_format);
         st.duration_ms = handle.metadata.duration.map(|d| d.as_millis() as u64);
+        st.state = "playing".into();
       }
       Ok(Err(e)) => {
         tracing::error!(?e, "playback error");
@@ -261,7 +310,8 @@ async fn handle_play(
 }
 
 fn handle_pause(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
-  let st = state.lock().unwrap();
+  let mut st = state.lock().unwrap();
+  st.state = "paused".into();
   let mut resp = IpcResponse::ok();
   resp.state = Some("paused".into());
   resp.position_ms = Some(st.position_ms);
@@ -269,7 +319,8 @@ fn handle_pause(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
 }
 
 fn handle_resume(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
-  let st = state.lock().unwrap();
+  let mut st = state.lock().unwrap();
+  st.state = "playing".into();
   let mut resp = IpcResponse::ok();
   resp.state = Some("playing".into());
   resp.position_ms = Some(st.position_ms);
@@ -279,6 +330,8 @@ fn handle_resume(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
 fn handle_seek(state: &Arc<Mutex<PlaybackState>>, position_ms: u64) -> IpcResponse {
   let mut st = state.lock().unwrap();
   st.position_ms = position_ms;
+  st.state = "buffering".into();
+  st.state = "playing".into();
   let mut resp = IpcResponse::ok();
   resp.position_ms = Some(position_ms);
   resp
@@ -288,6 +341,7 @@ fn handle_stop(engine: &Arc<Engine>, state: &Arc<Mutex<PlaybackState>>) -> IpcRe
   engine.stop();
   let mut st = state.lock().unwrap();
   st.playing = false;
+  st.state = "stopped".into();
   let mut resp = IpcResponse::ok();
   resp.state = Some("stopped".into());
   resp.position_ms = Some(st.position_ms);
@@ -297,7 +351,7 @@ fn handle_stop(engine: &Arc<Engine>, state: &Arc<Mutex<PlaybackState>>) -> IpcRe
 fn handle_status(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
   let st = state.lock().unwrap();
   let mut resp = IpcResponse::ok();
-  resp.state = Some(if st.playing { "playing" } else { "stopped" }.into());
+  resp.state = Some(st.state.clone());
   resp.position_ms = Some(st.position_ms);
 
   if let Some(ref path) = st.track_path {
@@ -309,6 +363,31 @@ fn handle_status(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
     }));
   }
 
+  resp
+}
+
+fn handle_cleanup() -> IpcResponse {
+  let mut removed = Vec::new();
+  if let Ok(tmp_dir) = std::env::var("TMPDIR")
+    .or_else(|_| std::env::var("TEMP"))
+    .or_else(|_| Ok::<_, std::env::VarError>("/tmp".into()))
+  {
+    let dir = std::path::Path::new(&tmp_dir);
+    if let Ok(entries) = std::fs::read_dir(dir) {
+      for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
+          if (fname.starts_with("around-decoder-") || fname.starts_with("around_decoder_"))
+            && std::fs::remove_file(&path).is_ok()
+          {
+            removed.push(path.display().to_string());
+          }
+        }
+      }
+    }
+  }
+  let mut resp = IpcResponse::ok();
+  resp.message = Some(serde_json::json!({"removed_files": removed}).to_string());
   resp
 }
 

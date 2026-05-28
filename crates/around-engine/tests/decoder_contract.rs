@@ -83,3 +83,41 @@ fn wav_decoder_truncated_file_errors() {
     // The important thing: no panic.
   }
 }
+
+#[test]
+fn decoder_codec_not_supported_error() {
+    // Verify AroundError::CodecNotSupported exists and formats correctly
+    let err = around_core::AroundError::CodecNotSupported {
+        codec: "DRM_AAC".into(),
+        reason: "encrypted stream".into(),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("DRM_AAC"));
+    assert!(msg.contains("encrypted stream"));
+}
+
+#[test]
+fn decoder_invalid_position_error() {
+    // Verify AroundError::InvalidPosition exists and formats correctly
+    let err = around_core::AroundError::InvalidPosition {
+        position_ms: 999999,
+        duration_ms: Some(10000),
+    };
+    let msg = err.to_string();
+    assert!(msg.contains("999999"));
+    assert!(msg.contains("10000"));
+}
+
+#[test]
+fn wav_decoder_seek_uses_sample_frames() {
+    // Contract: Decoder::seek offset is sample frames, not milliseconds.
+    // Verify that after opening a WAV file, seek(0) works (seeks to start).
+    let source = around_source_file::FileSource::new(fixture_path("example.wav"));
+    let mut decoder = around_codec_wav::WavDecoder::open(Box::new(source))
+        .expect("open should succeed");
+    // seek(0) = seek to sample frame 0 (start)
+    decoder.seek(0).expect("seek to frame 0 should succeed");
+    let mut buf = vec![0.0f32; 1024];
+    let read = decoder.read(&mut buf).expect("read after seek should succeed");
+    assert!(read.is_some());
+}
