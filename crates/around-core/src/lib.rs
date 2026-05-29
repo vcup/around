@@ -1,9 +1,9 @@
 //! around-core: Shared types, traits, and error types for the around audio engine.
 //!
-//! This crate defines the foundational contracts (`Decoder`, `Source`)
+//! This crate defines the foundational contracts (`Codec`, `Source`)
 //! that all other crates build upon. It has minimal dependencies.
 
-pub mod decoder;
+pub mod codec;
 pub mod error;
 pub mod metadata;
 pub mod source;
@@ -11,11 +11,10 @@ pub mod state;
 pub mod types;
 
 // Re-export all public types at crate root for convenience
-pub use decoder::{Decoder, SourceRequirements};
-pub use decoder::{DecoderFactory, ErasedDecoder};
+pub use codec::{AudioStream, AudioStreamVTable, CodecInfo, CodecRegistry, PrefixReader};
 pub use error::AroundError;
 pub use metadata::Metadata;
-pub use source::{FormatSignature, Source, SourceCapabilities};
+pub use source::{FormatSignature, ReadSeek, Source, SourceCapabilities};
 pub use state::{PlaybackStatus, PAUSED, PLAYING, STOPPED};
 pub use types::{
   AudioFormat, BitDepth, ChannelLayout, ContentType, ExtensionSource, SampleRate, SampleSpec,

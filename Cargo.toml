@@ -5,6 +5,7 @@ members = [
     "crates/around-cli",
     "crates/around-codec-wav",
     "crates/around-codec-test-pcm",
+    "crates/around-codec-macros",
     "crates/around-source-file",
     "examples/simple_decoder",
 ]
@@ -24,6 +25,7 @@ around-engine = { path = "crates/around-engine" }
 around-source-file = { path = "crates/around-source-file" }
 around-codec-wav = { path = "crates/around-codec-wav" }
 around-codec-test-pcm = { path = "crates/around-codec-test-pcm" }
+around-codec-macros = { path = "crates/around-codec-macros" }
 
 bitflags = "2"
 clap = { version = "4", features = ["derive"] }
@@ -39,6 +41,7 @@ libloading = "0.8"
 serde = "1"
 base64 = "0.22"
 criterion = { version = "0.5", features = ["html_reports"] }
+crossbeam = "0.8"
 
 [workspace.lints.clippy]
 unwrap_used = "warn"

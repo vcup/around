@@ -4,18 +4,21 @@ use around_core::{AroundError, Source, SourceCapabilities};
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
 
 pub struct FileSource {
   path: PathBuf,
-  opened: AtomicBool,
+  /// Snapshot of file size at construction time. MAY diverge if the file is
+  /// externally modified after construction; the engine uses this as a hint.
+  content_length: Option<u64>,
 }
 
 impl FileSource {
   pub fn new(path: impl Into<PathBuf>) -> Self {
+    let path = path.into();
+    let content_length = fs::metadata(&path).ok().map(|m| m.len());
     Self {
-      path: path.into(),
-      opened: AtomicBool::new(false),
+      path,
+      content_length,
     }
   }
 }
@@ -38,13 +41,29 @@ impl Source for FileSource {
       }
     })?;
 
-    self.opened.store(true, std::sync::atomic::Ordering::SeqCst);
+    Ok(Box::new(BufReader::new(file)))
+  }
+
+  fn open_seekable(
+    &self,
+  ) -> Result<Box<dyn around_core::source::ReadSeek + Send + Sync>, AroundError> {
+    let file = fs::File::open(&self.path).map_err(|e| {
+      if e.kind() == std::io::ErrorKind::NotFound {
+        AroundError::FileNotFound {
+          path: self.path.display().to_string(),
+        }
+      } else {
+        AroundError::Internal {
+          message: format!("failed to open '{}': {}", self.path.display(), e),
+        }
+      }
+    })?;
 
     Ok(Box::new(BufReader::new(file)))
   }
 
   fn content_length(&self) -> Option<u64> {
-    fs::metadata(&self.path).ok().map(|m| m.len())
+    self.content_length
   }
 
   fn content_type(&self) -> Option<String> {

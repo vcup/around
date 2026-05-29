@@ -17,7 +17,7 @@ path = "src/main.rs"
 around-core = { workspace = true }
 around-engine = { workspace = true }
 clap = { workspace = true }
-tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "macros"] }
+tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "macros", "signal"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

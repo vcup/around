@@ -1,0 +1,19 @@
+[package]
+name = "around-codec-macros"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

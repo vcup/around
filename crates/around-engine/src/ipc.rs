@@ -24,6 +24,8 @@ impl Default for PlaybackState {
       track_path: None,
       format_name: None,
       output_format: None,
+      seekable: false,
+      device_lost: false,
       state: "stopped".into(),
     }
   }
@@ -37,6 +39,8 @@ pub struct PlaybackState {
   pub track_path: Option<String>,
   pub format_name: Option<String>,
   pub output_format: Option<SampleSpec>,
+  pub seekable: bool,
+  pub device_lost: bool,
   pub state: String,
 }
 
@@ -85,6 +89,8 @@ pub struct IpcResponse {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub decoders: Option<Vec<serde_json::Value>>,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub device_lost: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub removed_files: Option<Vec<String>>,
 }
 
@@ -100,6 +106,7 @@ impl IpcResponse {
       track: None,
       decoders: None,
       removed_files: None,
+      device_lost: None,
     }
   }
 
@@ -114,6 +121,7 @@ impl IpcResponse {
       track: None,
       decoders: None,
       removed_files: None,
+      device_lost: None,
     }
   }
 }
@@ -127,9 +135,13 @@ impl IpcResponse {
 /// Stale socket files are removed before binding.  Each accepted connection
 /// is handled in its own tokio task so that multiple clients can interact
 /// with the engine concurrently.
+///
+/// The accept loop exits when `engine.is_shutdown()` returns true (set by the
+/// play thread after playback completes), allowing a clean join.
 pub async fn run_ipc_server(
   socket_path: &str,
   engine: Arc<Engine>,
+  state: Arc<Mutex<PlaybackState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   // Check if an instance is already running on this socket.
   if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
@@ -161,10 +173,13 @@ pub async fn run_ipc_server(
 
   tracing::info!("IPC server listening on {}", socket_path);
 
-  let state = Arc::new(Mutex::new(PlaybackState::default()));
   let ext_mgr = Arc::new(ExtensionManager::new());
 
   loop {
+    if engine.is_shutdown() {
+      tracing::info!("IPC server shutting down");
+      break;
+    }
     let (stream, _) = listener.accept().await?;
     let eng = engine.clone();
     let st = state.clone();
@@ -175,6 +190,8 @@ pub async fn run_ipc_server(
       }
     });
   }
+
+  Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -235,9 +252,9 @@ async fn handle_command(
 ) -> IpcResponse {
   match cmd {
     IpcCommand::Play { path } => handle_play(engine, state, path).await,
-    IpcCommand::Pause => handle_pause(state),
-    IpcCommand::Resume => handle_resume(state),
-    IpcCommand::Seek { position_ms } => handle_seek(state, position_ms),
+    IpcCommand::Pause => handle_pause(engine, state),
+    IpcCommand::Resume => handle_resume(engine, state),
+    IpcCommand::Seek { position_ms } => handle_seek(engine, state, position_ms),
     IpcCommand::Stop => handle_stop(engine, state),
     IpcCommand::Status => handle_status(state),
     IpcCommand::ListDecoders => handle_list_decoders(ext_mgr),
@@ -268,49 +285,62 @@ async fn handle_play(
     st.track_path = Some(path.clone());
     st.playing = true;
     st.state = "buffering".into();
-    st.position_ms = 0;
-    st.format_name = Some("WAV".into());
+    st.format_name = None; // engine.play() will populate on successful codec open
+    st.device_lost = false;
     st.duration_ms = None;
   }
 
   // Offload the blocking `engine.play()` call via spawn_blocking so the
   // async runtime stays responsive.  Playback runs to completion in the
   // background; the IPC client gets an immediate response.
+  //
+  // The engine.play() call now receives the shared state and updates
+  // position/state in real-time — no need for post-completion stitching.
   let eng = engine.clone();
-  let st_bg = state.clone();
+  let st_play = Arc::clone(state);
+  let st_err = Arc::clone(state);
   let path_bg = path;
   tokio::spawn(async move {
     let result = tokio::task::spawn_blocking(move || {
       let source = around_source_file::FileSource::new(PathBuf::from(&path_bg));
-      eng.play(Box::new(source))
+      eng.play(Box::new(source), st_play)
     })
     .await;
 
-    let mut st = st_bg.lock().unwrap();
-    st.playing = false;
     match result {
-      Ok(Ok(handle)) => {
-        st.output_format = Some(handle.output_format);
-        st.duration_ms = handle.metadata.duration.map(|d| d.as_millis() as u64);
-        st.state = "playing".into();
+      Ok(Ok(_handle)) => {
+        // State is already updated to "stopped" by engine.play() on exit.
+        tracing::info!("playback finished");
       }
       Ok(Err(e)) => {
         tracing::error!(?e, "playback error");
+        if let Ok(mut st) = st_err.lock() {
+          st.state = "error".into();
+          st.playing = false;
+        }
       }
       Err(_) => {
         tracing::error!("playback task panicked");
+        if let Ok(mut st) = st_err.lock() {
+          st.state = "error".into();
+          st.playing = false;
+        }
       }
     }
   });
 
   let mut resp = IpcResponse::ok();
   resp.track_id = Some(1);
-  resp.state = Some("playing".into());
+  resp.state = Some("buffering".into());
   resp
 }
 
-fn handle_pause(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
+fn handle_pause(engine: &Arc<Engine>, state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
   let mut st = state.lock().unwrap();
+  if !st.playing {
+    return IpcResponse::error("NO_TRACK", "no active playback to pause");
+  }
+  engine.pause();
   st.state = "paused".into();
   let mut resp = IpcResponse::ok();
   resp.state = Some("paused".into());
@@ -318,8 +348,12 @@ fn handle_pause(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
   resp
 }
 
-fn handle_resume(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
+fn handle_resume(engine: &Arc<Engine>, state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
   let mut st = state.lock().unwrap();
+  if !st.playing {
+    return IpcResponse::error("NO_TRACK", "no active playback to resume");
+  }
+  engine.resume();
   st.state = "playing".into();
   let mut resp = IpcResponse::ok();
   resp.state = Some("playing".into());
@@ -327,11 +361,21 @@ fn handle_resume(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
   resp
 }
 
-fn handle_seek(state: &Arc<Mutex<PlaybackState>>, position_ms: u64) -> IpcResponse {
+fn handle_seek(
+  engine: &Arc<Engine>,
+  state: &Arc<Mutex<PlaybackState>>,
+  position_ms: u64,
+) -> IpcResponse {
   let mut st = state.lock().unwrap();
+  if !st.playing {
+    return IpcResponse::error("NO_TRACK", "no active playback to seek");
+  }
+  if !st.seekable {
+    return IpcResponse::error("NOT_SUPPORTED", "current source does not support seeking");
+  }
+  engine.seek(position_ms);
   st.position_ms = position_ms;
   st.state = "buffering".into();
-  st.state = "playing".into();
   let mut resp = IpcResponse::ok();
   resp.position_ms = Some(position_ms);
   resp
@@ -362,6 +406,7 @@ fn handle_status(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
         "duration_ms": st.duration_ms.unwrap_or(0),
     }));
   }
+  resp.device_lost = Some(st.device_lost);
 
   resp
 }
@@ -370,7 +415,7 @@ fn handle_cleanup() -> IpcResponse {
   let mut removed = Vec::new();
   if let Ok(tmp_dir) = std::env::var("TMPDIR")
     .or_else(|_| std::env::var("TEMP"))
-    .or_else(|_| Ok::<_, std::env::VarError>("/tmp".into()))
+    .or_else(|_| std::env::temp_dir().into_os_string().into_string())
   {
     let dir = std::path::Path::new(&tmp_dir);
     if let Ok(entries) = std::fs::read_dir(dir) {

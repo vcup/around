@@ -70,7 +70,10 @@ impl fmt::Display for AroundError {
       Self::SourceAlreadyConsumed { source } => {
         write!(f, "source '{}' already consumed", source)
       }
-      Self::InvalidPosition { position_ms, duration_ms } => {
+      Self::InvalidPosition {
+        position_ms,
+        duration_ms,
+      } => {
         if let Some(dur) = duration_ms {
           write!(
             f,
@@ -78,7 +81,11 @@ impl fmt::Display for AroundError {
             position_ms, dur
           )
         } else {
-          write!(f, "invalid position {}ms (no duration available)", position_ms)
+          write!(
+            f,
+            "invalid position {}ms (no duration available)",
+            position_ms
+          )
         }
       }
       Self::CodecNotSupported { codec, reason } => {

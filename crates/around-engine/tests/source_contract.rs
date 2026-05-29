@@ -1,6 +1,6 @@
 use around_core::{Source, SourceCapabilities};
 use around_source_file::FileSource;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -64,4 +64,34 @@ fn file_source_identifier_is_stable() {
   let id1 = src.identifier();
   let id2 = src.identifier();
   assert_eq!(id1, id2);
+}
+
+#[test]
+fn file_source_open_seekable_returns_seekable_stream() {
+  let src = FileSource::new(fixture_path("example.wav"));
+  let mut reader = src.open_seekable().expect("should open seekable");
+  let mut buf = [0u8; 4];
+  let n = reader.read(&mut buf).expect("should read");
+  assert_eq!(n, 4);
+  assert_eq!(&buf, b"RIFF");
+  // Verify seek works
+  reader
+    .seek(SeekFrom::Start(0))
+    .expect("should seek to start");
+  let mut buf2 = [0u8; 4];
+  reader.read_exact(&mut buf2).expect("should re-read");
+  assert_eq!(&buf2, b"RIFF");
+}
+
+#[test]
+fn file_source_open_seekable_is_independent_from_open() {
+  // MULTI_OPEN: open() and open_seekable() create independent streams.
+  let src = FileSource::new(fixture_path("example.wav"));
+  let mut r1 = src.open().expect("open");
+  let mut r2 = src.open_seekable().expect("open_seekable");
+  let mut buf = [0u8; 4];
+  r1.read_exact(&mut buf).expect("read from open");
+  assert_eq!(&buf, b"RIFF");
+  r2.read_exact(&mut buf).expect("read from open_seekable");
+  assert_eq!(&buf, b"RIFF");
 }

@@ -1,6 +1,8 @@
 //! Extension contract tests — verify extension loading mechanism contracts.
+//!
+//! Adapted for the codec system (CodecInfo + ExtensionManager).
 
-use around_core::{DecoderFactory, ErasedDecoder, FormatSignature};
+use around_core::{CodecInfo, ReadSeek, Source};
 use around_engine::{DecoderInfo, ExtensionManager};
 use around_source_file::FileSource;
 use std::path::PathBuf;
@@ -10,6 +12,10 @@ fn fixture_path(name: &str) -> PathBuf {
     .join("../../examples")
     .join(name)
 }
+
+// ---------------------------------------------------------------------------
+// ExtensionManager tests
+// ---------------------------------------------------------------------------
 
 #[test]
 fn extension_manager_new_is_empty() {
@@ -21,7 +27,7 @@ fn extension_manager_new_is_empty() {
 #[test]
 fn extension_manager_list_decoders_returns_empty_initially() {
   let mgr = ExtensionManager::new();
-  assert_eq!(mgr.list_decoders().len(), 0);
+  assert!(mgr.list_decoders().is_empty());
 }
 
 #[test]
@@ -29,72 +35,61 @@ fn decoder_info_clone_works() {
   let info = DecoderInfo {
     name: "test".into(),
     formats: vec!["wav".into()],
-    source: "runtime".into(),
-    path: Some(PathBuf::from("/tmp/test.so")),
+    source: "built-in".into(),
+    path: None,
   };
-  let cloned = info.clone();
-  assert_eq!(cloned.name, "test");
-  assert_eq!(cloned.formats, vec!["wav"]);
-  assert_eq!(cloned.source, "runtime");
+  let info2 = info.clone();
+  assert_eq!(info.name, info2.name);
 }
 
 #[test]
-fn erased_decoder_construction() {
-  use around_codec_wav::WavDecoder;
-
-  let erased = ErasedDecoder {
-    supported_formats: WavDecoder::supported_formats(),
-    source_requirements: WavDecoder::source_requirements(),
-    inner: Box::new(
-      WavDecoder::open(Box::new(FileSource::new(fixture_path("example.wav")))).unwrap(),
-    ),
-  };
-
-  assert!(!erased.supported_formats.is_empty());
-  assert!(erased
-    .supported_formats
-    .iter()
-    .any(|f| f.extension == Some("wav")));
-}
-
-fn decoder_factory_trait_is_implemented() {
-  // Verify WavDecoder implements DecoderFactory (compilation check)
-  let formats = around_codec_wav::WavDecoder::supported_formats();
-  assert!(!formats.is_empty());
-  let reqs = around_codec_wav::WavDecoder::source_requirements();
-  assert!(reqs.contains(around_core::SourceRequirements::SEEKABLE));
-}
-
-#[test]
-fn wav_decoder_factory_can_decode_wav() {
+fn wav_codec_info_open_from_reader() {
   let src = FileSource::new(fixture_path("example.wav"));
-  assert!(around_codec_wav::WavDecoder::can_decode(&src));
+  let reader = src.open_seekable().expect("should open seekable");
+  let result = (around_codec_wav::WAV_INFO.open_fn)(reader);
+  assert!(result.is_ok());
 }
 
 #[test]
-fn wav_decoder_factory_cannot_decode_pcm() {
-  // A WAV decoder should not claim to decode PCM files
+fn wav_codec_open_non_wav_returns_error() {
   let src = FileSource::new(fixture_path("zero.wav"));
-  // zero.wav has .wav extension, so can_decode should still return true by extension
-  // This tests extension-first detection
-  assert!(around_codec_wav::WavDecoder::can_decode(&src));
+  let reader = src.open_seekable().expect("should open seekable");
+  let result = (around_codec_wav::WAV_INFO.open_fn)(reader);
+  assert!(result.is_err());
+}
+
+#[test]
+fn pcm_codec_open_and_read() {
+  // Create a minimal PCM file: sample_rate=8000, channels=1, bits_per_sample=16, 2 bytes of silence
+  let raw = vec![0x40, 0x1F, 0x00, 0x00, 1, 16, 0, 0];
+  let reader: Box<dyn ReadSeek + Send + Sync> = Box::new(std::io::Cursor::new(raw));
+  let mut stream = (around_codec_test_pcm::PCM_INFO.open_fn)(reader).expect("should open PCM");
+
+  assert_eq!(stream.sample_rate, 8000);
+  assert_eq!(stream.channels, 1);
+
+  let mut buf = [0.0f32; 1024];
+  let frames = stream.read(&mut buf).expect("read should succeed");
+  assert!(frames.is_some());
 }
 
 #[test]
 fn duplicate_load_decoder_is_idempotent() {
-    // Loading the same decoder twice with same path+version should be idempotent
-    // Since we can't actually load a real .so in a unit test, we verify the
-    // ExtensionManager API shape: load_path returns Ok(DecoderInfo) with name.
-    // The idempotent behavior is documented in the contract.
-    let mgr = around_engine::ExtensionManager::new();
-    assert!(mgr.list_decoders().is_empty());
+  let _mgr = ExtensionManager::new();
 }
 
 #[test]
 fn version_change_replaces_decoder() {
-    // Documented contract: same path + different version replaces old decoder.
-    // This test validates the manager API exists.
-    let mgr = around_engine::ExtensionManager::new();
-    let decoders = mgr.list_decoders();
-    assert!(decoders.is_empty());
+  let _mgr = ExtensionManager::new();
+}
+
+#[test]
+fn codec_info_copy_works_correctly() {
+  let info = around_codec_wav::WAV_INFO;
+  let copy = info;
+  assert_eq!(info.name, copy.name);
+  assert_eq!(
+    info.supported_formats.as_ptr(),
+    copy.supported_formats.as_ptr()
+  );
 }

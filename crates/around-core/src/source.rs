@@ -2,7 +2,7 @@
 
 use crate::error::AroundError;
 use bitflags::bitflags;
-use std::io::Read;
+use std::io::{Read, Seek};
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -15,10 +15,16 @@ bitflags! {
     }
 }
 
+/// Helper trait combining `Read` + `Seek` for use in trait objects.
+/// Rust only allows one non-auto trait in a `dyn` type; this merges them.
+pub trait ReadSeek: Read + Seek {}
+impl<T: Read + Seek> ReadSeek for T {}
+
 /// Trait abstracting where audio bytes come from.
 ///
 /// Implementations include local files, HTTP streams, and in-memory buffers.
-/// All I/O happens in `open()`; metadata methods must not perform I/O.
+/// All I/O happens in `open()` and `open_seekable()`; metadata methods must not
+/// perform I/O.
 pub trait Source: Send + Sync {
   /// Capabilities this source provides.
   fn capabilities(&self) -> SourceCapabilities {
@@ -29,6 +35,15 @@ pub trait Source: Send + Sync {
   /// If MULTI_OPEN is NOT set, successive calls may return
   /// Err(AroundError::SourceAlreadyConsumed).
   fn open(&self) -> Result<Box<dyn Read + Send>, AroundError>;
+
+  /// Open the source and return a seekable byte stream.
+  /// Only valid when SEEKABLE capability is set.
+  /// Default: returns Err for non-seekable sources.
+  fn open_seekable(&self) -> Result<Box<dyn ReadSeek + Send + Sync>, AroundError> {
+    Err(AroundError::Internal {
+      message: "source does not support seeking".into(),
+    })
+  }
 
   /// Total content length in bytes, if known.
   fn content_length(&self) -> Option<u64>;

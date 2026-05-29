@@ -1,4 +1,4 @@
-//! around-codec-test-pcm: Minimal PCM decoder for extension contract testing.
+//! around-codec-test-pcm: Minimal PCM codec for extension contract testing.
 //!
 //! Handles raw PCM data with a simple header format:
 //! - 4 bytes: sample rate (u32 LE)
@@ -7,28 +7,31 @@
 //! - Remainder: raw PCM samples (interleaved if multi-channel)
 
 use around_core::{
-  AroundError, Decoder, DecoderFactory, FormatSignature, Metadata, SampleSpec, Source,
-  SourceRequirements,
+  AroundError, AudioStream, AudioStreamVTable, CodecInfo, FormatSignature, ReadSeek,
 };
-use std::sync::LazyLock;
+use std::io::Read;
 
-static PCM_FORMATS: LazyLock<Vec<FormatSignature>> = LazyLock::new(|| {
-  vec![FormatSignature::from_extension(
-    "pcm",
-    "Raw PCM with header",
-  )]
-});
+// ---------------------------------------------------------------------------
+// Format declarations
+// ---------------------------------------------------------------------------
 
-pub struct PcmDecoder {
-  metadata: Metadata,
-  output_format: SampleSpec,
+static PCM_FORMATS: &[FormatSignature] = &[FormatSignature::from_extension(
+  "pcm",
+  "Raw PCM with header",
+)];
+
+// ---------------------------------------------------------------------------
+// Internal state
+// ---------------------------------------------------------------------------
+
+struct PcmState {
   samples: Vec<f32>,
+  channels: u8,
   position: usize,
 }
 
-impl PcmDecoder {
-  fn decode_all(source: &dyn Source) -> Result<(Vec<f32>, SampleSpec, Metadata), AroundError> {
-    let mut reader = source.open()?;
+impl PcmState {
+  fn open(mut reader: Box<dyn ReadSeek + Send>) -> Result<(Self, u32), AroundError> {
     let mut raw = Vec::new();
     reader
       .read_to_end(&mut raw)
@@ -79,92 +82,127 @@ impl PcmDecoder {
       }
     };
 
-    let spec = SampleSpec::new(sample_rate, channels, bits_per_sample).map_err(|e| {
-      AroundError::DecodeError {
-        message: e.to_string(),
-      }
-    })?;
-
-    Ok((samples, spec, Metadata::new()))
+    Ok((
+      Self {
+        samples,
+        channels,
+        position: 0,
+      },
+      sample_rate,
+    ))
   }
-}
 
-impl Decoder for PcmDecoder {
-  fn read(&mut self, buf: &mut [f32]) -> Result<Option<usize>, AroundError> {
+  fn read_impl(&mut self, buf: &mut [f32]) -> Result<Option<usize>, AroundError> {
     if self.position >= self.samples.len() {
       return Ok(None);
     }
     let remaining = self.samples.len() - self.position;
-    let to_copy = std::cmp::min(remaining, buf.len());
+    let to_copy = remaining.min(buf.len());
     buf[..to_copy].copy_from_slice(&self.samples[self.position..self.position + to_copy]);
     self.position += to_copy;
-    Ok(Some(to_copy))
+    Ok(Some(to_copy / self.channels as usize))
   }
 
-  fn seek(&mut self, offset: u64) -> Result<(), AroundError> {
-    let offset = offset as usize;
-    if offset > self.samples.len() {
-      return Err(AroundError::DecodeError {
-        message: format!(
-          "seek offset {} exceeds {} samples",
-          offset,
-          self.samples.len()
-        ),
+  fn seek_impl(&mut self, offset: u64) -> Result<(), AroundError> {
+    let ch = self.channels as u64;
+    let sample_offset = offset * ch;
+    if sample_offset > self.samples.len() as u64 {
+      return Err(AroundError::InvalidPosition {
+        position_ms: 0,
+        duration_ms: None,
       });
     }
-    self.position = offset;
+    self.position = sample_offset as usize;
     Ok(())
   }
+}
 
-  fn metadata(&self) -> &Metadata {
-    &self.metadata
-  }
+// ---------------------------------------------------------------------------
+// VTable wrappers
+// ---------------------------------------------------------------------------
 
-  fn output_format(&self) -> SampleSpec {
-    self.output_format
+unsafe fn pcm_read(
+  data: *mut std::ffi::c_void,
+  buf: &mut [f32],
+) -> Result<Option<usize>, AroundError> {
+  let state = unsafe { &mut *(data as *mut PcmState) };
+  state.read_impl(buf)
+}
+
+unsafe fn pcm_seek(data: *mut std::ffi::c_void, frame: u64) -> Result<(), AroundError> {
+  let state = unsafe { &mut *(data as *mut PcmState) };
+  state.seek_impl(frame)
+}
+
+unsafe fn pcm_drop(data: *mut std::ffi::c_void) {
+  unsafe { drop(Box::from_raw(data as *mut PcmState)) };
+}
+
+// ---------------------------------------------------------------------------
+// Static vtable
+// ---------------------------------------------------------------------------
+
+static PCM_VTABLE: AudioStreamVTable = AudioStreamVTable {
+  read: pcm_read,
+  seek: pcm_seek,
+  drop: pcm_drop,
+};
+
+// ---------------------------------------------------------------------------
+// open_fn
+// ---------------------------------------------------------------------------
+
+fn pcm_open(reader: Box<dyn ReadSeek + Send>) -> Result<AudioStream, AroundError> {
+  let (state, sample_rate) = PcmState::open(reader)?;
+  let channels = state.channels;
+  let total_frames = (state.samples.len() / state.channels as usize) as u64;
+  let data = Box::into_raw(Box::new(state)) as *mut std::ffi::c_void;
+  unsafe {
+    Ok(AudioStream::new(
+      data,
+      &PCM_VTABLE,
+      sample_rate,
+      channels,
+      total_frames,
+    ))
   }
 }
 
-impl DecoderFactory for PcmDecoder {
-  fn supported_formats() -> &'static [FormatSignature] {
-    &PCM_FORMATS
-  }
+// ---------------------------------------------------------------------------
+// Public codec info
+// ---------------------------------------------------------------------------
 
-  fn source_requirements() -> SourceRequirements {
-    SourceRequirements::KNOWN_LENGTH
-  }
+/// Static codec descriptor. The engine calls `registry.push(PCM_INFO)`.
+pub static PCM_INFO: CodecInfo = CodecInfo::new("pcm", PCM_FORMATS, pcm_open);
 
-  fn can_decode(source: &dyn Source) -> bool {
-    source.identifier().to_lowercase().ends_with(".pcm")
-  }
-
-  fn open(source: Box<dyn Source>) -> Result<Self, AroundError> {
-    let (samples, output_format, metadata) = Self::decode_all(source.as_ref())?;
-    Ok(Self {
-      metadata,
-      output_format,
-      samples,
-      position: 0,
-    })
-  }
-}
+// ---------------------------------------------------------------------------
+// FFI entry point for dynamic loading
+// ---------------------------------------------------------------------------
 
 /// FFI entry point for dynamic loading.
-/// The extension manager calls this symbol after loading the shared library.
+/// Returns a C-ABI-compatible codec descriptor.
+#[repr(C)]
+pub struct CodecInfoFFI {
+  pub name: *const u8,
+  pub name_len: usize,
+  pub extensions: *const u8,
+  pub extensions_len: usize,
+  pub open_fn: unsafe extern "C" fn(reader: *mut std::ffi::c_void) -> *mut std::ffi::c_void,
+}
+
 #[no_mangle]
-pub extern "C" fn create_decoder() -> Box<around_core::ErasedDecoder> {
-  Box::new(around_core::ErasedDecoder {
-    supported_formats: PcmDecoder::supported_formats(),
-    source_requirements: PcmDecoder::source_requirements(),
-    inner: Box::new(PcmDecoder {
-      metadata: Metadata::new(),
-      output_format: SampleSpec {
-        sample_rate: 0,
-        channels: 0,
-        bit_depth: 0,
-      },
-      samples: Vec::new(),
-      position: 0,
-    }),
-  })
+pub extern "C" fn get_codec_info() -> CodecInfoFFI {
+  CodecInfoFFI {
+    name: b"pcm\0".as_ptr(),
+    name_len: 3,
+    extensions: b"pcm\0".as_ptr(),
+    extensions_len: 3,
+    open_fn: pcm_open_ffi,
+  }
+}
+
+/// FFI-compatible open wrapper. `reader` is a `*mut Box<dyn ReadSeek + Send + Sync>`.
+/// Stub — dynamic codec loading delegates to `pcm_open` via the vtable path.
+unsafe extern "C" fn pcm_open_ffi(_reader: *mut std::ffi::c_void) -> *mut std::ffi::c_void {
+  std::ptr::null_mut()
 }

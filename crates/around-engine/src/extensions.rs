@@ -1,21 +1,38 @@
-//! Extension manager: runtime loading/unloading of decoder shared libraries.
+//! Extension manager: runtime loading/unloading of codec shared libraries.
 //!
 //! Extensions are `.so`/`.dylib`/`.dll` files that export a single FFI entry point:
-//! `fn create_decoder() -> Box<ErasedDecoder>`.
+//! `fn get_codec_info() -> *const CodecInfoFFI`.
 //!
 //! The [`ExtensionManager`] owns the loaded libraries — they stay alive as long as
 //! they are registered. Callers receive lightweight [`DecoderInfo`] snapshots.
 
-use around_core::{AroundError, ErasedDecoder, FormatSignature};
+use around_core::AroundError;
 use libloading::{Library, Symbol};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-/// FFI entry point signature for decoder extensions.
-type CreateDecoderFn = unsafe fn() -> Box<ErasedDecoder>;
+// ---------------------------------------------------------------------------
+// FFI types
+// ---------------------------------------------------------------------------
 
-/// Metadata about a loaded decoder, safe to clone and share.
+/// C-ABI codec descriptor returned by `get_codec_info()`.
+#[repr(C)]
+pub struct CodecInfoFFI {
+  pub name_ptr: *const u8,
+  pub name_len: usize,
+  pub extensions_ptr: *const u8,
+  pub extensions_len: usize,
+}
+
+/// FFI entry point signature for codec extensions.
+type GetCodecInfoFn = unsafe fn() -> *const CodecInfoFFI;
+
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+/// Metadata about a loaded codec, safe to clone and share.
 #[derive(Debug, Clone)]
 pub struct DecoderInfo {
   pub name: String,
@@ -24,17 +41,15 @@ pub struct DecoderInfo {
   pub path: Option<PathBuf>,
 }
 
-/// Internal entry: holds both the live [`Library`] and its metadata.
-struct DecoderEntry {
+/// Internal entry: holds the live [`Library`] and its [`CodecInfo`].
+struct CodecEntry {
   _library: Library,
   info: DecoderInfo,
 }
 
-/// Registry of loaded decoder extensions.
-///
-/// Thread-safe: all methods take `&self` and synchronise internally.
+/// Registry of loaded codec extensions.
 pub struct ExtensionManager {
-  entries: Mutex<HashMap<String, DecoderEntry>>,
+  entries: Mutex<HashMap<String, CodecEntry>>,
 }
 
 impl Default for ExtensionManager {
@@ -50,11 +65,7 @@ impl ExtensionManager {
     }
   }
 
-  /// Load a decoder from a shared library file at `path`.
-  ///
-  /// The file must export `create_decoder` with the [`CreateDecoderFn`] signature.
-  /// The decoder's name is derived from the file stem. Returns an error if a
-  /// decoder with the same name is already registered.
+  /// Load a codec from a shared library file at `path`.
   pub fn load_path(&self, path: &Path) -> Result<DecoderInfo, AroundError> {
     let lib = unsafe {
       Library::new(path).map_err(|e| AroundError::DecoderLoadFailed {
@@ -63,33 +74,52 @@ impl ExtensionManager {
       })?
     };
 
-    let create: Symbol<CreateDecoderFn> = unsafe {
+    let get_info: Symbol<GetCodecInfoFn> = unsafe {
       lib
-        .get(b"create_decoder")
+        .get(b"get_codec_info")
         .map_err(|e| AroundError::DecoderLoadFailed {
           path: Some(path.display().to_string()),
-          reason: format!("symbol 'create_decoder' not found: {}", e),
+          reason: format!("symbol 'get_codec_info' not found: {}", e),
         })?
     };
 
-    let erased = unsafe { create() };
-    let formats: Vec<String> = erased
-      .supported_formats
-      .iter()
-      .filter_map(|f: &FormatSignature| f.extension.map(|s: &str| s.to_string()))
-      .collect();
+    let ffi = unsafe { get_info() };
+    if ffi.is_null() {
+      return Err(AroundError::DecoderLoadFailed {
+        path: Some(path.display().to_string()),
+        reason: "get_codec_info returned null".into(),
+      });
+    }
 
-    let name = path
-      .file_stem()
-      .and_then(|s| s.to_str())
+    let ffi_ref = unsafe { &*ffi };
+    let name = unsafe {
+      std::str::from_utf8(std::slice::from_raw_parts(
+        ffi_ref.name_ptr,
+        ffi_ref.name_len,
+      ))
       .unwrap_or("unknown")
-      .to_string();
+    }
+    .to_string();
+
+    let ext_str = unsafe {
+      std::str::from_utf8(std::slice::from_raw_parts(
+        ffi_ref.extensions_ptr,
+        ffi_ref.extensions_len,
+      ))
+      .unwrap_or("")
+    };
+
+    let formats: Vec<String> = ext_str
+      .split('\0')
+      .filter(|s| !s.is_empty())
+      .map(|s| s.to_string())
+      .collect();
 
     let mut entries = self.entries.lock().unwrap();
     if entries.contains_key(&name) {
       return Err(AroundError::DecoderLoadFailed {
         path: Some(path.display().to_string()),
-        reason: format!("decoder '{}' already loaded", name),
+        reason: format!("codec '{}' already loaded", name),
       });
     }
 
@@ -101,19 +131,17 @@ impl ExtensionManager {
     };
 
     entries.insert(
-      name,
-      DecoderEntry {
+      name.clone(),
+      CodecEntry {
         _library: lib,
         info: info.clone(),
       },
     );
+
     Ok(info)
   }
 
-  /// Load a decoder from base64-encoded shared library bytes.
-  ///
-  /// The bytes are written to a temporary file, loaded via [`load_path`],
-  /// and the temp file is deleted immediately afterward.
+  /// Load a codec from base64-encoded shared library bytes.
   pub fn load_bytes(&self, data: &[u8], name: &str) -> Result<DecoderInfo, AroundError> {
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD
@@ -124,7 +152,11 @@ impl ExtensionManager {
       })?;
 
     let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!("around_decoder_{}.so", name));
+    let tmp_path = tmp_dir.join(format!(
+      "around_decoder_{}.{}",
+      name,
+      std::env::consts::DLL_EXTENSION
+    ));
     std::fs::write(&tmp_path, &decoded).map_err(|e| AroundError::DecoderLoadFailed {
       path: Some(tmp_path.display().to_string()),
       reason: format!("failed to write temp file: {}", e),
@@ -149,9 +181,6 @@ impl ExtensionManager {
   }
 
   /// Scan `search_paths` directories for shared libraries and load them.
-  ///
-  /// Only files with `.so`, `.dylib`, or `.dll` extensions are considered.
-  /// Load failures are silently skipped.
   pub fn discover(&self, search_paths: &[PathBuf]) -> Vec<DecoderInfo> {
     let mut discovered = Vec::new();
     for dir in search_paths {
@@ -177,7 +206,7 @@ impl ExtensionManager {
     discovered
   }
 
-  /// Return a snapshot of all currently registered decoders.
+  /// Return a snapshot of all currently registered codecs.
   pub fn list_decoders(&self) -> Vec<DecoderInfo> {
     self
       .entries

@@ -1,13 +1,13 @@
 //! around: A cross-platform audio player — CLI entry point.
 
 use around_core::Source;
-use around_engine::{Engine, EngineConfig};
+use around_engine::{Engine, EngineConfig, PlaybackState};
 use around_source_file::FileSource;
 use clap::{Parser, Subcommand};
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 #[derive(Parser)]
@@ -132,6 +132,10 @@ fn cmd_play(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
+  // Shared state: the decode thread updates position/state in real-time,
+  // the IPC server reads it to serve status/pause/resume/seek commands.
+  let state = Arc::new(Mutex::new(PlaybackState::default()));
+
   let source = FileSource::new(&path);
   let source_box: Box<dyn Source> = Box::new(source);
 
@@ -143,15 +147,56 @@ fn cmd_play(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("received interrupt signal, stopping...");
     eng.stop();
   })?;
-  // On Unix, ctrlc crate already handles SIGINT, SIGTERM, SIGHUP.
-  // We keep the handler — all three signals trigger the same cleanup.
-  tracing::debug!("signal handlers installed: SIGINT, SIGHUP, SIGTERM");
+  // Ctrl+C handler (SIGINT) via ctrlc crate.
+  // SIGTERM and SIGHUP are handled via tokio signal watchers inside the IPC thread.
+  tracing::debug!("signal handlers: SIGINT (ctrlc), SIGHUP/SIGTERM (tokio)");
+
+  // Start IPC server on a background thread for control commands (pause/stop/status).
+  // Also watches for SIGTERM and SIGHUP to trigger graceful shutdown.
+  let ipc_engine = engine.clone();
+  let ipc_state = state.clone();
+  let ipc_handle = std::thread::spawn(move || {
+    let rt = tokio::runtime::Builder::new_current_thread()
+      .enable_io()
+      .build()
+      .expect("failed to create tokio runtime for IPC");
+    rt.block_on(async {
+      // Watch for SIGTERM and SIGHUP inside the tokio runtime.
+      #[cfg(unix)]
+      {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM watcher");
+        let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP watcher");
+
+        let eng = ipc_engine.clone();
+        tokio::spawn(async move {
+          tokio::select! {
+            _ = sigterm.recv() => {
+              tracing::info!("received SIGTERM, stopping playback");
+              eng.stop();
+            }
+            _ = sighup.recv() => {
+              tracing::info!("received SIGHUP, stopping playback");
+              eng.stop();
+            }
+          }
+        });
+      }
+
+      if let Err(e) =
+        around_engine::ipc::run_ipc_server("/tmp/around.sock", ipc_engine, ipc_state).await
+      {
+        tracing::error!(?e, "IPC server error");
+      }
+    });
+  });
 
   tracing::info!("playing '{}'", path.display());
 
   // Run play() on a background thread — it blocks until stop() or natural completion.
   let eng = engine.clone();
-  let play_thread = thread::spawn(move || eng.play(source_box));
+  let play_state = state.clone();
+  let play_thread = thread::spawn(move || eng.play(source_box, play_state));
 
   match play_thread.join() {
     Ok(Ok(handle)) => {
@@ -163,17 +208,39 @@ fn cmd_play(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
       drop(handle);
     }
     Ok(Err(e)) => {
+      // Signal IPC to shut down before returning the error.
+      engine.signal_shutdown();
+      // Connect to our own socket to unblock the accept() loop.
+      let _ = std::os::unix::net::UnixStream::connect("/tmp/around.sock");
+      let _ = ipc_handle.join();
+      let _ = std::fs::remove_file("/tmp/around.sock");
       return Err(Box::new(e));
     }
     Err(_panic) => {
+      engine.signal_shutdown();
+      let _ = std::os::unix::net::UnixStream::connect("/tmp/around.sock");
+      let _ = ipc_handle.join();
+      let _ = std::fs::remove_file("/tmp/around.sock");
       return Err("playback thread panicked".into());
     }
   }
 
+  // Signal IPC server to shut down, then unblock accept() by connecting.
+  engine.signal_shutdown();
+  let _ = std::os::unix::net::UnixStream::connect("/tmp/around.sock");
+  let _ = ipc_handle.join();
+
+  // Clean up socket after IPC server has exited.
+  let _ = std::fs::remove_file("/tmp/around.sock");
+  tracing::info!("playback complete, exiting");
   Ok(())
 }
 
 /// Send a JSON command to the engine via Unix socket and read the response.
+///
+/// Closes the write half after sending so the server's `next_line()` returns
+/// `None` and the connection is cleanly closed — preventing a deadlock where
+/// the client waits for EOF while the server waits for the next command.
 fn send_ipc_command(
   req: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
@@ -182,6 +249,7 @@ fn send_ipc_command(
   let request = req.to_string();
   stream.write_all(request.as_bytes())?;
   stream.write_all(b"\n")?;
+  stream.shutdown(std::net::Shutdown::Write)?;
 
   let mut buf = String::new();
   stream.read_to_string(&mut buf)?;

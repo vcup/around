@@ -14,7 +14,6 @@ workspace = true
 around-core = { workspace = true }
 around-source-file = { workspace = true }
 around-codec-wav = { workspace = true }
-symphonia = { workspace = true, features = ["wav"] }
 kdl = { workspace = true }
 tracing = { workspace = true }
 cpal = { workspace = true }
@@ -23,6 +22,7 @@ libloading = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 base64 = { workspace = true }
+crossbeam = { workspace = true }
 
 [[bench]]
 name = "pipeline_bench"
@@ -31,3 +31,4 @@ harness = false
 [dev-dependencies]
 criterion = { workspace = true }
 around-source-file = { workspace = true }
+around-codec-test-pcm = { workspace = true }
