@@ -1,46 +1,38 @@
 //! IPC codec: message framing and serialisation format.
 //!
-//! Decoupled from transport: JSON can run over Unix sockets or TCP.
-//! Future: Protobuf codec (feature `ipc-protobuf`) with length-prefixed framing.
+//! Cross-platform — decoupled from transport.
+//! JSON newline-delimited protocol. Future: Protobuf codec.
 
-use crate::ipc::{IpcCommand, IpcResponse};
+use crate::ipc_types::{IpcCommand, IpcResponse};
 use serde_json;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
 // ---------------------------------------------------------------------------
-// JsonLineCodec — newline-delimited JSON (current default)
+// JsonLineCodec — newline-delimited JSON (cross-platform)
 // ---------------------------------------------------------------------------
 
 /// Newline-delimited JSON codec for IPC.
 ///
 /// Framing: each message is a single line of JSON, terminated by `\n`.
 /// Serialisation: `serde_json`.
-///
-/// This is the default codec. A future [`ProtobufCodec`] would use
-/// length-prefixed binary framing + `prost` serialization.
 #[derive(Clone, Copy)]
 pub(crate) struct JsonLineCodec;
 
 impl JsonLineCodec {
   /// Read one command from the stream.
-  ///
-  /// Reads a newline-delimited line, trims whitespace, ignores empty lines,
-  /// and deserialises as [`IpcCommand`].
-  pub(crate) async fn read_command<S: AsyncRead + Unpin>(
+  pub(crate) async fn read_command<R: AsyncRead + Unpin>(
     &self,
-    reader: &mut S,
+    reader: &mut BufReader<R>,
   ) -> std::io::Result<IpcCommand> {
-    let mut lines = BufReader::new(reader).lines();
     loop {
-      let line = match lines.next_line().await? {
-        Some(l) => l,
-        None => {
-          return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "IPC connection closed",
-          ))
-        }
-      };
+      let mut line = String::new();
+      let n = reader.read_line(&mut line).await?;
+      if n == 0 {
+        return Err(std::io::Error::new(
+          std::io::ErrorKind::UnexpectedEof,
+          "IPC connection closed",
+        ));
+      }
       let line = line.trim().to_string();
       if line.is_empty() {
         continue;
@@ -51,11 +43,9 @@ impl JsonLineCodec {
   }
 
   /// Write one response to the stream.
-  ///
-  /// Serialises as JSON, appends `\n`, writes to stream.
-  pub(crate) async fn write_response<S: AsyncWrite + Unpin>(
+  pub(crate) async fn write_response<W: AsyncWrite + Unpin>(
     &self,
-    writer: &mut S,
+    writer: &mut W,
     resp: &IpcResponse,
   ) -> std::io::Result<()> {
     let mut json = serde_json::to_string(resp)

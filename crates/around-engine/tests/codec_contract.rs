@@ -231,7 +231,7 @@ fn codec_registry_by_extension_no_match_returns_empty() {
 }
 
 #[test]
-fn codec_registry_by_magic_matches_RIFF() {
+fn codec_registry_by_magic_matches_riff() {
   let mut registry = CodecRegistry::new();
   registry.push(around_codec_wav::WAV_INFO);
 

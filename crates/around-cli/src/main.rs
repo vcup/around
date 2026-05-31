@@ -4,8 +4,8 @@ use around_core::Source;
 use around_engine::{Engine, EngineConfig, PlaybackState};
 use around_source_file::FileSource;
 use clap::{Parser, Subcommand};
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -155,6 +155,9 @@ fn cmd_play(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
   // Also watches for SIGTERM and SIGHUP to trigger graceful shutdown.
   let ipc_engine = engine.clone();
   let ipc_state = state.clone();
+  // Port file for TCP IPC — the server writes its port here so clients can discover it.
+  let port_file = std::env::temp_dir().join("around.port");
+  let port_file_path = port_file.to_str().unwrap().to_string();
   let ipc_handle = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -184,7 +187,7 @@ fn cmd_play(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
       }
 
       if let Err(e) =
-        around_engine::ipc::run_ipc_server("/tmp/around.sock", ipc_engine, ipc_state).await
+        around_engine::ipc::run_ipc_server(&port_file_path, ipc_engine, ipc_state).await
       {
         tracing::error!(?e, "IPC server error");
       }
@@ -210,49 +213,69 @@ fn cmd_play(path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(Err(e)) => {
       // Signal IPC to shut down before returning the error.
       engine.signal_shutdown();
-      // Connect to our own socket to unblock the accept() loop.
-      let _ = std::os::unix::net::UnixStream::connect("/tmp/around.sock");
+      // Connect to our own server to unblock the accept() loop.
+      let _ = std::fs::read_to_string(&port_file)
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .and_then(|p| TcpStream::connect(format!("127.0.0.1:{}", p)).ok());
       let _ = ipc_handle.join();
-      let _ = std::fs::remove_file("/tmp/around.sock");
+      let _ = std::fs::remove_file(&port_file);
       return Err(Box::new(e));
     }
     Err(_panic) => {
       engine.signal_shutdown();
-      let _ = std::os::unix::net::UnixStream::connect("/tmp/around.sock");
+      let _ = std::fs::read_to_string(&port_file)
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .and_then(|p| TcpStream::connect(format!("127.0.0.1:{}", p)).ok());
       let _ = ipc_handle.join();
-      let _ = std::fs::remove_file("/tmp/around.sock");
+      let _ = std::fs::remove_file(&port_file);
       return Err("playback thread panicked".into());
     }
   }
 
   // Signal IPC server to shut down, then unblock accept() by connecting.
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect("/tmp/around.sock");
+  let _ = std::fs::read_to_string(&port_file)
+    .ok()
+    .and_then(|p| p.trim().parse::<u16>().ok())
+    .and_then(|p| TcpStream::connect(format!("127.0.0.1:{}", p)).ok());
   let _ = ipc_handle.join();
 
-  // Clean up socket after IPC server has exited.
-  let _ = std::fs::remove_file("/tmp/around.sock");
+  // Clean up port file after IPC server has exited.
+  let _ = std::fs::remove_file(&port_file);
   tracing::info!("playback complete, exiting");
   Ok(())
 }
 
-/// Send a JSON command to the engine via Unix socket and read the response.
+/// Send a JSON command to the engine via TCP and read the response.
 ///
-/// Closes the write half after sending so the server's `next_line()` returns
-/// `None` and the connection is cleanly closed — preventing a deadlock where
-/// the client waits for EOF while the server waits for the next command.
+/// Reads the engine's port from `temp_dir/around.port`, connects via TCP,
+/// sends the JSON request newline-terminated, shuts down the write half,
+/// and reads the JSON response.
 fn send_ipc_command(
   req: &serde_json::Value,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-  let mut stream = UnixStream::connect("/tmp/around.sock")?;
+  let port_file = std::env::temp_dir().join("around.port");
+  let port = std::fs::read_to_string(&port_file)
+    .map_err(|_| "no engine instance running (port file not found)")?;
+  let port: u16 = port
+    .trim()
+    .parse()
+    .map_err(|_| format!("invalid port in port file: {}", port))?;
+
+  let stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
+  let mut reader = BufReader::new(&stream);
+  let mut writer = BufWriter::new(&stream);
 
   let request = req.to_string();
-  stream.write_all(request.as_bytes())?;
-  stream.write_all(b"\n")?;
+  writer.write_all(request.as_bytes())?;
+  writer.write_all(b"\n")?;
+  writer.flush()?;
   stream.shutdown(std::net::Shutdown::Write)?;
 
   let mut buf = String::new();
-  stream.read_to_string(&mut buf)?;
+  reader.read_to_string(&mut buf)?;
 
   let response: serde_json::Value = serde_json::from_str(&buf)?;
   Ok(response)

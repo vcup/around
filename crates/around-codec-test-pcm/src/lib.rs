@@ -193,8 +193,10 @@ pub struct CodecInfoFFI {
 #[no_mangle]
 pub extern "C" fn get_codec_info() -> CodecInfoFFI {
   CodecInfoFFI {
+    #[allow(clippy::manual_c_str_literals)]
     name: b"pcm\0".as_ptr(),
     name_len: 3,
+    #[allow(clippy::manual_c_str_literals)]
     extensions: b"pcm\0".as_ptr(),
     extensions_len: 3,
     open_fn: pcm_open_ffi,

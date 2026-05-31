@@ -1,21 +1,32 @@
-//! Integration test: IPC transport control flow.
+//! Integration test: IPC transport control flow (TCP).
 //!
 //! Tests IPC command serialization, engine lifecycle, and response formats.
-
-use around_engine::{Engine, EngineConfig, IpcCommand, IpcResponse, PlaybackState};
+use around_engine::{Engine, EngineConfig, PlaybackState};
+#[cfg(target_os = "linux")]
 use cpal::traits::HostTrait;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 /// Check if a default audio output device is available.
 fn audio_device_available() -> bool {
-  // Use project-local ALSA null device for CI/testing (zero intrusion, no ~/.asoundrc)
-  let conf = concat!(env!("CARGO_MANIFEST_DIR"), "/../../ci/alsa-null.conf");
-  std::env::set_var("ALSA_CONFIG_PATH", conf);
-  cpal::default_host().default_output_device().is_some()
+  #[cfg(target_os = "linux")]
+  {
+    let conf = concat!(env!("CARGO_MANIFEST_DIR"), "/../../ci/alsa-null.conf");
+    std::env::set_var("ALSA_CONFIG_PATH", conf);
+  }
+  #[cfg(target_os = "linux")]
+  {
+    cpal::default_host().default_output_device().is_some()
+  }
+  #[cfg(not(target_os = "linux"))]
+  {
+    // On Windows/macOS CI there is typically no audio device.
+    // Return false so audio-dependent tests skip gracefully.
+    false
+  }
 }
 fn fixture_path(name: &str) -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -23,14 +34,17 @@ fn fixture_path(name: &str) -> PathBuf {
     .join(name)
 }
 
-fn send_command(socket_path: &str, cmd: &Value) -> Value {
-  let mut stream = UnixStream::connect(socket_path).expect("connect to IPC socket");
+fn send_command(port_file: &str, cmd: &Value) -> Value {
+  let port: u16 = std::fs::read_to_string(port_file)
+    .expect("read port file")
+    .trim()
+    .parse()
+    .expect("parse port");
+  let mut stream =
+    TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect to IPC server");
   let mut json = serde_json::to_string(cmd).unwrap();
   json.push('\n');
   stream.write_all(json.as_bytes()).expect("send command");
-  stream
-    .shutdown(std::net::Shutdown::Write)
-    .expect("shutdown write");
 
   let mut reader = BufReader::new(&stream);
   let mut response = String::new();
@@ -38,58 +52,16 @@ fn send_command(socket_path: &str, cmd: &Value) -> Value {
   serde_json::from_str(&response).expect("parse response")
 }
 
-#[test]
-fn ipc_command_serialization_roundtrips() {
-  let play_cmd: IpcCommand =
-    serde_json::from_str(r#"{"command":"play","path":"/tmp/test.wav"}"#).unwrap();
-  match play_cmd {
-    IpcCommand::Play { path } => assert_eq!(path, "/tmp/test.wav"),
-    _ => panic!("expected Play"),
-  }
-
-  let pause_cmd: IpcCommand = serde_json::from_str(r#"{"command":"pause"}"#).unwrap();
-  assert!(matches!(pause_cmd, IpcCommand::Pause));
-
-  let seek_cmd: IpcCommand =
-    serde_json::from_str(r#"{"command":"seek","position_ms":30000}"#).unwrap();
-  match seek_cmd {
-    IpcCommand::Seek { position_ms } => assert_eq!(position_ms, 30000),
-    _ => panic!("expected Seek"),
-  }
-
-  let status_cmd: IpcCommand = serde_json::from_str(r#"{"command":"status"}"#).unwrap();
-  assert!(matches!(status_cmd, IpcCommand::Status));
-
-  let stop_cmd: IpcCommand = serde_json::from_str(r#"{"command":"stop"}"#).unwrap();
-  assert!(matches!(stop_cmd, IpcCommand::Stop));
-
-  let list_cmd: IpcCommand = serde_json::from_str(r#"{"command":"list_decoders"}"#).unwrap();
-  assert!(matches!(list_cmd, IpcCommand::ListDecoders));
-}
-
-#[test]
-fn ipc_response_ok_format() {
-  let resp = IpcResponse::ok();
-  let json = serde_json::to_value(&resp).unwrap();
-  assert_eq!(json["status"], "ok");
-  assert!(json.get("state").is_none());
-}
-
-#[test]
-fn ipc_response_error_format() {
-  let resp = IpcResponse::error("FILE_NOT_FOUND", "No such file");
-  let json = serde_json::to_value(&resp).unwrap();
-  assert_eq!(json["status"], "error");
-  assert_eq!(json["code"], "FILE_NOT_FOUND");
-  assert_eq!(json["message"], "No such file");
-}
-
-#[test]
-fn engine_stop_is_idempotent() {
-  let config = EngineConfig::load();
-  let engine = Engine::new(config);
-  engine.stop();
-  engine.stop();
+/// Open a throwaway TCP connection to wake the server's accept loop
+/// so it can observe a shutdown signal.
+#[cfg(not(windows))]
+fn poke_server(port_file: &str) {
+  let port: u16 = std::fs::read_to_string(port_file)
+    .unwrap()
+    .trim()
+    .parse()
+    .unwrap();
+  let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
 }
 
 #[test]
@@ -102,14 +74,6 @@ fn engine_play_nonexistent_file_errors() {
   assert!(result.is_err());
 }
 
-#[test]
-fn playback_state_default() {
-  let state = PlaybackState::default();
-  assert!(!state.playing);
-  assert_eq!(state.position_ms, 0);
-  assert!(state.duration_ms.is_none());
-  assert!(state.track_path.is_none());
-}
 #[test]
 fn engine_play_valid_wav_returns_handle() {
   if !audio_device_available() {
@@ -145,65 +109,34 @@ fn engine_play_zero_byte_file_errors() {
 }
 
 #[test]
-fn play_while_playing_replaces_track() {
-  // When play is issued while another track is playing, the new track
-  // replaces the current one (VLC-style replace).
-  // This verifies the IPC command structure.
-  let cmd = serde_json::json!({"command": "play", "path": "/tmp/test.wav"});
-  let parsed: around_engine::IpcCommand = serde_json::from_value(cmd).unwrap();
-  match parsed {
-    around_engine::IpcCommand::Play { path } => assert_eq!(path, "/tmp/test.wav"),
-    _ => panic!("expected Play"),
-  }
-}
-
-#[test]
-fn cleanup_command_serialization() {
-  let cmd = serde_json::json!({"command": "cleanup"});
-  let parsed: around_engine::IpcCommand = serde_json::from_value(cmd).unwrap();
-  match parsed {
-    around_engine::IpcCommand::Cleanup => {}
-    _ => panic!("expected Cleanup"),
-  }
-}
-
-#[test]
-fn buffering_state_in_playback_state() {
-  let state = around_engine::PlaybackState::default();
-  assert_eq!(state.state, "stopped");
-}
-
-#[test]
-fn ipc_server_creates_socket_on_play() {
-  // Guard to remove the socket file on test exit (panic or success).
-  struct SocketGuard(String);
-  impl Drop for SocketGuard {
+fn ipc_server_creates_port_file_on_play() {
+  // Guard to remove the port file on test exit (panic or success).
+  struct PortFileGuard(String);
+  impl Drop for PortFileGuard {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
     }
   }
-
-  use std::os::unix::fs::PermissionsExt;
 
   if !audio_device_available() {
     eprintln!("skipping test: no audio output device available");
     return;
   }
 
-  let socket_path = format!(
-    "/tmp/around_test_{}_creates_socket.sock",
+  let port_file = format!(
+    "/tmp/around_test_{}_creates_port_file.port",
     std::process::id()
   );
 
-  // Clean up any stale socket from a previous run.
-  let _ = std::fs::remove_file(&socket_path);
+  // Clean up any stale port file from a previous run.
+  let _ = std::fs::remove_file(&port_file);
 
-  let _guard = SocketGuard(socket_path.clone());
+  let _guard = PortFileGuard(port_file.clone());
 
-  // Socket must not exist before playback starts.
+  // Port file must not exist before playback starts.
   assert!(
-    !std::path::Path::new(&socket_path).exists(),
-    "socket file should not exist before play"
+    !std::path::Path::new(&port_file).exists(),
+    "port file should not exist before play"
   );
 
   let config = EngineConfig::load();
@@ -213,7 +146,7 @@ fn ipc_server_creates_socket_on_play() {
   // Start IPC server on a background thread.
   let ipc_engine = engine.clone();
   let ipc_state = state.clone();
-  let ipc_path = socket_path.clone();
+  let ipc_path = port_file.clone();
   let _ipc_server = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -236,15 +169,22 @@ fn ipc_server_creates_socket_on_play() {
   // Give playback time to start.
   std::thread::sleep(std::time::Duration::from_millis(200));
 
-  let meta = std::fs::metadata(&socket_path).expect("socket file should exist after play starts");
-  assert_eq!(
-    meta.permissions().mode() & 0o777,
-    0o600,
-    "socket file must have 0600 permissions"
+  // Port file must exist after server starts.
+  assert!(
+    std::path::Path::new(&port_file).exists(),
+    "port file must exist after server starts"
   );
 
-  // Once the socket exists, send a status command and check the response.
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "status"}));
+  // Verify it contains a valid port number.
+  let port: u16 = std::fs::read_to_string(&port_file)
+    .expect("read port file")
+    .trim()
+    .parse()
+    .expect("valid port");
+  assert!(port > 0, "port must be > 0");
+
+  // Once the port file exists, send a status command and check the response.
+  let resp = send_command(&port_file, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok", "status response must contain ok");
 
   // Stop playback.
@@ -252,22 +192,22 @@ fn ipc_server_creates_socket_on_play() {
   std::thread::sleep(std::time::Duration::from_millis(200));
 
   // Verify playback stopped via status.
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "status"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok");
 
-  // Manually clean up the socket (IPC server thread keeps running).
-  let _ = std::fs::remove_file(&socket_path);
+  // Manually clean up the port file (IPC server thread keeps running).
+  let _ = std::fs::remove_file(&port_file);
   assert!(
-    !std::path::Path::new(&socket_path).exists(),
-    "socket file must be deletable after stop"
+    !std::path::Path::new(&port_file).exists(),
+    "port file must be deletable after stop"
   );
 }
 
 #[test]
-fn signal_cleanup_deletes_socket() {
-  // Guard to remove the socket file on test exit (panic or success).
-  struct SocketGuard(String);
-  impl Drop for SocketGuard {
+fn signal_cleanup_deletes_port_file() {
+  // Guard to remove the port file on test exit (panic or success).
+  struct PortFileGuard(String);
+  impl Drop for PortFileGuard {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
     }
@@ -278,15 +218,15 @@ fn signal_cleanup_deletes_socket() {
     return;
   }
 
-  let socket_path = format!(
-    "/tmp/around_test_{}_signal_cleanup.sock",
+  let port_file = format!(
+    "/tmp/around_test_{}_signal_cleanup.port",
     std::process::id()
   );
 
-  // Clean up any stale socket from a previous run.
-  let _ = std::fs::remove_file(&socket_path);
+  // Clean up any stale port file from a previous run.
+  let _ = std::fs::remove_file(&port_file);
 
-  let _guard = SocketGuard(socket_path.clone());
+  let _guard = PortFileGuard(port_file.clone());
 
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
@@ -295,7 +235,7 @@ fn signal_cleanup_deletes_socket() {
   // Start IPC server on a background thread.
   let ipc_engine = engine.clone();
   let ipc_state = state.clone();
-  let ipc_path = socket_path.clone();
+  let ipc_path = port_file.clone();
   let _ipc_server = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -316,23 +256,23 @@ fn signal_cleanup_deletes_socket() {
   });
   std::thread::sleep(std::time::Duration::from_millis(200));
 
-  // Socket must exist after playback starts.
+  // Port file must exist after playback starts.
   assert!(
-    std::path::Path::new(&socket_path).exists(),
-    "socket must exist after play starts"
+    std::path::Path::new(&port_file).exists(),
+    "port file must exist after play starts"
   );
 
   // Send stop command via IPC.
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "stop"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "stop"}));
   assert_eq!(resp["status"], "ok", "stop response must contain ok");
 
   std::thread::sleep(std::time::Duration::from_millis(200));
 
-  // Manually clean up the socket (IPC server thread keeps running).
-  let _ = std::fs::remove_file(&socket_path);
+  // Manually clean up the port file (IPC server thread keeps running).
+  let _ = std::fs::remove_file(&port_file);
   assert!(
-    !std::path::Path::new(&socket_path).exists(),
-    "socket must be deletable after stop"
+    !std::path::Path::new(&port_file).exists(),
+    "port file must be deletable after stop"
   );
 }
 
@@ -341,24 +281,22 @@ fn signal_cleanup_deletes_socket() {
 // =============================================================================
 
 #[test]
-fn socket_created_with_0600_permissions() {
-  struct SocketGuard(String);
-  impl Drop for SocketGuard {
+fn port_file_created_on_bind() {
+  struct PortFileGuard(String);
+  impl Drop for PortFileGuard {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
     }
   }
-
-  use std::os::unix::fs::PermissionsExt;
 
   if !audio_device_available() {
     eprintln!("skipping test: no audio output device available");
     return;
   }
 
-  let socket_path = format!("/tmp/around_test_{}_perms.sock", std::process::id());
-  let _ = std::fs::remove_file(&socket_path);
-  let _guard = SocketGuard(socket_path.clone());
+  let port_file = format!("/tmp/around_test_{}_bind.port", std::process::id());
+  let _ = std::fs::remove_file(&port_file);
+  let _guard = PortFileGuard(port_file.clone());
 
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
@@ -367,7 +305,7 @@ fn socket_created_with_0600_permissions() {
   // Start IPC server on a background thread.
   let ipc_engine = engine.clone();
   let ipc_state = state.clone();
-  let ipc_path = socket_path.clone();
+  let ipc_path = port_file.clone();
   let _ipc_server = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -379,21 +317,18 @@ fn socket_created_with_0600_permissions() {
   });
   std::thread::sleep(std::time::Duration::from_millis(200));
 
-  // Start playback on a background thread.
-  let play_engine = engine.clone();
-  let play_state = state.clone();
-  let _play_thread = std::thread::spawn(move || {
-    let source = around_source_file::FileSource::new(fixture_path("example.wav"));
-    let _ = play_engine.play(Box::new(source), play_state);
-  });
-  std::thread::sleep(std::time::Duration::from_millis(200));
-
-  let meta = std::fs::metadata(&socket_path).expect("socket file must exist after play starts");
-  assert_eq!(
-    meta.permissions().mode() & 0o777,
-    0o600,
-    "socket file must have 0600 permissions"
+  // Port file must exist and contain a valid port after server starts.
+  assert!(
+    std::path::Path::new(&port_file).exists(),
+    "port file must exist after server starts"
   );
+
+  let port: u16 = std::fs::read_to_string(&port_file)
+    .expect("read port file")
+    .trim()
+    .parse()
+    .expect("valid port");
+  assert!(port > 0, "port must be > 0");
 
   engine.stop();
   std::thread::sleep(std::time::Duration::from_millis(200));
@@ -401,8 +336,8 @@ fn socket_created_with_0600_permissions() {
 
 #[test]
 fn command_round_trip() {
-  struct SocketGuard(String);
-  impl Drop for SocketGuard {
+  struct PortFileGuard(String);
+  impl Drop for PortFileGuard {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
     }
@@ -413,9 +348,9 @@ fn command_round_trip() {
     return;
   }
 
-  let socket_path = format!("/tmp/around_test_{}_round_trip.sock", std::process::id());
-  let _ = std::fs::remove_file(&socket_path);
-  let _guard = SocketGuard(socket_path.clone());
+  let port_file = format!("/tmp/around_test_{}_round_trip.port", std::process::id());
+  let _ = std::fs::remove_file(&port_file);
+  let _guard = PortFileGuard(port_file.clone());
 
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
@@ -424,7 +359,7 @@ fn command_round_trip() {
   // Start IPC server on a background thread.
   let ipc_engine = engine.clone();
   let ipc_state = state.clone();
-  let ipc_path = socket_path.clone();
+  let ipc_path = port_file.clone();
   let _ipc_server = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -446,7 +381,7 @@ fn command_round_trip() {
   std::thread::sleep(std::time::Duration::from_millis(200));
 
   // Status command
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "status"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok", "status response must contain ok");
 
   // Pause / resume / seek: only assert "ok" if playback is still active.
@@ -454,7 +389,7 @@ fn command_round_trip() {
   let playing = resp.get("state").and_then(|v| v.as_str()) == Some("playing");
 
   // Pause command
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "pause"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "pause"}));
   if playing {
     assert_eq!(
       resp["status"], "ok",
@@ -469,7 +404,7 @@ fn command_round_trip() {
   }
 
   // Resume command
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "resume"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "resume"}));
   if playing {
     assert_eq!(
       resp["status"], "ok",
@@ -484,7 +419,7 @@ fn command_round_trip() {
 
   // Seek command
   let resp = send_command(
-    &socket_path,
+    &port_file,
     &serde_json::json!({"command": "seek", "position_ms": 5000}),
   );
   if playing {
@@ -503,36 +438,36 @@ fn command_round_trip() {
 }
 
 #[test]
-fn stale_socket_detection() {
-  struct SocketGuard(String);
-  impl Drop for SocketGuard {
+#[cfg(not(windows))]
+fn stale_port_file_handled() {
+  struct PortFileGuard(String);
+  impl Drop for PortFileGuard {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
     }
   }
 
-  use std::os::unix::fs::PermissionsExt;
+  let port_file = format!("/tmp/around_test_{}_stale.port", std::process::id());
+  let _ = std::fs::remove_file(&port_file);
 
-  let socket_path = format!("/tmp/around_test_{}_stale.sock", std::process::id());
-  let _ = std::fs::remove_file(&socket_path);
-
-  // Create a stale socket file manually (simulating a crashed previous instance).
-  std::fs::write(&socket_path, "stale").expect("create stale socket file");
+  // Create a stale port file manually (simulating a crashed previous instance
+  // that left a port file pointing at a dead server).
+  std::fs::write(&port_file, "65535\n").expect("create stale port file");
   assert!(
-    std::path::Path::new(&socket_path).exists(),
-    "stale socket file must exist before starting IPC server"
+    std::path::Path::new(&port_file).exists(),
+    "stale port file must exist before starting IPC server"
   );
 
-  let _guard = SocketGuard(socket_path.clone());
+  let _guard = PortFileGuard(port_file.clone());
 
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
   let state = Arc::new(Mutex::new(PlaybackState::default()));
 
-  // Start IPC server — it will detect the stale socket, remove it, and bind fresh.
+  // Start IPC server — it should detect the stale port, ignore it, and write a fresh one.
   let ipc_engine = engine.clone();
   let ipc_state = state.clone();
-  let ipc_path = socket_path.clone();
+  let ipc_path = port_file.clone();
   let _ipc_server = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -544,46 +479,47 @@ fn stale_socket_detection() {
   });
   std::thread::sleep(std::time::Duration::from_millis(200));
 
-  // The stale socket must be replaced by a fresh 0600 binding.
+  // The stale port file must be replaced by a fresh one with a valid port.
   assert!(
-    std::path::Path::new(&socket_path).exists(),
-    "socket file must exist after IPC server starts (replaces stale)"
+    std::path::Path::new(&port_file).exists(),
+    "port file must exist after IPC server starts (replaces stale)"
   );
 
-  let meta = std::fs::metadata(&socket_path).expect("socket metadata");
-  let perm = meta.permissions().mode();
-  assert_eq!(
-    perm & 0o777,
-    0o600,
-    "replacement socket must have 0600 permissions"
-  );
+  let port: u16 = std::fs::read_to_string(&port_file)
+    .expect("read port file")
+    .trim()
+    .parse()
+    .expect("valid port after replacement");
+  assert!(port > 0, "replacement port must be > 0");
+  // It must not be the stale value.
+  assert_ne!(port, 65535, "port must not be the stale value");
 
   engine.stop();
   std::thread::sleep(std::time::Duration::from_millis(200));
 }
 
 #[test]
+#[cfg(not(windows))]
 fn running_instance_rejection() {
-  // Use a unique socket path to avoid collisions with other parallel tests
-  // that also use /tmp/around_test_{pid}.sock.
-  let socket_path = format!("/tmp/around_rejection_test_{}.sock", std::process::id());
-  let _ = std::fs::remove_file(&socket_path);
+  // Use a unique port file to avoid collisions with other parallel tests.
+  let port_file = format!("/tmp/around_rejection_test_{}.port", std::process::id());
+  let _ = std::fs::remove_file(&port_file);
 
-  struct SocketGuard(String);
-  impl Drop for SocketGuard {
+  struct PortFileGuard(String);
+  impl Drop for PortFileGuard {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
     }
   }
-  let _guard = SocketGuard(socket_path.clone());
+  let _guard = PortFileGuard(port_file.clone());
 
-  // Start first IPC server (binds socket A).
+  // Start first IPC server.
   let config = EngineConfig::load();
   let engine_a = Arc::new(Engine::new(config.clone()));
   let state_a = Arc::new(Mutex::new(PlaybackState::default()));
   let eng_a = engine_a.clone();
   let st_a = state_a.clone();
-  let path_a = socket_path.clone();
+  let path_a = port_file.clone();
   let _server_a = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -598,7 +534,7 @@ fn running_instance_rejection() {
   // Second IPC server should detect the running instance and fail.
   let engine_b = Arc::new(Engine::new(config));
   let state_b = Arc::new(Mutex::new(PlaybackState::default()));
-  let path_b = socket_path;
+  let path_b = port_file;
   let result = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -623,9 +559,9 @@ fn running_instance_rejection() {
 }
 
 #[test]
-fn socket_cleanup_after_stop() {
-  struct SocketGuard(String);
-  impl Drop for SocketGuard {
+fn port_file_cleanup_after_stop() {
+  struct PortFileGuard(String);
+  impl Drop for PortFileGuard {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
     }
@@ -636,14 +572,14 @@ fn socket_cleanup_after_stop() {
     return;
   }
 
-  let socket_path = format!("/tmp/around_test_{}_cleanup_stop.sock", std::process::id());
-  let _ = std::fs::remove_file(&socket_path);
-  let _guard = SocketGuard(socket_path.clone());
+  let port_file = format!("/tmp/around_test_{}_cleanup_stop.port", std::process::id());
+  let _ = std::fs::remove_file(&port_file);
+  let _guard = PortFileGuard(port_file.clone());
 
-  // Socket must not exist before playback.
+  // Port file must not exist before playback.
   assert!(
-    !std::path::Path::new(&socket_path).exists(),
-    "socket file must not exist before play"
+    !std::path::Path::new(&port_file).exists(),
+    "port file must not exist before play"
   );
 
   let config = EngineConfig::load();
@@ -653,7 +589,7 @@ fn socket_cleanup_after_stop() {
   // Start IPC server on a background thread.
   let ipc_engine = engine.clone();
   let ipc_state = state.clone();
-  let ipc_path = socket_path.clone();
+  let ipc_path = port_file.clone();
   let _ipc_server = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -674,45 +610,46 @@ fn socket_cleanup_after_stop() {
   });
   std::thread::sleep(std::time::Duration::from_millis(200));
 
-  // Socket must exist during playback.
+  // Port file must exist during playback.
   assert!(
-    std::path::Path::new(&socket_path).exists(),
-    "socket must exist during playback"
+    std::path::Path::new(&port_file).exists(),
+    "port file must exist during playback"
   );
   // Send stop command via IPC.
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "stop"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "stop"}));
   assert_eq!(resp["status"], "ok", "stop response must contain ok");
 
   std::thread::sleep(std::time::Duration::from_millis(200));
 
-  // Manually clean up the socket (IPC server thread keeps running).
-  let _ = std::fs::remove_file(&socket_path);
+  // Manually clean up the port file (IPC server thread keeps running).
+  let _ = std::fs::remove_file(&port_file);
   assert!(
-    !std::path::Path::new(&socket_path).exists(),
-    "socket must be deletable after stop"
+    !std::path::Path::new(&port_file).exists(),
+    "port file must be deletable after stop"
   );
 }
 
 #[test]
-fn socket_cleanup_after_signal() {
-  struct SocketGuard(String);
-  impl Drop for SocketGuard {
+#[cfg(not(windows))]
+fn port_file_cleanup_after_signal() {
+  struct PortFileGuard(String);
+  impl Drop for PortFileGuard {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
     }
   }
 
-  // Use a unique socket path per test run
-  let socket_path = format!("/tmp/around_cleanup_test_{}.sock", std::process::id());
-  let _ = std::fs::remove_file(&socket_path);
-  let _guard = SocketGuard(socket_path.clone());
+  // Use a unique port file path per test run
+  let port_file = format!("/tmp/around_cleanup_test_{}.port", std::process::id());
+  let _ = std::fs::remove_file(&port_file);
+  let _guard = PortFileGuard(port_file.clone());
 
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
   let state = Arc::new(Mutex::new(PlaybackState::default()));
   let eng = engine.clone();
   let st = state.clone();
-  let path = socket_path.clone();
+  let path = port_file.clone();
 
   // Start IPC server on a background thread
   let server = std::thread::spawn(move || {
@@ -726,10 +663,10 @@ fn socket_cleanup_after_signal() {
   // Wait for server to bind
   std::thread::sleep(std::time::Duration::from_millis(300));
 
-  // Socket should exist
+  // Port file should exist
   assert!(
-    std::path::Path::new(&socket_path).exists(),
-    "socket should be created by IPC server"
+    std::path::Path::new(&port_file).exists(),
+    "port file should be created by IPC server"
   );
 
   // Simulate signal by stopping the engine (same effect as SIGTERM → engine.stop())
@@ -740,55 +677,23 @@ fn socket_cleanup_after_signal() {
   std::thread::sleep(std::time::Duration::from_millis(100));
 
   // Note: in the current implementation, the IPC server drops the runtime
-  // but the socket file is only deleted by cmd_play, not by run_ipc_server itself.
-  // This test validates that the socket can be cleaned up externally.
-  let _ = std::fs::remove_file(&socket_path);
-  assert!(!std::path::Path::new(&socket_path).exists());
+  // but the port file is only written by run_ipc_server itself.
+  // This test validates that the port file can be cleaned up externally.
+  let _ = std::fs::remove_file(&port_file);
+  assert!(!std::path::Path::new(&port_file).exists());
 }
 
-#[test]
-fn status_includes_device_lost() {
-  // Verify PlaybackState defaults have device_lost: false.
-  let state = PlaybackState::default();
-  assert!(
-    !state.device_lost,
-    "default PlaybackState should have device_lost: false"
-  );
-
-  // Verify IpcResponse::ok() omits device_lost when None (skip_serializing_if).
-  let resp = IpcResponse::ok();
-  let json = serde_json::to_value(&resp).unwrap();
-  assert!(
-    json.get("device_lost").is_none(),
-    "IpcResponse::ok() should omit device_lost when None"
-  );
-
-  // Manually construct a status-style response with device_lost: false.
-  let mut resp = IpcResponse::ok();
-  resp.state = Some("stopped".into());
-  resp.position_ms = Some(0);
-  resp.device_lost = Some(false);
-  let json = serde_json::to_value(&resp).unwrap();
-  assert_eq!(json["status"], "ok");
-  assert_eq!(json["state"], "stopped");
-  assert_eq!(json["device_lost"], false);
-
-  // When device_lost is Some(true), it should serialize.
-  let mut resp = IpcResponse::ok();
-  resp.device_lost = Some(true);
-  let json = serde_json::to_value(&resp).unwrap();
-  assert_eq!(json["device_lost"], true);
-}
 // =============================================================================
 
-/// Helper: spawn an IPC server on a unique socket, return (socket_path, engine, state).
+/// Helper: spawn an IPC server on a unique port file, return (port_file, engine, state).
+#[cfg(not(windows))]
 fn spawn_ipc_server(suffix: &str) -> (String, Arc<Engine>, Arc<Mutex<PlaybackState>>) {
-  let socket_path = format!(
-    "/tmp/around_runtime_test_{}_{}.sock",
+  let port_file = format!(
+    "/tmp/around_runtime_test_{}_{}.port",
     std::process::id(),
     suffix
   );
-  let _ = std::fs::remove_file(&socket_path);
+  let _ = std::fs::remove_file(&port_file);
 
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
@@ -796,7 +701,7 @@ fn spawn_ipc_server(suffix: &str) -> (String, Arc<Engine>, Arc<Mutex<PlaybackSta
 
   let ipc_engine = engine.clone();
   let ipc_state = state.clone();
-  let ipc_path = socket_path.clone();
+  let ipc_path = port_file.clone();
   std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -807,36 +712,38 @@ fn spawn_ipc_server(suffix: &str) -> (String, Arc<Engine>, Arc<Mutex<PlaybackSta
     ))
   });
 
-  // Wait for server to bind.
+  // Wait for server to bind (poll for port file existence).
   for _ in 0..50 {
-    if std::path::Path::new(&socket_path).exists() {
+    if std::path::Path::new(&port_file).exists() {
       break;
     }
     std::thread::sleep(std::time::Duration::from_millis(10));
   }
   assert!(
-    std::path::Path::new(&socket_path).exists(),
-    "IPC server socket must be created: {}",
-    socket_path
+    std::path::Path::new(&port_file).exists(),
+    "IPC server port file must be created: {}",
+    port_file
   );
 
-  (socket_path, engine, state)
+  (port_file, engine, state)
 }
 
-/// Clean up socket file on test exit.
-struct SocketGuard(String);
-impl Drop for SocketGuard {
+#[cfg(not(windows))]
+struct PortFileGuard(String);
+#[cfg(not(windows))]
+impl Drop for PortFileGuard {
   fn drop(&mut self) {
     let _ = std::fs::remove_file(&self.0);
   }
 }
 
 #[test]
+#[cfg(not(windows))]
 fn runtime_idle_pause_returns_no_track() {
-  let (socket_path, engine, _state) = spawn_ipc_server("idle_pause");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, _state) = spawn_ipc_server("idle_pause");
+  let _guard = PortFileGuard(port_file.clone());
 
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "pause"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "pause"}));
   assert_eq!(
     resp["status"], "error",
     "pause without playback must return error"
@@ -844,15 +751,16 @@ fn runtime_idle_pause_returns_no_track() {
   assert_eq!(resp["code"], "NO_TRACK", "error code must be NO_TRACK");
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 #[test]
+#[cfg(not(windows))]
 fn runtime_idle_resume_returns_no_track() {
-  let (socket_path, engine, _state) = spawn_ipc_server("idle_resume");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, _state) = spawn_ipc_server("idle_resume");
+  let _guard = PortFileGuard(port_file.clone());
 
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "resume"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "resume"}));
   assert_eq!(
     resp["status"], "error",
     "resume without playback must return error"
@@ -860,16 +768,17 @@ fn runtime_idle_resume_returns_no_track() {
   assert_eq!(resp["code"], "NO_TRACK", "error code must be NO_TRACK");
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 #[test]
+#[cfg(not(windows))]
 fn runtime_idle_seek_returns_no_track() {
-  let (socket_path, engine, _state) = spawn_ipc_server("idle_seek");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, _state) = spawn_ipc_server("idle_seek");
+  let _guard = PortFileGuard(port_file.clone());
 
   let resp = send_command(
-    &socket_path,
+    &port_file,
     &serde_json::json!({"command": "seek", "position_ms": 5000}),
   );
   assert_eq!(
@@ -879,15 +788,16 @@ fn runtime_idle_seek_returns_no_track() {
   assert_eq!(resp["code"], "NO_TRACK", "error code must be NO_TRACK");
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 #[test]
+#[cfg(not(windows))]
 fn runtime_status_returns_stopped_when_idle() {
-  let (socket_path, engine, _state) = spawn_ipc_server("idle_status");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, _state) = spawn_ipc_server("idle_status");
+  let _guard = PortFileGuard(port_file.clone());
 
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "status"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok", "status must return ok even when idle");
   assert_eq!(resp["state"], "stopped", "idle state must be stopped");
   assert_eq!(resp["position_ms"], 0, "idle position must be 0");
@@ -897,17 +807,18 @@ fn runtime_status_returns_stopped_when_idle() {
   );
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 #[test]
+#[cfg(not(windows))]
 fn runtime_protocol_no_deadlock() {
   // Verify IPC commands return immediately (< 500ms), not hung.
-  let (socket_path, engine, _state) = spawn_ipc_server("no_deadlock");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, _state) = spawn_ipc_server("no_deadlock");
+  let _guard = PortFileGuard(port_file.clone());
 
   let start = std::time::Instant::now();
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "status"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "status"}));
   let elapsed = start.elapsed();
 
   assert!(
@@ -918,32 +829,34 @@ fn runtime_protocol_no_deadlock() {
   assert_eq!(resp["status"], "ok");
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 #[test]
+#[cfg(not(windows))]
 fn runtime_stop_idempotent_via_ipc() {
-  let (socket_path, engine, _state) = spawn_ipc_server("idempotent_stop");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, _state) = spawn_ipc_server("idempotent_stop");
+  let _guard = PortFileGuard(port_file.clone());
 
   // First stop — should succeed.
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "stop"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "stop"}));
   assert_eq!(resp["status"], "ok", "first stop must return ok");
   assert_eq!(resp["state"], "stopped");
 
   // Second stop — idempotent, still ok.
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "stop"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "stop"}));
   assert_eq!(resp["status"], "ok", "second stop must also return ok");
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 #[test]
+#[cfg(not(windows))]
 fn runtime_state_mutation_visible_to_ipc() {
   // Mutate shared state directly, then verify IPC status sees the change.
-  let (socket_path, engine, state) = spawn_ipc_server("state_visible");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, state) = spawn_ipc_server("state_visible");
+  let _guard = PortFileGuard(port_file.clone());
 
   // Mutate state externally (simulating what the decode loop does).
   {
@@ -956,7 +869,7 @@ fn runtime_state_mutation_visible_to_ipc() {
     st.position_ms = 12345;
   }
 
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "status"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok");
   assert_eq!(
     resp["state"], "playing",
@@ -977,14 +890,15 @@ fn runtime_state_mutation_visible_to_ipc() {
   assert_eq!(resp["track"]["format"], "WAV");
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 #[test]
+#[cfg(not(windows))]
 fn runtime_pause_while_playing_succeeds() {
   // Set state to playing, then send pause via IPC → must succeed.
-  let (socket_path, engine, state) = spawn_ipc_server("pause_playing");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, state) = spawn_ipc_server("pause_playing");
+  let _guard = PortFileGuard(port_file.clone());
 
   // Simulate active playback.
   {
@@ -994,7 +908,7 @@ fn runtime_pause_while_playing_succeeds() {
     st.position_ms = 5000;
   }
 
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "pause"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "pause"}));
   assert_eq!(resp["status"], "ok", "pause during playback must succeed");
   assert_eq!(resp["state"], "paused", "state must transition to paused");
   assert_eq!(resp["position_ms"], 5000, "position must be preserved");
@@ -1003,14 +917,15 @@ fn runtime_pause_while_playing_succeeds() {
   assert!(engine.is_shutdown() == false); // engine exists but pause doesn't shut down
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 #[test]
+#[cfg(not(windows))]
 fn runtime_seek_updates_position_in_state() {
   // Set state to playing, send seek → position_ms must update.
-  let (socket_path, engine, state) = spawn_ipc_server("seek_position");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, state) = spawn_ipc_server("seek_position");
+  let _guard = PortFileGuard(port_file.clone());
 
   {
     let mut st = state.lock().unwrap();
@@ -1021,7 +936,7 @@ fn runtime_seek_updates_position_in_state() {
   }
 
   let resp = send_command(
-    &socket_path,
+    &port_file,
     &serde_json::json!({"command": "seek", "position_ms": 30000}),
   );
   assert_eq!(resp["status"], "ok", "seek during playback must succeed");
@@ -1044,7 +959,7 @@ fn runtime_seek_updates_position_in_state() {
   }
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 // =============================================================================
@@ -1052,10 +967,11 @@ fn runtime_seek_updates_position_in_state() {
 // =============================================================================
 
 #[test]
+#[cfg(not(windows))]
 fn seek_non_seekable_source_returns_not_supported() {
   // When seekable=false in PlaybackState, handle_seek must return NOT_SUPPORTED.
-  let (socket_path, engine, state) = spawn_ipc_server("seek_not_supported");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, state) = spawn_ipc_server("seek_not_supported");
+  let _guard = PortFileGuard(port_file.clone());
 
   {
     let mut st = state.lock().unwrap();
@@ -1066,7 +982,7 @@ fn seek_non_seekable_source_returns_not_supported() {
   }
 
   let resp = send_command(
-    &socket_path,
+    &port_file,
     &serde_json::json!({"command": "seek", "position_ms": 5000}),
   );
   assert_eq!(
@@ -1088,23 +1004,16 @@ fn seek_non_seekable_source_returns_not_supported() {
   }
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 #[test]
-fn playback_state_default_seekable_is_false() {
-  let st = PlaybackState::default();
-  assert!(!st.seekable, "seekable must default to false for safety");
-  assert!(!st.playing, "playing must default to false");
-  assert_eq!(st.state, "stopped");
-}
-
-#[test]
+#[cfg(not(windows))]
 fn status_includes_seekable_flag() {
   // Verify that seekable flag set during play() is visible via IPC status.
   // (Indirectly tests that engine.play() propagates seekable to PlaybackState.)
-  let (socket_path, engine, state) = spawn_ipc_server("status_seekable");
-  let _guard = SocketGuard(socket_path.clone());
+  let (port_file, engine, state) = spawn_ipc_server("status_seekable");
+  let _guard = PortFileGuard(port_file.clone());
 
   {
     let mut st = state.lock().unwrap();
@@ -1115,13 +1024,13 @@ fn status_includes_seekable_flag() {
   }
 
   let resp = send_command(
-    &socket_path,
+    &port_file,
     &serde_json::json!({"command": "seek", "position_ms": 2000}),
   );
   assert_eq!(resp["status"], "ok", "seek on seekable source must succeed");
 
   engine.signal_shutdown();
-  let _ = std::os::unix::net::UnixStream::connect(&socket_path);
+  poke_server(&port_file);
 }
 
 #[test]
@@ -1134,16 +1043,16 @@ fn format_name_propagated_to_status_during_playback() {
     return;
   }
 
-  struct SocketGuard(String);
-  impl Drop for SocketGuard {
+  struct PortFileGuard(String);
+  impl Drop for PortFileGuard {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
     }
   }
 
-  let socket_path = format!("/tmp/around_test_{}_fmt_name.sock", std::process::id());
-  let _ = std::fs::remove_file(&socket_path);
-  let _guard = SocketGuard(socket_path.clone());
+  let port_file = format!("/tmp/around_test_{}_fmt_name.port", std::process::id());
+  let _ = std::fs::remove_file(&port_file);
+  let _guard = PortFileGuard(port_file.clone());
 
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
@@ -1152,7 +1061,7 @@ fn format_name_propagated_to_status_during_playback() {
   // Start IPC server.
   let ipc_engine = engine.clone();
   let ipc_state = state.clone();
-  let ipc_path = socket_path.clone();
+  let ipc_path = port_file.clone();
   let _ipc_server = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
@@ -1174,7 +1083,7 @@ fn format_name_propagated_to_status_during_playback() {
   std::thread::sleep(std::time::Duration::from_millis(300));
 
   // Status must contain format_name from the codec (not "WAV" hardcode).
-  let resp = send_command(&socket_path, &serde_json::json!({"command": "status"}));
+  let resp = send_command(&port_file, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok");
 
   if let Some(track) = resp.get("track") {

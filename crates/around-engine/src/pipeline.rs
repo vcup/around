@@ -1,6 +1,6 @@
 //! Audio pipeline: Source → Codec → Output Sink.
 
-use crate::ipc::PlaybackState;
+use crate::ipc_types::PlaybackState;
 use crate::output::AudioOutput;
 use around_core::{AroundError, AudioStream, CodecRegistry, Source, SourceCapabilities};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
