@@ -2,7 +2,7 @@
 //!
 //! Adapted for the codec system (CodecInfo + ExtensionManager).
 
-use around_core::{CodecInfo, ReadSeek, Source};
+use around_core::{ReadSeek, Source};
 use around_engine::{DecoderInfo, ExtensionManager};
 use around_source_file::FileSource;
 use std::path::PathBuf;

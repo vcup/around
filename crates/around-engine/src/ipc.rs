@@ -1,177 +1,63 @@
-//! IPC server: Unix domain socket with JSON newline-delimited protocol.
+//! IPC server: TCP on localhost with JSON newline-delimited protocol.
 //!
-//! Accepts commands from a local CLI over a Unix domain socket.
+//! Accepts commands from a local CLI over a TCP connection on 127.0.0.1.
 //! Each connection processes commands sequentially; multiple concurrent
 //! connections are supported via per-connection tasks.
 
 use crate::extensions::ExtensionManager;
+use crate::ipc_codec::JsonLineCodec;
+use crate::ipc_types::{IpcCommand, IpcResponse, PlaybackState};
 use crate::pipeline::Engine;
-use around_core::{AroundError, SampleSpec};
-use serde::{Deserialize, Serialize};
+use around_core::AroundError;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{UnixListener, UnixStream};
-
-/// Shared playback state, updated by command handlers and readable via `status`.
-// Manual Default: state defaults to "stopped"
-impl Default for PlaybackState {
-  fn default() -> Self {
-    Self {
-      playing: false,
-      position_ms: 0,
-      duration_ms: None,
-      track_path: None,
-      format_name: None,
-      output_format: None,
-      seekable: false,
-      device_lost: false,
-      state: "stopped".into(),
-    }
-  }
-}
-
-#[derive(Debug, Clone)]
-pub struct PlaybackState {
-  pub playing: bool,
-  pub position_ms: u64,
-  pub duration_ms: Option<u64>,
-  pub track_path: Option<String>,
-  pub format_name: Option<String>,
-  pub output_format: Option<SampleSpec>,
-  pub seekable: bool,
-  pub device_lost: bool,
-  pub state: String,
-}
-
-/// Incoming IPC command, tagged by the `command` field in JSON.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "command")]
-pub enum IpcCommand {
-  #[serde(rename = "play")]
-  Play { path: String },
-  #[serde(rename = "pause")]
-  Pause,
-  #[serde(rename = "resume")]
-  Resume,
-  #[serde(rename = "seek")]
-  Seek { position_ms: u64 },
-  #[serde(rename = "stop")]
-  Stop,
-  #[serde(rename = "status")]
-  Status,
-  #[serde(rename = "list_decoders")]
-  ListDecoders,
-  #[serde(rename = "load_decoder")]
-  LoadDecoder { path: String },
-  #[serde(rename = "load_decoder_bytes")]
-  LoadDecoderBytes { data: String, name: String },
-  #[serde(rename = "cleanup")]
-  Cleanup,
-}
-
-/// Outgoing IPC response; all fields optional except `status`.
-#[derive(Debug, Serialize)]
-pub struct IpcResponse {
-  pub status: String,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub state: Option<String>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub position_ms: Option<u64>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub code: Option<String>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub message: Option<String>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub track_id: Option<u64>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub track: Option<serde_json::Value>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub decoders: Option<Vec<serde_json::Value>>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub device_lost: Option<bool>,
-  #[serde(skip_serializing_if = "Option::is_none")]
-  pub removed_files: Option<Vec<String>>,
-}
-
-impl IpcResponse {
-  pub fn ok() -> Self {
-    Self {
-      status: "ok".into(),
-      state: None,
-      position_ms: None,
-      code: None,
-      message: None,
-      track_id: None,
-      track: None,
-      decoders: None,
-      removed_files: None,
-      device_lost: None,
-    }
-  }
-
-  pub fn error(code: &str, msg: &str) -> Self {
-    Self {
-      status: "error".into(),
-      state: None,
-      position_ms: None,
-      code: Some(code.into()),
-      message: Some(msg.into()),
-      track_id: None,
-      track: None,
-      decoders: None,
-      removed_files: None,
-      device_lost: None,
-    }
-  }
-}
+use tokio::io::BufReader;
+use tokio::net::{TcpListener, TcpStream};
 
 // ---------------------------------------------------------------------------
 // Public entry-point
 // ---------------------------------------------------------------------------
 
-/// Bind a Unix domain socket at `socket_path` and serve IPC commands forever.
+/// Bind a TCP listener on `127.0.0.1:0` (random port) and serve IPC commands forever.
 ///
-/// Stale socket files are removed before binding.  Each accepted connection
-/// is handled in its own tokio task so that multiple clients can interact
-/// with the engine concurrently.
+/// The chosen port is written to `port_file`.  On startup, if `port_file`
+/// already exists the port is read and a connection attempt is made to
+/// check for a live instance — if one is found the server refuses to start.
 ///
-/// The accept loop exits when `engine.is_shutdown()` returns true (set by the
-/// play thread after playback completes), allowing a clean join.
+/// Each accepted connection is handled in its own tokio task so that
+/// multiple clients can interact with the engine concurrently.
+///
+/// The accept loop exits when `engine.is_shutdown()` returns true (set by
+/// the play thread after playback completes), allowing a clean join.
 pub async fn run_ipc_server(
-  socket_path: &str,
+  port_file: &str,
   engine: Arc<Engine>,
   state: Arc<Mutex<PlaybackState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-  // Check if an instance is already running on this socket.
-  if let Ok(stream) = tokio::net::UnixStream::connect(socket_path).await {
-    drop(stream);
-    return Err(
-      format!(
-        "another engine instance is already running on {}",
-        socket_path
-      )
-      .into(),
-    );
-  }
-
-  // Remove stale socket file if connection was refused.
-  let _ = std::fs::remove_file(socket_path);
-
-  let listener = UnixListener::bind(socket_path)?;
-
-  // Set socket permissions to 0600.
-  #[cfg(unix)]
-  {
-    use std::os::unix::fs::PermissionsExt;
-    if let Ok(meta) = std::fs::metadata(socket_path) {
-      let mut perms = meta.permissions();
-      perms.set_mode(0o600);
-      let _ = std::fs::set_permissions(socket_path, perms);
+  // Check if an instance is already running by reading the port file.
+  if let Ok(port_str) = std::fs::read_to_string(port_file) {
+    if let Ok(port) = port_str.trim().parse::<u16>() {
+      let addr = format!("127.0.0.1:{}", port);
+      if TcpStream::connect(&addr).await.is_ok() {
+        return Err(
+          format!(
+            "another engine instance is already running on port {}",
+            port
+          )
+          .into(),
+        );
+      }
     }
+    // Stale port file — connection was refused or port invalid.
+    let _ = std::fs::remove_file(port_file);
   }
 
-  tracing::info!("IPC server listening on {}", socket_path);
+  let listener = TcpListener::bind("127.0.0.1:0").await?;
+  let port = listener.local_addr()?.port();
+
+  std::fs::write(port_file, port.to_string())?;
+
+  tracing::info!("IPC server listening on 127.0.0.1:{}", port);
 
   let ext_mgr = Arc::new(ExtensionManager::new());
 
@@ -199,45 +85,25 @@ pub async fn run_ipc_server(
 // ---------------------------------------------------------------------------
 
 async fn handle_connection(
-  stream: UnixStream,
+  stream: TcpStream,
   engine: Arc<Engine>,
   state: Arc<Mutex<PlaybackState>>,
   ext_mgr: Arc<ExtensionManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   let (reader, mut writer) = stream.into_split();
-  let mut lines = BufReader::new(reader).lines();
+  let codec = JsonLineCodec;
+  let mut buf_reader = BufReader::new(reader);
 
-  while let Some(line) = lines.next_line().await? {
-    let line = line.trim().to_string();
-    if line.is_empty() {
-      continue;
-    }
-
-    let cmd: IpcCommand = match serde_json::from_str(&line) {
+  loop {
+    let cmd = match codec.read_command(&mut buf_reader).await {
       Ok(c) => c,
-      Err(e) => {
-        let resp = IpcResponse::error("PARSE_ERROR", &e.to_string());
-        send_response(&mut writer, &resp).await?;
-        continue;
-      }
+      Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+      Err(e) => return Err(e.into()),
     };
 
     let resp = handle_command(cmd, &engine, &state, &ext_mgr).await;
-    send_response(&mut writer, &resp).await?;
+    codec.write_response(&mut writer, &resp).await?;
   }
-
-  Ok(())
-}
-
-/// Serialise `resp` as a newline-terminated JSON line and write it to `writer`.
-async fn send_response(
-  writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-  resp: &IpcResponse,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-  let mut json = serde_json::to_string(resp)?;
-  json.push('\n');
-  writer.write_all(json.as_bytes()).await?;
-  Ok(())
 }
 
 // ---------------------------------------------------------------------------
