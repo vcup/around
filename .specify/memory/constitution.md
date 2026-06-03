@@ -1,12 +1,11 @@
 <!--
   Sync Impact Report
   ==================
-  Version change: 1.8.0 → 2.0.0
-  Bump rationale: MAJOR — governance restructured from flat 16-principle list to
-                   three-layer hierarchy (Core Principles / Architecture Directives /
-                   Technical Constraints). Nine items demoted from principle status to
-                   directive or constraint level. This is a backward-incompatible
-                   governance change per the amendment procedure.
+  Version change: 2.0.0 → 3.1.0
+  Bump rationale: MAJOR (2.0→3.0): Core Principle VIII (First-Principles
+                   Minimalism). MINOR (3.0→3.1): refined VIII to incorporate
+                   innovation propagation and warning integrity — no new
+                   principles added, existing principle deepened.
   Restructuring map:
     Retained as Core Principles:
       I, II, III, IV → I, II, III, IV
@@ -27,8 +26,6 @@
     ✅ .specify/templates/spec-template.md — no changes needed
     ✅ .specify/templates/tasks-template.md — no changes needed
     ✅ .specify/templates/checklist-template.md — no changes needed
-  Follow-up TODOs: Update plan-template.md Constitution Check section
--->
 
 # around music player constitution
 
@@ -221,6 +218,54 @@ around MUST absorb the best of each without dogma.
 because each camp lacks what the other excels at. around's mission is to make
 switching unnecessary. By absorbing both paradigms, around eliminates the
 trade-off entirely: own what you love, discover what you don't yet know.
+
+### VIII. First-Principles Minimalism
+
+The simplest correct solution is the goal at every level — architecture,
+implementation, and tooling. Complexity is never an achievement. Warnings
+are never acceptable background noise.
+
+**Unify, don't bifurcate.** Two code paths that perform the same operation
+MUST merge into one. Configuration values gate behavior; control flow MUST
+NOT fork into parallel universes. A boolean that means "skip X" MUST skip
+only X — not create a separate spawning strategy, transport model, or shutdown
+path. Every runtime behavior MUST trace to a config field; implicit activation
+is a design bug.
+
+**Eliminate before you add.** Duplication (two TCP spawn blocks, two socket
+binding functions sharing 85% of their code) is not solved by introducing an
+abstraction layer — the duplication itself must be eliminated by unifying the
+underlying concept. New abstractions are justified only when the unified
+concept genuinely differs from existing ones.
+
+**Propagate innovation.** When a new capability is added (a feature flag, a
+codec, a data representation), every layer that handles that concern MUST be
+updated to benefit from it. Adding protobuf support MUST result in the data
+model shedding JSON-specific types (`serde_json::Value`). A new binary-safe
+wire format MUST propagate to the type system (`String` → `Vec<u8>`).
+Old patterns rot the moment a better alternative is compiled in.
+
+**Resolve, never suppress.** Compiler warnings, clippy lints, and test
+skips are symptoms of an unresolved problem. `#[allow(dead_code)]` is
+prohibited without a comment citing a specific completion plan — and the
+preferred response is always to wire up the code or delete it. When
+`cargo test --all` cannot pass without `--test-threads=1`, the race
+condition or deadlock is the bug, not the parallelism. Silent suppression
+is the engineering equivalent of ignoring a patient's vital signs.
+
+**First-principles over path dependency.** Every review MUST start from
+"what is the simplest correct solution?", not "how do I fix this code?"
+Incremental patching accumulates layers that obscure intent. When
+accumulated changes have diverged from the simple solution, the code
+MUST be refactored back to first principles.
+
+**Rationale**: A project that suppresses warnings, adds abstractions
+rather than eliminating duplication, and leaves new features half-wired
+into the old architecture is a project in slow decay. The discipline of
+simplifying at every review — architecture, implementation, and tooling —
+produces a codebase where each concept appears once, each config value
+has a clear semantic, and each code path directly reflects a requirement,
+never an artifact of history.
 
 ## Architecture Directives
 
@@ -659,7 +704,7 @@ that sacrifices one for the other.
   tools MUST have a documented fallback path.
 
 - **Configuration**: Defaults MUST work without creating files in the
-  user's home directory, system paths, or global state. User-controlled
+  the user's home directory, system paths, or global state. User-controlled
   config paths (e.g., `~/.config/around/config.kdl`) are acceptable when
   explicitly documented as opt-in.
 
