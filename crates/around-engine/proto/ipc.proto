@@ -1,0 +1,77 @@
+syntax = "proto3";
+package around.ipc;
+
+enum Status {
+  STATUS_OK = 0;
+  STATUS_ERROR = 1;
+}
+
+enum TrackState {
+  STOPPED = 0;
+  PLAYING = 1;
+  PAUSED = 2;
+  BUFFERING = 3;
+  ERROR = 4;
+}
+
+enum DecoderSource {
+  BUILTIN = 0;
+  EXTENSION = 1;
+  DYNAMIC = 2;
+}
+
+// Length-delimited framing: each message is prefixed with a varint length.
+// Wire format: [varint_length][serialized_message]
+
+message IpcCommand {
+  oneof command {
+    PlayCommand play = 1;
+    PauseCommand pause = 2;
+    ResumeCommand resume = 3;
+    SeekCommand seek = 4;
+    StopCommand stop = 5;
+    StatusCommand status = 6;
+    ListDecodersCommand list_decoders = 7;
+    LoadDecoderCommand load_decoder = 8;
+    LoadDecoderBytesCommand load_decoder_bytes = 9;
+    CleanupCommand cleanup = 10;
+  }
+}
+
+message PlayCommand { string path = 1; }
+message PauseCommand {}
+message ResumeCommand {}
+message SeekCommand { uint64 position_ms = 1; }
+message StopCommand {}
+message StatusCommand {}
+message ListDecodersCommand {}
+message LoadDecoderCommand { string path = 1; }
+message LoadDecoderBytesCommand { bytes data = 1; string name = 2; }
+message CleanupCommand {}
+
+message IpcResponse {
+  Status status = 1;
+  optional TrackState state = 2;
+  optional uint64 position_ms = 3;
+  optional string code = 4;    // error code when status="error"
+  optional string message = 5;
+  optional uint64 track_id = 6;
+  optional TrackInfo track = 7;
+  repeated DecoderInfo decoders = 8;
+  optional bool device_lost = 9;
+  repeated string removed_files = 10;
+}
+
+message TrackInfo {
+  uint64 id = 1;
+  string path = 2;
+  string format = 3;
+  uint64 duration_ms = 4;
+}
+
+message DecoderInfo {
+  string name = 1;
+  repeated string formats = 2;
+  DecoderSource source = 3;
+  optional string path = 4;
+}
