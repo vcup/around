@@ -1,6 +1,5 @@
 use around_engine::output::AudioOutput;
 use std::sync::Arc;
-use std::time::Duration;
 
 #[test]
 fn test_send_and_receive() {
@@ -42,19 +41,23 @@ fn test_sender_clone() {
 
 #[test]
 fn test_backpressure() {
+  use std::sync::Barrier;
   let output = Arc::new(AudioOutput::new(1));
 
   // Fill the capacity-1 buffer (non-blocking: buffer starts empty)
   output.send(vec![1.0f32]).unwrap();
 
+  let barrier = Arc::new(Barrier::new(2));
   let output_clone = output.clone();
+  let barrier_clone = barrier.clone();
   let received = std::thread::spawn(move || {
-    // Wait to give the main thread time to block on send
-    std::thread::sleep(Duration::from_millis(50));
+    // Wait until main thread is about to block on send
+    barrier_clone.wait();
     output_clone.try_recv()
   });
 
-  // This send blocks until the spawned thread frees the slot
+  // Signal helper, then block on send (helper hasn't drained yet — barrier ensures ordering)
+  barrier.wait();
   output.send(vec![2.0f32]).unwrap();
 
   let first = received.join().unwrap();

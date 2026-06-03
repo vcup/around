@@ -19,7 +19,7 @@ pub enum AroundError {
     required: String,
   },
   NoTrack,
-  DecoderLoadFailed {
+  CodecLoadFailed {
     path: Option<String>,
     reason: String,
   },
@@ -59,11 +59,11 @@ impl fmt::Display for AroundError {
         )
       }
       Self::NoTrack => write!(f, "no track loaded"),
-      Self::DecoderLoadFailed { path, reason } => {
+      Self::CodecLoadFailed { path, reason } => {
         if let Some(p) = path {
-          write!(f, "decoder load failed for '{}': {}", p, reason)
+          write!(f, "codec load failed for '{}': {}", p, reason)
         } else {
-          write!(f, "decoder load failed: {}", reason)
+          write!(f, "codec load failed: {}", reason)
         }
       }
       Self::Internal { message } => write!(f, "internal error: {}", message),

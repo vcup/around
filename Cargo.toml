@@ -7,7 +7,6 @@ members = [
     "crates/around-codec-test-pcm",
     "crates/around-codec-macros",
     "crates/around-source-file",
-    "examples/simple_decoder",
 ]
 resolver = "2"
 

@@ -4,11 +4,12 @@
 //! `fn get_codec_info() -> *const CodecInfoFFI`.
 //!
 //! The [`ExtensionManager`] owns the loaded libraries — they stay alive as long as
-//! they are registered. Callers receive lightweight [`DecoderInfo`] snapshots.
-
+// Clippy: Mutex poisoning panics are intentional — they indicate unrecoverable bugs.
+/// they are registered. Callers receive lightweight [`CodecDescriptor`] snapshots.
 use around_core::AroundError;
 use libloading::{Library, Symbol};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -34,7 +35,7 @@ type GetCodecInfoFn = unsafe fn() -> *const CodecInfoFFI;
 
 /// Metadata about a loaded codec, safe to clone and share.
 #[derive(Debug, Clone)]
-pub struct DecoderInfo {
+pub struct CodecDescriptor {
   pub name: String,
   pub formats: Vec<String>,
   pub source: String,
@@ -44,12 +45,20 @@ pub struct DecoderInfo {
 /// Internal entry: holds the live [`Library`] and its [`CodecInfo`].
 struct CodecEntry {
   _library: Library,
-  info: DecoderInfo,
+  info: CodecDescriptor,
+  /// Temp file created by load_bytes; removed on drop/unload (required for Windows).
+  temp_file: Option<PathBuf>,
 }
 
 /// Registry of loaded codec extensions.
 pub struct ExtensionManager {
   entries: Mutex<HashMap<String, CodecEntry>>,
+}
+
+fn hash_bytes(data: &[u8]) -> u64 {
+  let mut h = std::collections::hash_map::DefaultHasher::new();
+  data.hash(&mut h);
+  h.finish()
 }
 
 impl Default for ExtensionManager {
@@ -65,10 +74,25 @@ impl ExtensionManager {
     }
   }
 
+  /// Remove temp files for all tracked codecs.
+  /// Called by handle_cleanup IPC command.
+  pub fn cleanup_temp_files(&self) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+    for entry in entries.values_mut() {
+      if let Some(ref path) = entry.temp_file.take() {
+        if std::fs::remove_file(path).is_ok() {
+          removed.push(path.clone());
+        }
+      }
+    }
+    removed
+  }
+
   /// Load a codec from a shared library file at `path`.
-  pub fn load_path(&self, path: &Path) -> Result<DecoderInfo, AroundError> {
+  pub fn load_path(&self, path: &Path) -> Result<CodecDescriptor, AroundError> {
     let lib = unsafe {
-      Library::new(path).map_err(|e| AroundError::DecoderLoadFailed {
+      Library::new(path).map_err(|e| AroundError::CodecLoadFailed {
         path: Some(path.display().to_string()),
         reason: format!("failed to load library: {}", e),
       })?
@@ -77,7 +101,7 @@ impl ExtensionManager {
     let get_info: Symbol<GetCodecInfoFn> = unsafe {
       lib
         .get(b"get_codec_info")
-        .map_err(|e| AroundError::DecoderLoadFailed {
+        .map_err(|e| AroundError::CodecLoadFailed {
           path: Some(path.display().to_string()),
           reason: format!("symbol 'get_codec_info' not found: {}", e),
         })?
@@ -85,7 +109,7 @@ impl ExtensionManager {
 
     let ffi = unsafe { get_info() };
     if ffi.is_null() {
-      return Err(AroundError::DecoderLoadFailed {
+      return Err(AroundError::CodecLoadFailed {
         path: Some(path.display().to_string()),
         reason: "get_codec_info returned null".into(),
       });
@@ -115,15 +139,15 @@ impl ExtensionManager {
       .map(|s| s.to_string())
       .collect();
 
-    let mut entries = self.entries.lock().unwrap();
+    let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
     if entries.contains_key(&name) {
-      return Err(AroundError::DecoderLoadFailed {
+      return Err(AroundError::CodecLoadFailed {
         path: Some(path.display().to_string()),
         reason: format!("codec '{}' already loaded", name),
       });
     }
 
-    let info = DecoderInfo {
+    let info = CodecDescriptor {
       name: name.clone(),
       formats: formats.clone(),
       source: "runtime".into(),
@@ -135,53 +159,57 @@ impl ExtensionManager {
       CodecEntry {
         _library: lib,
         info: info.clone(),
+        temp_file: None,
       },
     );
 
     Ok(info)
   }
 
-  /// Load a codec from base64-encoded shared library bytes.
-  pub fn load_bytes(&self, data: &[u8], name: &str) -> Result<DecoderInfo, AroundError> {
-    use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD
-      .decode(data)
-      .map_err(|e| AroundError::DecoderLoadFailed {
-        path: None,
-        reason: format!("base64 decode failed: {}", e),
-      })?;
-
+  /// Load a codec from raw shared library bytes (already decoded from wire format).
+  pub fn load_bytes(&self, data: &[u8]) -> Result<CodecDescriptor, AroundError> {
+    let hash = hash_bytes(data);
     let tmp_dir = std::env::temp_dir();
     let tmp_path = tmp_dir.join(format!(
-      "around_decoder_{}.{}",
-      name,
+      "around_codec_{}_{:016x}.{}",
+      std::process::id(),
+      hash,
       std::env::consts::DLL_EXTENSION
     ));
-    std::fs::write(&tmp_path, &decoded).map_err(|e| AroundError::DecoderLoadFailed {
+    // No path-traversal check needed: filename is derived from data hash,
+    // not user input.
+    std::fs::write(&tmp_path, data).map_err(|e| AroundError::CodecLoadFailed {
       path: Some(tmp_path.display().to_string()),
       reason: format!("failed to write temp file: {}", e),
     })?;
 
     let result = self.load_path(&tmp_path);
-    let _ = std::fs::remove_file(&tmp_path);
 
     match result {
       Ok(mut info) => {
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = entries.get_mut(&info.name) {
           entry.info.source = "bytes".into();
           entry.info.path = None;
+          // Record the temp file so it's cleaned up when the codec is unloaded.
+          // Windows locks the DLL while loaded; Linux allows immediate unlink
+          // but tracking is harmless and simplifies cross-platform cleanup.
+          entry.temp_file = Some(tmp_path);
         }
         info.source = "bytes".into();
         info.path = None;
         Ok(info)
       }
-      Err(e) => Err(e),
+      Err(e) => {
+        // Load failed — clean up the temp file now.
+        let _ = std::fs::remove_file(&tmp_path);
+        Err(e)
+      }
     }
   }
 
   /// Scan `search_paths` directories for shared libraries and load them.
-  pub fn discover(&self, search_paths: &[PathBuf]) -> Vec<DecoderInfo> {
+  pub fn discover(&self, search_paths: &[PathBuf]) -> Vec<CodecDescriptor> {
     let mut discovered = Vec::new();
     for dir in search_paths {
       if let Ok(entries) = std::fs::read_dir(dir) {
@@ -192,7 +220,7 @@ impl ExtensionManager {
             .is_some_and(|e| e == "so" || e == "dylib" || e == "dll")
           {
             if let Ok(mut info) = self.load_path(&path) {
-              let mut entries = self.entries.lock().unwrap();
+              let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
               if let Some(entry) = entries.get_mut(&info.name) {
                 entry.info.source = "discovered".into();
               }
@@ -207,11 +235,11 @@ impl ExtensionManager {
   }
 
   /// Return a snapshot of all currently registered codecs.
-  pub fn list_decoders(&self) -> Vec<DecoderInfo> {
+  pub fn list_codecs(&self) -> Vec<CodecDescriptor> {
     self
       .entries
       .lock()
-      .unwrap()
+      .unwrap_or_else(|e| e.into_inner())
       .values()
       .map(|e| e.info.clone())
       .collect()

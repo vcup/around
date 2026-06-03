@@ -3,7 +3,7 @@
 //! Adapted for the codec system (CodecInfo + ExtensionManager).
 
 use around_core::{ReadSeek, Source};
-use around_engine::{DecoderInfo, ExtensionManager};
+pub use around_engine::{CodecDescriptor, ExtensionManager};
 use around_source_file::FileSource;
 use std::path::PathBuf;
 
@@ -20,19 +20,13 @@ fn fixture_path(name: &str) -> PathBuf {
 #[test]
 fn extension_manager_new_is_empty() {
   let mgr = ExtensionManager::new();
-  let decoders = mgr.list_decoders();
-  assert!(decoders.is_empty());
+  let codecs = mgr.list_codecs();
+  assert!(codecs.is_empty());
 }
 
 #[test]
-fn extension_manager_list_decoders_returns_empty_initially() {
-  let mgr = ExtensionManager::new();
-  assert!(mgr.list_decoders().is_empty());
-}
-
-#[test]
-fn decoder_info_clone_works() {
-  let info = DecoderInfo {
+fn codec_descriptor_clone_works() {
+  let info = CodecDescriptor {
     name: "test".into(),
     formats: vec!["wav".into()],
     source: "built-in".into(),
@@ -71,16 +65,6 @@ fn pcm_codec_open_and_read() {
   let mut buf = [0.0f32; 1024];
   let frames = stream.read(&mut buf).expect("read should succeed");
   assert!(frames.is_some());
-}
-
-#[test]
-fn duplicate_load_decoder_is_idempotent() {
-  let _mgr = ExtensionManager::new();
-}
-
-#[test]
-fn version_change_replaces_decoder() {
-  let _mgr = ExtensionManager::new();
 }
 
 #[test]

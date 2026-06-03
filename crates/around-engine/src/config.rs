@@ -8,7 +8,7 @@ use std::path::PathBuf;
 pub struct EngineConfig {
   pub output_device: Option<String>,
   pub output_auto_reconnect: bool,
-  pub decoder_search_paths: Vec<PathBuf>,
+  pub codec_search_paths: Vec<PathBuf>,
 }
 
 impl Default for EngineConfig {
@@ -16,7 +16,7 @@ impl Default for EngineConfig {
     Self {
       output_device: None,
       output_auto_reconnect: true,
-      decoder_search_paths: Vec::new(),
+      codec_search_paths: Vec::new(),
     }
   }
 }
@@ -48,19 +48,16 @@ impl EngineConfig {
     let mut cfg = Self::default();
 
     for node in doc.nodes() {
-      match node.name().value() {
-        "output" => {
-          for entry in node.entries() {
-            match entry.name().map(|n| n.value()) {
-              Some("device") => cfg.output_device = entry.value().as_string().map(String::from),
-              Some("auto_reconnect") => {
-                cfg.output_auto_reconnect = entry.value().as_bool().unwrap_or(true)
-              }
-              _ => {}
+      if node.name().value() == "output" {
+        for entry in node.entries() {
+          match entry.name().map(|n| n.value()) {
+            Some("device") => cfg.output_device = entry.value().as_string().map(String::from),
+            Some("auto_reconnect") => {
+              cfg.output_auto_reconnect = entry.value().as_bool().unwrap_or(true)
             }
+            _ => {}
           }
         }
-        _ => {}
       }
     }
     Ok(cfg)

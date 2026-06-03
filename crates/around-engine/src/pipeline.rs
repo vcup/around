@@ -1,6 +1,7 @@
 //! Audio pipeline: Source → Codec → Output Sink.
 
-use crate::ipc_types::PlaybackState;
+// Clippy: Mutex poisoning panics are intentional — they indicate unrecoverable bugs.
+use crate::ipc::types::{PlaybackState, TrackState};
 use crate::output::AudioOutput;
 use around_core::{AroundError, AudioStream, CodecRegistry, Source, SourceCapabilities};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -8,6 +9,7 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::sync::Notify;
 
 pub struct Engine {
   config: crate::config::EngineConfig,
@@ -17,6 +19,7 @@ pub struct Engine {
   paused: Arc<AtomicBool>,
   seek_target_ms: Arc<Mutex<Option<u64>>>,
   shutdown: Arc<AtomicBool>,
+  shutdown_signal: Arc<Notify>,
 }
 
 pub struct PlaybackHandle {
@@ -45,6 +48,7 @@ impl Engine {
       paused: Arc::new(AtomicBool::new(false)),
       seek_target_ms: Arc::new(Mutex::new(None)),
       shutdown: Arc::new(AtomicBool::new(false)),
+      shutdown_signal: Arc::new(Notify::new()),
     }
   }
 
@@ -232,13 +236,11 @@ impl Engine {
       });
     }
     let output_format =
-      around_core::SampleSpec::new(audio_stream.sample_rate, audio_stream.channels, 16).unwrap_or(
-        around_core::SampleSpec {
-          sample_rate: audio_stream.sample_rate,
-          channels: audio_stream.channels,
-          bit_depth: 16,
+      around_core::SampleSpec::new(audio_stream.sample_rate, audio_stream.channels, 16).map_err(
+        |e| AroundError::DecodeError {
+          message: format!("invalid stream spec: {}", e),
         },
-      );
+      )?;
 
     let duration_ms = if audio_stream.total_frames > 0 {
       Some((audio_stream.total_frames as u128 * 1000 / sample_rate as u128) as u64)
@@ -246,21 +248,25 @@ impl Engine {
       None
     };
 
-    {
-      let mut st = state.lock().unwrap();
-      st.state = "buffering".into();
+    let epoch = {
+      let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+      st.state = TrackState::Buffering;
       st.playing = true;
       st.position_ms = 0;
       st.output_format = Some(output_format);
       st.format_name = Some(codec_name.to_string());
       st.seekable = seekable;
       st.duration_ms = duration_ms;
-    }
+      st.epoch
+    };
 
     let running = Arc::clone(&self.running);
     running.store(true, Ordering::SeqCst);
     self.paused.store(false, Ordering::SeqCst);
-    *self.seek_target_ms.lock().unwrap() = None;
+    *self
+      .seek_target_ms
+      .lock()
+      .unwrap_or_else(|e| e.into_inner()) = None;
 
     let output = Arc::new(AudioOutput::new(4));
     let output_sender = output.sender_clone();
@@ -313,8 +319,8 @@ impl Engine {
     tracing::info!(codec = codec_name, "starting playback");
 
     {
-      let mut st = state.lock().unwrap();
-      st.state = "playing".into();
+      let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+      st.state = TrackState::Playing;
     }
 
     let max_ch = output_format.channels.max(1) as usize;
@@ -326,7 +332,7 @@ impl Engine {
       if self.device_lost.load(Ordering::SeqCst) {
         tracing::warn!("playback paused: audio device lost");
         {
-          let mut st = state.lock().unwrap();
+          let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
           st.device_lost = true;
         }
         if self.config.output_auto_reconnect {
@@ -343,20 +349,29 @@ impl Engine {
       }
 
       if seekable {
-        if let Some(target_ms) = self.seek_target_ms.lock().unwrap().take() {
+        if let Some(target_ms) = self
+          .seek_target_ms
+          .lock()
+          .unwrap_or_else(|e| e.into_inner())
+          .take()
+        {
           let frame = target_ms * sample_rate / 1000;
           if let Err(e) = audio_stream.seek(frame) {
             tracing::warn!(?e, target_ms, "seek failed, continuing");
           } else {
             total_frames = frame as usize;
             let pos = total_frames as u64 * 1000 / sample_rate;
-            let mut st = state.lock().unwrap();
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
             st.position_ms = pos;
-            st.state = "playing".into();
+            st.state = TrackState::Playing;
           }
         }
       } else {
-        let _ = self.seek_target_ms.lock().unwrap().take();
+        let _ = self
+          .seek_target_ms
+          .lock()
+          .unwrap_or_else(|e| e.into_inner())
+          .take();
       }
 
       match audio_stream.read(&mut buf) {
@@ -370,7 +385,7 @@ impl Engine {
           total_frames += n;
           consecutive_errors = 0;
           let position_ms = total_frames as u64 * 1000 / sample_rate;
-          let mut st = state.lock().unwrap();
+          let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
           st.position_ms = position_ms;
         }
         Ok(None) => break,
@@ -380,9 +395,11 @@ impl Engine {
           if consecutive_errors >= 3 {
             tracing::error!(?e, "too many consecutive decode errors, stopping");
             {
-              let mut st = state.lock().unwrap();
-              st.state = "error".into();
-              st.playing = false;
+              let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+              if st.epoch == epoch {
+                st.state = TrackState::Error;
+                st.playing = false;
+              }
             }
             return Err(e);
           }
@@ -394,10 +411,12 @@ impl Engine {
     running.store(false, Ordering::SeqCst);
 
     {
-      let mut st = state.lock().unwrap();
-      st.state = "stopped".into();
-      st.playing = false;
-      st.position_ms = total_frames as u64 * 1000 / sample_rate;
+      let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+      if st.epoch == epoch {
+        st.state = TrackState::Stopped;
+        st.playing = false;
+        st.position_ms = total_frames as u64 * 1000 / sample_rate;
+      }
     }
 
     Ok(PlaybackHandle {
@@ -419,13 +438,24 @@ impl Engine {
     self.paused.store(false, Ordering::SeqCst);
   }
   pub fn seek(&self, position_ms: u64) {
-    *self.seek_target_ms.lock().unwrap() = Some(position_ms);
+    *self
+      .seek_target_ms
+      .lock()
+      .unwrap_or_else(|e| e.into_inner()) = Some(position_ms);
   }
-  pub fn signal_shutdown(&self) {
+  pub fn shutdown(&self) {
     self.shutdown.store(true, Ordering::SeqCst);
+    self.shutdown_signal.notify_one();
   }
   pub fn is_shutdown(&self) -> bool {
     self.shutdown.load(Ordering::SeqCst)
+  }
+  /// Returns a future that resolves when `shutdown()` is called.
+  pub fn shutdown_signal(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
+    let notified = self.shutdown_signal.notified();
+    async move {
+      notified.await;
+    }
   }
   pub fn notify_device_lost(&self) {
     self.device_lost.store(true, Ordering::SeqCst);

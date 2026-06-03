@@ -10,7 +10,6 @@ env:
    CARGO_TERM_COLOR: always
 
 jobs:
-   # ── Linux (primary dev target) ──────────────────────────────────────────
    linux:
       runs-on: ubuntu-latest
       steps:
@@ -18,22 +17,18 @@ jobs:
          - uses: actions-rust-lang/setup-rust-toolchain@v1
            with:
               components: clippy, rustfmt
-
-         - name: Install ALSA dev libraries
+         - name: Install system dependencies
            run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-
+              protobuf-compiler
          - name: Build
            run: cargo build --workspace --verbose
-
          - name: Test
            run: cargo test --workspace --verbose
            env:
               ALSA_CONFIG_PATH: ${{ github.workspace }}/ci/alsa-null.conf
-
          - name: Clippy
            run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
 
-   # ── macOS ───────────────────────────────────────────────────────────────
    macos:
       runs-on: macos-latest
       steps:
@@ -41,18 +36,15 @@ jobs:
          - uses: actions-rust-lang/setup-rust-toolchain@v1
            with:
               components: clippy
-
+         - name: Install protobuf
+           run: brew install protobuf
          - name: Build
            run: cargo build --workspace --verbose
-
          - name: Test
            run: cargo test --workspace --verbose
-           # Audio tests skip automatically if no output device is available.
-
          - name: Clippy
            run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
 
-   # ── Windows ─────────────────────────────────────────────────────────────
    windows:
       runs-on: windows-latest
       steps:
@@ -60,15 +52,11 @@ jobs:
          - uses: actions-rust-lang/setup-rust-toolchain@v1
            with:
               components: clippy
-
+         - name: Install protobuf
+           run: choco install protoc -y
          - name: Build
            run: cargo build --workspace --verbose
-
          - name: Test
            run: cargo test --workspace --verbose
-           # Audio tests skip automatically if no output device is available.
-           # IPC tests use TCP transport on Windows (no Unix sockets).
-           # Named pipe tests require #[cfg(windows)] gating.
-
          - name: Clippy
            run: cargo clippy --workspace -- -D warnings 2>&1 | head -80

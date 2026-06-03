@@ -1,8 +1,10 @@
 //! Tests for IPC types (PlaybackState, IpcCommand, IpcResponse).
 //! Platform-independent — run on all targets.
 
-use around_engine::{Engine, EngineConfig, IpcCommand, IpcResponse, PlaybackState};
-use serde_json;
+use around_engine::ipc::IpcConfig;
+use around_engine::{
+  Engine, EngineConfig, ErrorCode, IpcCommand, IpcResponse, PlaybackState, TrackInfo, TrackState,
+};
 
 #[test]
 fn ipc_command_serialization_roundtrips() {
@@ -29,8 +31,8 @@ fn ipc_command_serialization_roundtrips() {
   let stop_cmd: IpcCommand = serde_json::from_str(r#"{"command":"stop"}"#).unwrap();
   assert!(matches!(stop_cmd, IpcCommand::Stop));
 
-  let list_cmd: IpcCommand = serde_json::from_str(r#"{"command":"list_decoders"}"#).unwrap();
-  assert!(matches!(list_cmd, IpcCommand::ListDecoders));
+  let list_cmd: IpcCommand = serde_json::from_str(r#"{"command":"list_codecs"}"#).unwrap();
+  assert!(matches!(list_cmd, IpcCommand::ListCodecs));
 }
 
 #[test]
@@ -43,10 +45,10 @@ fn ipc_response_ok_format() {
 
 #[test]
 fn ipc_response_error_format() {
-  let resp = IpcResponse::error("FILE_NOT_FOUND", "No such file");
+  let resp = IpcResponse::error(ErrorCode::FileNotFound, "No such file");
   let json = serde_json::to_value(&resp).unwrap();
   assert_eq!(json["status"], "error");
-  assert_eq!(json["code"], "FILE_NOT_FOUND");
+  assert_eq!(json["code"].as_str().unwrap(), "FILE_NOT_FOUND");
   assert_eq!(json["message"], "No such file");
 }
 
@@ -62,7 +64,7 @@ fn playback_state_default() {
 #[test]
 fn buffering_state_in_playback_state() {
   let state = around_engine::PlaybackState::default();
-  assert_eq!(state.state, "stopped");
+  assert_eq!(state.state, TrackState::Stopped);
 }
 
 #[test]
@@ -70,7 +72,7 @@ fn playback_state_default_seekable_is_false() {
   let st = PlaybackState::default();
   assert!(!st.seekable, "seekable must default to false for safety");
   assert!(!st.playing, "playing must default to false");
-  assert_eq!(st.state, "stopped");
+  assert_eq!(st.state, TrackState::Stopped);
 }
 
 #[test]
@@ -115,7 +117,7 @@ fn status_includes_device_lost() {
 
   // Manually construct a status-style response with device_lost: false.
   let mut resp = IpcResponse::ok();
-  resp.state = Some("stopped".into());
+  resp.state = Some(TrackState::Stopped);
   resp.position_ms = Some(0);
   resp.device_lost = Some(false);
   let json = serde_json::to_value(&resp).unwrap();
@@ -136,4 +138,171 @@ fn engine_stop_is_idempotent() {
   let engine = Engine::new(config);
   engine.stop();
   engine.stop();
+}
+
+// ---------------------------------------------------------------------------
+// IpcConfig tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ipc_config_default_has_platform_native_enabled() {
+  let cfg = IpcConfig::default();
+  assert!(
+    cfg.enable_platform_native,
+    "platform-native must be enabled by default"
+  );
+  assert!(
+    cfg.tcp_bind.is_none(),
+    "TCP must be off by default (Constitution VI)"
+  );
+  assert!(
+    cfg.udp_bind.is_none(),
+    "UDP must be off by default (Constitution VI)"
+  );
+}
+
+#[test]
+fn ipc_config_from_cli_env_tcp_flag_takes_precedence() {
+  // CLI flag takes precedence over env var (FR-037).
+  let cfg = IpcConfig::from_parts(Some("0.0.0.0:5555"), Some("0.0.0.0:9999"), None, None).unwrap();
+  assert_eq!(cfg.tcp_bind.unwrap().to_string(), "0.0.0.0:5555");
+}
+
+#[test]
+fn ipc_config_from_cli_env_falls_back_to_env_var() {
+  // When CLI flag is None, env var is used.
+  let cfg = IpcConfig::from_parts(None, None, None, Some("0.0.0.0:7777")).unwrap();
+  assert_eq!(cfg.udp_bind.unwrap().to_string(), "0.0.0.0:7777");
+}
+
+#[test]
+fn ipc_config_from_cli_env_invalid_address_errors() {
+  let result = IpcConfig::from_parts(Some("notanaddress"), None, None, None);
+  assert!(result.is_err(), "invalid address must error");
+}
+
+#[test]
+fn ipc_config_from_cli_env_both_none_gives_defaults() {
+  let cfg = IpcConfig::from_parts(None, None, None, None).unwrap();
+  assert!(cfg.tcp_bind.is_none());
+  assert!(cfg.udp_bind.is_none());
+  assert!(cfg.enable_platform_native);
+}
+
+// ---------------------------------------------------------------------------
+// IpcResponse field tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ipc_response_removed_files_serialization() {
+  // Verify removed_files serializes correctly (data model compliance).
+  let mut resp = IpcResponse::ok();
+  resp.removed_files = Some(vec!["/tmp/a".into(), "/tmp/b".into()]);
+  let json = serde_json::to_value(&resp).unwrap();
+  assert_eq!(json["status"], "ok");
+  let files = json["removed_files"].as_array().unwrap();
+  assert_eq!(files.len(), 2);
+  assert_eq!(files[0], "/tmp/a");
+  assert_eq!(files[1], "/tmp/b");
+}
+
+#[test]
+fn ipc_response_removed_files_none_is_omitted() {
+  let mut resp = IpcResponse::ok();
+  resp.removed_files = Some(vec![]);
+  let json = serde_json::to_value(&resp).unwrap();
+  // Empty vec still serializes (it\'s Some, not None).
+  assert!(json.get("removed_files").is_some());
+  assert_eq!(json["removed_files"].as_array().unwrap().len(), 0);
+
+  let resp = IpcResponse::ok();
+  let json = serde_json::to_value(&resp).unwrap();
+  // None should be omitted entirely.
+  assert!(json.get("removed_files").is_none());
+}
+
+#[test]
+fn ipc_command_unknown_command_deserializes_to_default() {
+  // serde(tag = "command") with unknown tag should error, not silently succeed.
+  let result: Result<IpcCommand, _> = serde_json::from_str(r#"{"command":"nonexistent"}"#);
+  assert!(result.is_err(), "unknown command must be rejected");
+}
+
+#[test]
+fn ipc_command_play_without_path_errors() {
+  let result: Result<IpcCommand, _> = serde_json::from_str(r#"{"command":"play"}"#);
+  assert!(result.is_err(), "play without path must error");
+}
+
+#[test]
+fn ipc_command_seek_without_position_errors() {
+  let result: Result<IpcCommand, _> = serde_json::from_str(r#"{"command":"seek"}"#);
+  assert!(result.is_err(), "seek without position_ms must error");
+}
+
+#[test]
+fn ipc_command_load_codec_without_path_errors() {
+  let result: Result<IpcCommand, _> = serde_json::from_str(r#"{"command":"load_codec"}"#);
+  assert!(result.is_err(), "load_codec without path must error");
+}
+
+#[test]
+fn ipc_command_extra_fields_ignored() {
+  // Extra fields must be ignored per forward-compatibility.
+  let cmd: IpcCommand = serde_json::from_str(r#"{"command":"status","extra":"ignored"}"#).unwrap();
+  assert!(matches!(cmd, IpcCommand::Status));
+}
+
+#[test]
+fn ipc_command_missing_command_field_errors() {
+  let result: Result<IpcCommand, _> = serde_json::from_str(r#"{}"#);
+  assert!(result.is_err(), "missing command field must error");
+}
+
+#[test]
+fn ipc_response_all_fields_populated() {
+  let mut resp = IpcResponse::ok();
+  resp.state = Some(TrackState::Playing);
+  resp.position_ms = Some(12345);
+  resp.track_id = Some(1);
+  resp.track = Some(TrackInfo {
+    id: 1,
+    path: "/tmp/test.wav".into(),
+    format: "wav".into(),
+    duration_ms: 30000,
+  });
+  resp.codecs = Some(vec![around_engine::ipc::types::CodecDescriptor {
+    name: "test".into(),
+    formats: vec!["wav".into()],
+    source: "extension".into(),
+    path: None,
+  }]);
+  resp.removed_files = Some(vec!["/tmp/old.so".into()]);
+  resp.device_lost = Some(false);
+
+  let json = serde_json::to_value(&resp).unwrap();
+  assert_eq!(json["status"], "ok");
+  assert_eq!(json["state"], "playing");
+  assert_eq!(json["position_ms"], 12345);
+  assert_eq!(json["track_id"], 1);
+  assert_eq!(json["track"]["format"], "wav");
+  assert_eq!(json["codecs"].as_array().unwrap().len(), 1);
+  assert_eq!(json["removed_files"][0], "/tmp/old.so");
+  assert_eq!(json["device_lost"], false);
+  // Verify no extra/unexpected fields leak into the response.
+  assert!(
+    json.get("code").is_none(),
+    "ok response must not have error code"
+  );
+  assert!(
+    json.get("message").is_none(),
+    "ok response must not have message"
+  );
+}
+
+#[test]
+fn ipc_config_from_cli_env_invalid_udp_address_errors() {
+  // M4: Invalid UDP bind address via env var must produce an error.
+  let result = IpcConfig::from_parts(None, None, None, Some("notanaddress"));
+  assert!(result.is_err(), "invalid UDP address must error");
 }

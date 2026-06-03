@@ -351,7 +351,7 @@ fn extension_magic_conflict_magic_wins() {
   assert_eq!(magic_codecs[0].name, "mp3");
 
   // Conflict: ext_codecs != magic_codecs → magic wins
-  assert!(same_ptr_set(&ext_codecs, &magic_codecs) == false);
+  assert!(!same_ptr_set(&ext_codecs, &magic_codecs));
 }
 
 fn same_ptr_set(a: &[&CodecInfo], b: &[&CodecInfo]) -> bool {
@@ -401,9 +401,8 @@ fn all_codecs_fail_no_fallback_remaining() {
   let mut all_failed = true;
   for codec in &ext_codecs {
     let reader: Box<dyn ReadSeek + Send> = Box::new(std::io::Cursor::new(b"RIFF....WAVE....."));
-    match (codec.open_fn)(reader) {
-      Ok(_) => all_failed = false,
-      Err(_) => {}
+    if let Ok(_) = (codec.open_fn)(reader) {
+      all_failed = false
     }
   }
   assert!(all_failed);

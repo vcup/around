@@ -55,7 +55,7 @@ pub trait Source: Send + Sync {
   fn identifier(&self) -> String;
 }
 
-/// Describes a format signature a decoder can match against.
+/// Describes a format signature a codec can match against.
 #[derive(Debug, Clone)]
 pub struct FormatSignature {
   pub extension: Option<&'static str>,

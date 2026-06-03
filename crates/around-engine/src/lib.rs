@@ -2,16 +2,17 @@
 
 pub mod config;
 pub mod extensions;
-pub mod ipc_types;
-pub(crate) mod ipc_codec;
 pub mod ipc;
 pub mod output;
 pub mod pipeline;
 pub mod platform;
 
 pub use config::EngineConfig;
-pub use extensions::{DecoderInfo, ExtensionManager};
-pub use ipc_types::{IpcCommand, IpcResponse, PlaybackState};
+pub use extensions::ExtensionManager;
 pub use ipc::run_ipc_server;
+pub use ipc::types::{
+  CodecDescriptor, ErrorCode, IpcCommand, IpcResponse, PlaybackState, ResponseStatus, TrackInfo,
+  TrackState,
+};
 pub use output::AudioOutput;
 pub use pipeline::Engine;

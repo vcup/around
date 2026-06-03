@@ -24,3 +24,4 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 around-source-file = { workspace = true }
 ctrlc = { workspace = true }
+libc = "0.2"
