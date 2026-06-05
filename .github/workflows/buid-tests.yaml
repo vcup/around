@@ -1,62 +1,64 @@
 name: Build and tests
 
 on:
-   push:
-      branches: ["master"]
-   pull_request:
-      branches: ["master"]
+  push:
+    branches: ["master"]
+  pull_request:
+    branches: ["master"]
 
 env:
-   CARGO_TERM_COLOR: always
+  CARGO_TERM_COLOR: always
 
 jobs:
-   linux:
-      runs-on: ubuntu-latest
-      steps:
-         - uses: actions/checkout@v4
-         - uses: actions-rust-lang/setup-rust-toolchain@v1
-           with:
-              components: clippy, rustfmt
-         - name: Install system dependencies
-           run: sudo apt-get update && sudo apt-get install -y libasound2-dev
-              protobuf-compiler
-         - name: Build
-           run: cargo build --workspace --verbose
-         - name: Test
-           run: cargo test --workspace --verbose
-           env:
-              ALSA_CONFIG_PATH: ${{ github.workspace }}/ci/alsa-null.conf
-         - name: Clippy
-           run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev protobuf-compiler
+      - uses: LABSN/sound-ci-helpers@v1
+      - name: Build
+        run: cargo build --workspace --verbose
+      - name: Test
+        run: cargo test --workspace --verbose
+        env:
+          ALSA_CONFIG_PATH: ${{ github.workspace }}/ci/alsa-null.conf
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
 
-   macos:
-      runs-on: macos-latest
-      steps:
-         - uses: actions/checkout@v4
-         - uses: actions-rust-lang/setup-rust-toolchain@v1
-           with:
-              components: clippy
-         - name: Install protobuf
-           run: brew install protobuf
-         - name: Build
-           run: cargo build --workspace --verbose
-         - name: Test
-           run: cargo test --workspace --verbose
-         - name: Clippy
-           run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+      - name: Install protobuf
+        run: brew install protobuf
+      - uses: LABSN/sound-ci-helpers@v1
+      - name: Build
+        run: cargo build --workspace --verbose
+      - name: Test
+        run: cargo test --workspace --verbose
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
 
-   windows:
-      runs-on: windows-latest
-      steps:
-         - uses: actions/checkout@v4
-         - uses: actions-rust-lang/setup-rust-toolchain@v1
-           with:
-              components: clippy
-         - name: Install protobuf
-           run: choco install protoc -y
-         - name: Build
-           run: cargo build --workspace --verbose
-         - name: Test
-           run: cargo test --workspace --verbose
-         - name: Clippy
-           run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+      - name: Install protobuf
+        run: choco install protoc -y
+      - uses: LABSN/sound-ci-helpers@v1
+      - name: Build
+        run: cargo build --workspace --verbose
+      - name: Test
+        run: cargo test --workspace --verbose
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
