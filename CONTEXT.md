@@ -117,11 +117,12 @@ _Avoid_: Player, daemon, server, around process.
 
 A single playback context within the Engine: one Source, one decode loop,
 one optional FilterChain, and one output ring buffer. The Engine manages
-0..N concurrent Streams. Each Stream has a unique `StreamId` and an
-optional user-assigned alias. A Stream is created by a `Play` command
-and destroyed by `Stop`, exhaustion, or error. The decode loop runs
-asynchronously on the Engine's tokio runtime, feeding samples into a
-lock-free ring buffer consumed by the output layer.
+0..N concurrent Streams. Each Stream has a unique `StreamId`, an
+optional user-assigned alias, and an `output_spec` — the target
+format for the final resampler, matched to the output device's native
+format and updated on device reconnect. The decode loop is async,
+feeding samples into a lock-free ring buffer consumed by the output
+layer.
 _Avoid_: Track, playback session, player instance.
 
 ## StreamId
@@ -135,11 +136,68 @@ _Avoid_: Track ID, handle.
 
 ## FilterChain
 
-An ordered sequence of DSP filters (EQ, compressor, limiter, etc.)
-applied to decoded PCM samples inline within the decode loop — after
-decode, before the ring buffer write — to maximise L1/L2 data-cache
-locality. The chain is per-Stream and may be empty.
+An ordered list of audio processing filters applied within the decode
+loop. Format negotiation at construction time auto‑inserts Resample
+and de/interleave filters at boundaries where formats diverge. The
+chain's final output format is guaranteed to match `output_spec`.
+May be empty (plain playback); then a single Resample filter is
+auto‑inserted if decode format ≠ output device format.
 _Avoid_: Effect chain, audio processing pipeline.
+
+## SampleSpec
+
+Describes an uncompressed audio format: sample rate (Hz), channel count,
+and interleave mode (interleaved or planar). Used by codec output,
+filter `formats_in`/`formats_out` declarations, and `output_spec` on a
+Stream. The format negotiation engine uses `SampleSpec` lists to find
+globally optimal format assignments across the FilterChain.
+_Avoid_: Audio format, output config.
+
+## AudioBuffer
+
+The C‑ABI processing unit passed to filter `process()` functions.
+A flat `#[repr(C)]` struct with interleave‑mode metadata.
+FFmpeg: `AVFrame.data[]` maps to `AudioBufferC.channels`.
+
+## PcmBuffer
+
+A pre‑allocated `Vec<f32>` used as the in‑place processing buffer
+inside the decode loop. Split into two regions determined during
+FilterChain negotiation: `[0..decoder_max]` for decode output and
+in‑place filter processing, `[decoder_max..capacity-1]` for resample
+output. Reused every iteration — zero allocation after initialisation.
+
+## PlanarBuffer
+
+A multi‑channel audio buffer where each channel occupies a contiguous
+memory region (`Vec<Vec<f32>>`). All channels share the same heap
+allocation. The Rust‑side representation of `AudioBufferC`.
+
+## Resampler
+
+A Filter that converts sample rate, channel count, or both. Equal
+status with all other filters — not a special pipeline stage.
+Auto‑inserted by the chain builder at boundaries where adjacent
+filters have no common format, and at the chain's end when the
+final filter's output does not match `output_spec`.
+_Avoid_: SRC, sample rate converter, upsampler.
+
+## Deinterleave / Interleave
+
+Filters auto‑inserted at chain boundaries where the interleave mode
+changes. Deinterleave: interleaved → planar. Interleave: planar →
+interleaved. Zero‑overhead when absent (all filters share the same
+interleave mode).
+
+## Filter
+
+A single audio‑processing unit (EQ, compressor, resampler, volume,
+deinterleave). Each filter declares accepted input/output formats
+via `SampleSpec` lists, accepts configuration via FFmpeg‑style string
+(optionally KDL‑parsed), and registers through the unified
+ExtensionManager plugin registry. Built‑in filters (Volume) are
+always available; others are runtime‑loadable shared libraries.
+_Avoid_: Plugin, DSP unit, effect.
 
 ## Router
 

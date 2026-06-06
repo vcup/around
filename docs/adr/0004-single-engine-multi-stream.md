@@ -95,26 +95,40 @@ flag. In the 004 branch, all devices default to auto-reconnect.
 
 ### FilterChain (future)
 
-DSP filters run inline in the decode loop (decode → filter → ring buffer)
-to maximise L1/L2 data-cache locality. The chain is per-Stream and ordered.
+Superseded by ADR-0005.
 
 ### Router (future)
 
-The Router maps each Stream's ring buffer to one or more consumer endpoints
-(physical devices, virtual loopback, network sinks, file recorders). Ring
-buffer consumers share a broadcast read pattern with independent cursors.
-In the 004 branch, each Stream has exactly one consumer (the CPAL callback)
-and the Router is implicit.
+The Router fans out a single Stream's ring buffer to N consumers
+(physical devices, virtual loopback, network sinks, file recorders).
+It is a 1‑to‑N SPSC bridge: a tokio task reads from the Stream's
+ring buffer and writes to each consumer's independent SPSC ring.
+Every consumer ring has its own Resample filter if its target format
+differs from the Stream's `output_spec`.
+
+When there is exactly one consumer, the Router is absent — the Stream
+ring buffer connects directly to the consumer.
 
 ### Forwarding (future)
 
+Default strategy per connection type:
+
 | Mode | Data | Bandwidth | Use case |
 |---|---|---|---|
-| Source bytes | Encoded Source::read output | Low | WAN, cross-device |
-| Decoded PCM | Ring buffer samples | High | LAN sync, low latency |
+| Decoded PCM | Stream ring buffer samples | High | LAN, low latency |
+| Source bytes | Encoded Source output | Low | WAN, cross‑device |
 
-Default: source bytes.
+Alternative: send synchronised timestamps only; the receiving instance
+pulls the source independently (network sources download directly;
+local files are synced to peers). All modes are user‑configurable.
 
+### Source trait
+
+The `Source` trait is asynchronous. All I/O (disk, network) is `async`.
+The decode loop awaits `source.read(&mut buf).await?` on the main
+tokio runtime. This enables io_uring on Linux and natural composability
+with network streams — no `spawn_blocking` for I/O, only for CPU work
+(decode + filter).
 ## Consequences
 
 - `PlaybackState` struct replaced by `StreamState` with Atomic fields — no
