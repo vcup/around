@@ -26,7 +26,7 @@ sample count, channel count, and interleave layout.
 
 ### Problem 2: DSP filtering location
 
-ADR-0004 places the FilterChain "inline in the decode loop" without
+ADR-0005 places the FilterChain "inline in the decode loop" without
 specifying where format adaptation occurs. Every filter has a preferred
 input/output format; format requirements propagate through the chain.
 
@@ -339,7 +339,7 @@ filter name="custom" args="acrossover=split=500 1500 4000:order=4th"
 
 ### 11. Device‑loss recovery
 
-Per ADR-0004, when the output device changes:
+Per ADR-0005, when the output device changes:
 
 1. `output_spec` is re‑queried from the new device.
 2. The terminal Resample filter receives the new ratio via
@@ -368,7 +368,7 @@ as a pragmatic approximation.
 - `extensions.rs`: added `register_filter` path, `ExtensionKind` enum,
   unified `register_around_extensions` ABI.
 - `ipc/types.rs`: `SampleSpec` gains `interleave` field; `PlaybackState`
-  (to become `StreamState` per ADR-0004) gains `output_spec` field.
+  (to become `StreamState` per ADR-0005) gains `output_spec` field.
 - `output.rs`: `AudioOutput` replaced by `ringbuf::HeapRb<f32>`.
 - `Cargo.toml`: removed `crossbeam` dependency (replaced by `ringbuf`);
   added optional `rubato` dependency; scaffolded `around-filter-ffmpeg`
@@ -376,14 +376,14 @@ as a pragmatic approximation.
 
 ### What this ADR does NOT decide
 
-- The exact `PlaybackState → StreamState` migration (ADR-0004 scope).
+- The exact `PlaybackState → StreamState` migration (ADR-0005 scope).
 - The Router (multi‑consumer fan‑out, beyond the 004 branch).
-- The Source trait's async design (decided in ADR-0004, awaiting
+- The Source trait's async design (decided in ADR-0005, awaiting
   implementation).
 
 ### ADR relationships
 
 - **ADR-0002** (fn‑ptr vtable): FilterVTable follows the same pattern.
-- **ADR-0004** (single‑Engine multi‑Stream): this ADR refines StreamState,
+- **ADR-0005** (single‑Engine multi‑Stream): this ADR refines StreamState,
   FilterChain design, and decode‑loop scheduling.
 - Future ADR: async Source trait (io_uring / network streaming).

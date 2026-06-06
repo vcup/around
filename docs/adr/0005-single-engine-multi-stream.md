@@ -1,4 +1,4 @@
-# ADR 0004: Single-Engine Multi-Stream Architecture
+# ADR 0005: Single-Engine Multi-Stream Architecture
 
 The Engine manages 0..N concurrent playback Streams within a single process.
 Each Stream is an independent decode loop feeding a lock-free ring buffer
@@ -95,7 +95,7 @@ flag. In the 004 branch, all devices default to auto-reconnect.
 
 ### FilterChain (future)
 
-Superseded by ADR-0005.
+Superseded by ADR-0006 (FilterChain).
 
 ### Router (future)
 
