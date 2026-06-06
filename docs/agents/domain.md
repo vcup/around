@@ -61,10 +61,11 @@ Do not assume the next session inherits the current session's context.
 
 ## Known deviations (branch: `004-platform-native-ipc`)
 
-These are temporary inconsistencies. The Codec naming deviation was fixed
-in-branch (it overlapped with IPC work). The remaining deviation will be
-resolved when the branch merges.
+## Known deviations
 
-| Deviation | Code location | Resolution after merge |
-|-----------|--------------|----------------------|
-| `PlaybackStatus` is `u8` constants (`PLAYING`, `PAUSED`, `STOPPED`, `BUFFERING`) in `around-core/src/state.rs`, but the canonical term is the enum form | `around-core/src/state.rs`, `around-engine/src/ipc/types.rs` (`TrackState`) | Replace `u8` constants with `PlaybackStatus` enum; unify `TrackState` into it; add `Buffering` variant |
+| Deviation | Code location | Resolution |
+|-----------|--------------|-----------|
+| `PlaybackState` (sync `Mutex`-based, single‑stream) differs from the ADR‑0005 `StreamState` (all‑Atomic, multi‑stream) design | `around-engine/src/ipc/types.rs`, `around-engine/src/pipeline.rs` | Implement ADR‑0005 — replace `Arc<Mutex<PlaybackState>>` with per‑stream `StreamState` using `atomic-rs` |
+| `AudioOutput` uses `crossbeam::bounded<Vec<f32>>` + per‑batch `to_vec()` instead of ADR‑0006's `ringbuf::HeapRb<f32>` + `PcmBuffer` zero‑allocation design | `around-engine/src/output.rs`, `around-engine/src/pipeline.rs` | Replace with `ringbuf::HeapRb` + pre‑allocated `PcmBuffer` region layout |
+| `ExtensionManager` only loads Codecs (single `get_codec_info` entry point) — not yet the unified `register_around_extensions` from ADR‑0004 | `around-engine/src/extensions.rs` | Implement ADR‑0004 unified entry point + `ExtensionKind` enum |
+| Build script uses `unwrap()` — clippy warns | `crates/around-engine/build.rs` | Replace with `expect()` or allow

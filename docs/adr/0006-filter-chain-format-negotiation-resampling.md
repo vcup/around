@@ -6,9 +6,10 @@ filter—including resampling and de/interleaving—has equal status within the
 chain. Format negotiation finds a globally optimal format assignment across
 all filters and auto-inserts Resample, Deinterleave, and Interleave filters
 at boundaries where formats diverge. Filters are runtime-loadable shared
-libraries registered through the same ExtensionManager that handles Codecs
-(ADR-0002 pattern, unified entry point). FFmpeg's `avfilter` is available as
-an optional runtime plugin with zero-copy processing via a shared buffer pool.
+libraries registered through the same extension framework that handles Codecs
+(ADR-0004, `{slot_name}_create` registration functions). FFmpeg's `avfilter`
+is available as an optional runtime plugin with zero-copy processing via a
+shared buffer pool.
 
 ## Status
 
@@ -183,110 +184,58 @@ A `Volume` filter lives in the FilterChain (post‑fader position). It accepts
 interleaved f32, multiplies every sample by a gain factor, zero‑copy.
 Zero‑overhead when absent (not present in the filter list).
 
-### 7. Filter trait — C‑ABI vtable
+### 7. Filter trait — `#[stabby::stabby]`
 
-Follows ADR-0002's function‑pointer vtable pattern for stable cross‑`.so`
-boundaries.
+stabby generates an ABI‑stable vtable with identical call overhead to
+hand‑written C vtables — a single `call [rax+offset]` after one pointer
+load. stabby also provides canaries and layout reports for cross‑compiler‑
+version safety.
 
 ```rust
-#[repr(C)]
-struct SampleSpecC {
-    rate: u32,
-    channels: u8,
-    interleave: u8,     // 0 = interleaved, 1 = planar
-}
+use stabby::dynptr;
 
-#[repr(C)]
-struct FilterInfoC {
-    name: *const c_char,
-    description: *const c_char,
-    formats_in: *const SampleSpecC,   // null‑terminated array
-    formats_out: *const SampleSpecC,
-    /// Returns an opaque handle. Owns `config` — filter must free it
-    /// via `libc::free` when no longer needed.
-    open_fn: unsafe extern "C" fn(config: *mut c_char) -> *mut c_void,
+#[stabby::stabby]
+pub trait Filter {
+    extern "C" fn process(&mut self, buf: &mut AudioBufferC) -> u32;
+    extern "C" fn get_params(&self) -> stabby::string::StabbyString;
 }
-
-#[repr(C)]
-struct FilterVTable {
-    /// Process one batch. `buf` carries the interleave mode negotiated
-    /// for this filter.
-    process: unsafe extern "C" fn(*mut c_void, *mut AudioBufferC) -> u32,
-    drop: unsafe extern "C" fn(*mut c_void),
-}
-
-/// Returns a string describing the filter's current state.
-/// Engine owns the returned pointer and must free via `libc::free`.
-type GetParamsFn = unsafe extern "C" fn(opaque: *const c_void) -> *mut c_char;
 ```
 
-**Config ownership:** `open_fn` takes ownership of the config string
-(allocated by the Engine via `libc::malloc`). The filter may free it
-immediately or hold it until `drop`. `get_params` returns a freshly
-allocated string describing the current internal state — formatted from
-the filter's own data, not a stored copy of the original config. This
-ensures normalised values, default fills, and inactive option exclusion
-are accurately reflected.
+`dynptr!(Box<dyn Filter>)` at the call site compiles to the same
+instructions as a hand‑written C vtable.
+
+### 7.1 Filter registration
+
+Filter registration uses the extension framework defined in ADR‑0004.
+Each filter `.so` exports an `around_filter_create(index: usize) ->
+*mut c_void` registration function (following the `{slot_name}_create`
+pattern from ADR‑0004 §5.2).  The host polls `create(0)`, `create(1)`,
+… until null; each opaque pointer is passed to the Filter Register via
+`push_raw`.  The `Filter` trait itself carries the factory interface —
+`info()` returns metadata (name, description, formats_in/out),
+`open(config)` returns a `Box<dyn Filter>` instance, and `process()`
+applies the filter.
 
 ### 8. ExtensionManager — unified plugin registry
 
-A `.so` exports one entry point:
+Registration mechanics are defined in ADR‑0004 §5.  This section describes
+the audio‑specific payloads and how the Engine stores them.
+A single `.so` may export multiple `{slot}_create` functions — one for
+each Slot it implements — enabling distributable bundles that ship a
+codec alongside a suite of filters in one file.
 
 ```rust
-// .so export:
-pub unsafe extern "C" fn register_around_extensions(reg: *mut ExtensionRegistrarC);
+// SDK registries store typed trait objects:
+//   CodecRegister → Vec<DynCodecRef>
+//   FilterRegister → Vec<dynptr!(Box<dyn Filter + Send + Sync>)>
+// Lifecycle managed by around‑extensions via RegisterVTable.
 ```
 
-The Engine builds an `ExtensionRegistrarC` and passes it in. The `.so`
-calls back to register each capability:
+Loading follows ADR‑0004 §5.3 (recursive `load()`), which handles
+dependency resolution, Slot definition, entry registration, and
+lifecycle initialisation.  Trait objects are owned by SDK Registries.
+`remove_by_meta` drops them before `dlclose`.
 
-```rust
-#[repr(C)]
-struct ExtensionRegistrarC {
-    opaque: *mut c_void,      // Engine‑private pointer
-    register_codec: unsafe extern "C" fn(opaque: *mut c_void, info: *const CodecInfoC),
-    register_filter: unsafe extern "C" fn(opaque: *mut c_void, info: *const FilterInfoC),
-    // future: register_source, register_sink
-}
-```
-
-A single `.so` may call `register_codec` and/or `register_filter` any
-number of times — one entry‑point invocation can register all of the
-plugin's capabilities at once. This enables distributable bundles that
-ship both a codec and a suite of filters in one file.
-
-```rust
-// Internal Engine storage
-enum ExtensionKind {
-    Codec(CodecInfo),
-    Filter(FilterInfoWrapped),  // holds FilterInfoC copy + GetParamsFn
-}
-
-struct ExtensionEntry {
-    _library: Library,          // keeps .so alive (and all ptrs valid)
-    kind: ExtensionKind,
-    name: String,
-    temp_file: Option<PathBuf>,
-}
-```
-
-Loading flow:
-
-```
-ExtensionManager::load_path(path)
-  → Library::new(path)                         // dlopen
-  → lib.get(b"register_around_extensions")      // dlsym
-  → alloc ExtensionRegistrarC { opaque, register_codec, register_filter }
-  → call register_around_extensions(&mut reg)
-      → .so callback: reg.register_codec(WAV)
-      → .so callback: reg.register_filter(EQ)
-  → Engine stores ExtensionEntry for each registered capability
-  → Library stays alive (held by ExtensionEntry)
-```
-
-Pointers passed to registration callbacks must point to `static` data
-inside the `.so` (their lifetime is tied to `Library`). The Engine
-copies `CodecInfo` but wraps `FilterInfoC` by reference.
 
 ### 9. FFmpeg bridge — runtime plugin, zero-copy
 
@@ -365,8 +314,7 @@ as a pragmatic approximation.
   and `ringbuf::HeapRb`. Static `to_vec()` allocation removed.
 - `pipeline::filter_chain` (new module): format negotiation, filter graph
   builder, auto‑insert rules, scoring function.
-- `extensions.rs`: added `register_filter` path, `ExtensionKind` enum,
-  unified `register_around_extensions` ABI.
+- `extensions.rs`: added filter registration path via Pull‑model exports.
 - `ipc/types.rs`: `SampleSpec` gains `interleave` field; `PlaybackState`
   (to become `StreamState` per ADR-0005) gains `output_spec` field.
 - `output.rs`: `AudioOutput` replaced by `ringbuf::HeapRb<f32>`.
@@ -383,7 +331,8 @@ as a pragmatic approximation.
 
 ### ADR relationships
 
-- **ADR-0002** (fn‑ptr vtable): FilterVTable follows the same pattern.
+- **ADR-0004** (Unified Extension System): Filter uses `#[stabby::stabby]`
+  trait + `{slot_name}_create` registration, the same mechanism as Codec.
 - **ADR-0005** (single‑Engine multi‑Stream): this ADR refines StreamState,
   FilterChain design, and decode‑loop scheduling.
 - Future ADR: async Source trait (io_uring / network streaming).
