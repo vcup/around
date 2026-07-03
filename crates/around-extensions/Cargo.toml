@@ -1,5 +1,5 @@
 [package]
-name = "around-core"
+name = "around-extensions"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,10 +9,15 @@ rust-version.workspace = true
 
 [lints]
 workspace = true
+
 [dependencies]
-bitflags = "2"
 stabby = { workspace = true }
 stabby-abi = { workspace = true, features = ["std", "test"] }
+libloading = { workspace = true }
 parking_lot = { workspace = true }
-around-extensions = { workspace = true }
-around-extensions-macros = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+around-extensions-test-plugin = { path = "../around-extensions-test-plugin" }
+libloading = { workspace = true }
+tracing-subscriber = { workspace = true }

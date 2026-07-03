@@ -30,6 +30,7 @@ fn proto_command_to_ipc(c: proto::ipc_command::Command) -> std::io::Result<types
     Command::LoadCodec(d) => Ok(types::IpcCommand::LoadCodec { path: d.path }),
     Command::LoadCodecBytes(d) => Ok(types::IpcCommand::LoadCodecBytes { data: d.data }),
     Command::Cleanup(_) => Ok(types::IpcCommand::Cleanup),
+    Command::Shutdown(_) => Ok(types::IpcCommand::Shutdown),
   }
 }
 

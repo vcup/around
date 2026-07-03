@@ -12,8 +12,10 @@ workspace = true
 
 [dependencies]
 around-core = { workspace = true }
+around-extensions = { workspace = true }
 around-source-file = { workspace = true }
 around-codec-wav = { workspace = true }
+stabby = { workspace = true }
 kdl = { workspace = true }
 tracing = { workspace = true }
 cpal = { workspace = true }
@@ -23,10 +25,9 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 crossbeam = { workspace = true }
 prost = { workspace = true, optional = true }
-
-[[bench]]
-name = "pipeline_bench"
-harness = false
+tokio-util = { workspace = true }
+parking_lot = { workspace = true }
+ringbuf = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true, optional = true }

@@ -30,7 +30,6 @@ pub mod types;
 pub use self::config::IpcConfig;
 
 use self::types::{IpcCommand, IpcResponse, PlaybackState};
-use crate::extensions::ExtensionManager;
 use crate::pipeline::Engine;
 use std::sync::{Arc, Mutex};
 // ---------------------------------------------------------------------------
@@ -41,7 +40,6 @@ pub(crate) async fn handle_command(
   cmd: IpcCommand,
   engine: &Arc<Engine>,
   state: &Arc<Mutex<PlaybackState>>,
-  ext_mgr: &Arc<ExtensionManager>,
 ) -> IpcResponse {
   use self::handlers::*;
   match cmd {
@@ -51,10 +49,10 @@ pub(crate) async fn handle_command(
     IpcCommand::Seek { position_ms } => handle_seek(engine, state, position_ms),
     IpcCommand::Stop => handle_stop(engine, state),
     IpcCommand::Status => handle_status(state),
-    IpcCommand::ListCodecs => handle_list_codecs(ext_mgr),
-    IpcCommand::LoadCodec { path } => handle_load_codec(ext_mgr, &path),
-    IpcCommand::LoadCodecBytes { data } => handle_load_codec_bytes(ext_mgr, data),
-    IpcCommand::Cleanup => handle_cleanup(ext_mgr),
+    IpcCommand::ListCodecs => handle_list_codecs(),
+    IpcCommand::LoadCodec { path } => handle_load_codec(&path),
+    IpcCommand::LoadCodecBytes { data } => handle_load_codec_bytes(data),
+    IpcCommand::Cleanup => handle_cleanup(),
     IpcCommand::Shutdown => handle_shutdown(engine),
   }
 }
@@ -67,14 +65,13 @@ pub async fn run_ipc_server(
   engine: Arc<Engine>,
   state: Arc<Mutex<PlaybackState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-  let ext_mgr = Arc::new(ExtensionManager::new());
   // Remove stale temp files from crashed previous instances before binding.
   for path in handlers::scan_and_remove_stale_temp_files() {
     tracing::info!("removed stale temp file: {}", path);
   }
   let mut manager = transport_manager::TransportManager::new(config);
   manager.check_running_instance().await?;
-  manager.start(engine, state, ext_mgr).await?;
+  manager.start(engine, state).await?;
   manager.join().await;
   Ok(())
 }

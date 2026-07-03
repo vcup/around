@@ -1,8 +1,12 @@
 //! Playback state types.
 
-pub type PlaybackStatus = u8;
-
-pub const PLAYING: PlaybackStatus = 0;
-pub const PAUSED: PlaybackStatus = 1;
-pub const STOPPED: PlaybackStatus = 2;
-pub const BUFFERING: PlaybackStatus = 3;
+/// Playback status for a stream.  Uses `#[repr(u8)]` for Atomic compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PlaybackStatus {
+  Playing = 0,
+  Paused = 1,
+  Stopped = 2,
+  Buffering = 3,
+  Error = 4,
+}

@@ -15,4 +15,6 @@ crate-type = ["lib", "cdylib"]
 
 [dependencies]
 around-core = { workspace = true }
-symphonia = { workspace = true, features = ["wav"] }
+around-extensions = { workspace = true }
+tracing = { workspace = true }
+stabby = { workspace = true }

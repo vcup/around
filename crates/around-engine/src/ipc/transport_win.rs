@@ -25,14 +25,12 @@ pub(crate) async fn serve_pipe(
   state: Arc<Mutex<PlaybackState>>,
   mut server: tokio::net::windows::named_pipe::NamedPipeServer,
   codec: impl IpcCodec + Clone + Send + 'static,
-  ext_mgr: Arc<crate::extensions::ExtensionManager>,
 ) {
   loop {
     if engine.is_shutdown() {
       break;
     }
 
-    // Wait for a client to connect
     if let Err(e) = server.connect().await {
       tracing::warn!(?e, "named pipe connect error");
       continue;
@@ -40,10 +38,8 @@ pub(crate) async fn serve_pipe(
 
     let eng = engine.clone();
     let st = state.clone();
-    let ext = ext_mgr.clone();
     let cdc = codec.clone();
 
-    // Create a new pipe instance for the next client
     let next_pipe = match create_named_pipe().await {
       Ok(p) => p,
       Err(e) => {
@@ -52,8 +48,7 @@ pub(crate) async fn serve_pipe(
       }
     };
 
-    // Handle connection (sequential — matches serve() pattern).
-    if let Err(e) = crate::ipc::connection::handle_connection(server, eng, st, ext, cdc).await {
+    if let Err(e) = crate::ipc::connection::handle_connection(server, eng, st, cdc).await {
       tracing::error!(?e, "named pipe connection error");
     }
     server = next_pipe;

@@ -1,6 +1,5 @@
 //! Transport orchestration: start-up sequence, lifecycle, shutdown.
 
-use crate::extensions::ExtensionManager;
 use crate::ipc::codec::IpcWire;
 use crate::ipc::config::IpcConfig;
 use crate::ipc::types::PlaybackState;
@@ -112,7 +111,6 @@ impl TransportManager {
     &mut self,
     engine: Arc<Engine>,
     state: Arc<Mutex<PlaybackState>>,
-    ext_mgr: Arc<ExtensionManager>,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut native_ok = false;
 
@@ -131,7 +129,6 @@ impl TransportManager {
           native_ok = true;
           let eng = engine.clone();
           let st = state.clone();
-          let ext = ext_mgr.clone();
           let sp = self.unix_socket.clone();
           let force_json = self.config.force_json;
           let handle = tokio::spawn(async move {
@@ -141,7 +138,7 @@ impl TransportManager {
               Box::pin(async move { l.accept().await.map(|(s, _)| s) })
                 as Pin<Box<dyn Future<Output = io::Result<_>> + Send>>
             };
-            super::connection::serve(&eng, &st, &ext, IpcWire::select(force_json), accept).await;
+            super::connection::serve(&eng, &st, IpcWire::select(force_json), accept).await;
             // FR-005: clean up socket file on exit.
             let _ = std::fs::remove_file(&sp);
           });
@@ -159,17 +156,10 @@ impl TransportManager {
             native_ok = true;
             let eng = engine.clone();
             let st = state.clone();
-            let ext = ext_mgr.clone();
             let force_json = self.config.force_json;
             let handle = tokio::spawn(async move {
-              crate::ipc::transport_win::serve_pipe(
-                eng,
-                st,
-                server,
-                IpcWire::select(force_json),
-                ext,
-              )
-              .await;
+              crate::ipc::transport_win::serve_pipe(eng, st, server, IpcWire::select(force_json))
+                .await;
             });
             self.handles.push(handle);
           }
@@ -205,7 +195,6 @@ impl TransportManager {
       );
       let eng = engine.clone();
       let st = state.clone();
-      let ext = ext_mgr.clone();
       let pp = self.port_path.clone();
       let force_json = self.config.force_json;
       let handle = tokio::spawn(async move {
@@ -215,13 +204,14 @@ impl TransportManager {
           Box::pin(async move { l.accept().await.map(|(s, _)| s) })
             as Pin<Box<dyn Future<Output = io::Result<_>> + Send>>
         };
-        super::connection::serve(&eng, &st, &ext, IpcWire::select(force_json), accept).await;
+        super::connection::serve(&eng, &st, IpcWire::select(force_json), accept).await;
         if needs_port_file {
           let _ = std::fs::remove_file(&pp);
         }
       });
       self.handles.push(handle);
     } else if native_ok {
+      // Native transport succeeded — clean up any stale TCP port file.
       let _ = std::fs::remove_file(&self.port_path);
     }
 
@@ -231,7 +221,6 @@ impl TransportManager {
       tracing::info!("IPC server (UDP) listening on {}", udp_socket.local_addr()?);
       let eng = engine.clone();
       let st = state.clone();
-      let ext = ext_mgr.clone();
       let force_json = self.config.force_json;
       let handle = tokio::spawn(async move {
         crate::ipc::transport_udp::serve_udp(
@@ -239,7 +228,6 @@ impl TransportManager {
           st,
           Arc::new(udp_socket),
           IpcWire::select(force_json),
-          ext,
         )
         .await;
       });

@@ -1,32 +1,52 @@
-//! around-codec-wav: Built-in WAV codec.
+//! around-codec-wav: WAV(PCM) codec via the Codec trait (ADR-0004 compliant).
 //!
-//! Handles WAV(PCM) files via the codec system (AudioStream + CodecInfo).
-//! Retains all prior fixes: C1 (frame→sample conversion), C2 (zero-size chunks),
-//! H2 (bits_per_sample validation), H4 (out-of-range seek), M1 (duration).
+//! Implements the ABI-stable [`Codec`] trait for RIFF/WAV PCM audio files.
+//! Uses reader callbacks (`ReadFn`/`SeekFn`) during `open()` instead of
+//! `Box<dyn ReadSeek>`, enabling cross-FFI-boundary streaming.
+//!
+//! ## Extension exports
+//!
+//! | Symbol | Purpose |
+//! |---|---|
+//! | `AROUND_META` | Extension metadata (name, version, dependencies) |
+//! | `around_codec_create` | Factory: `fn(index: usize) -> *mut c_void` |
 
-use around_core::{
-  AroundError, AudioStream, AudioStreamVTable, CodecInfo, FormatSignature, ReadSeek,
-};
-use std::io::{self, Read, Seek, SeekFrom};
-
-// ---------------------------------------------------------------------------
-// Format declarations
-// ---------------------------------------------------------------------------
-
-static WAV_FORMATS: &[FormatSignature] = &[FormatSignature::from_extension("wav", "WAV audio")
-  .with_mime("audio/wav")
-  .with_magic(b"RIFF")];
+use std::ffi::c_void;
+use std::io;
 
 // ---------------------------------------------------------------------------
-// Internal state
+// Extension metadata
 // ---------------------------------------------------------------------------
 
 /// Maximum frames decoded per internal read batch — bounds per-call memory.
 const READ_BATCH_FRAMES: usize = 4096;
 
-struct WavState {
-  reader: Box<dyn ReadSeek + Send>,
-  sample_rate: u32,
+/// Exported extension metadata.
+#[no_mangle]
+pub static AROUND_META: around_extensions::ExtensionMeta = around_extensions::ExtensionMeta {
+  name: c"around-codec-wav".as_ptr().cast(),
+  semver: c"0.1.0".as_ptr().cast(),
+  api_version: 1,
+  _pad: 0,
+  depends_on: std::ptr::null(),
+  depends_on_slots: std::ptr::null(),
+  author: c"around project".as_ptr().cast(),
+  description: c"WAV PCM audio codec".as_ptr().cast(),
+};
+
+// ---------------------------------------------------------------------------
+// Codec implementation
+// ---------------------------------------------------------------------------
+
+/// Stateless WAV codec. Per-stream state is allocated in `open()` and stored
+/// as an opaque `*mut c_void`.
+pub struct WavCodec;
+
+/// Per-stream state for WAV decoding.
+struct WavStream {
+  reader_ctx: *mut c_void,
+  reader_read: around_core::codec::ReadFn,
+  reader_seek: around_core::codec::SeekFn,
   channels: u8,
   bit_depth: u8,
   data_start: u64,
@@ -36,223 +56,144 @@ struct WavState {
   raw_buf: Vec<u8>,
 }
 
-impl WavState {
-  fn open(mut reader: Box<dyn ReadSeek + Send>) -> Result<Self, AroundError> {
-    let (sample_rate, channels, bit_depth, data_start, bytes_per_frame, total_frames) =
-      Self::parse_header(&mut *reader)?;
-
-    let initial_cap = READ_BATCH_FRAMES * bytes_per_frame;
-
-    Ok(Self {
-      reader,
-      sample_rate,
-      channels,
-      bit_depth,
-      data_start,
-      bytes_per_frame,
-      total_frames,
-      position: 0,
-      raw_buf: Vec::with_capacity(initial_cap),
-    })
-  }
-
-  fn read_impl(&mut self, buf: &mut [f32]) -> Result<Option<usize>, AroundError> {
-    if self.position >= self.total_frames {
-      return Ok(None);
-    }
-
-    let ch = self.channels as usize;
-    let remaining = (self.total_frames - self.position) as usize;
-    let max_buf_frames = buf.len().checked_div(ch).unwrap_or(0);
-    let want_frames = remaining.min(max_buf_frames);
-    let bpf = self.bytes_per_frame;
-    let mut total_frames_out = 0;
-
-    while total_frames_out < want_frames {
-      let batch_frames = READ_BATCH_FRAMES.min(want_frames - total_frames_out);
-      let batch_bytes = batch_frames * bpf;
-
-      if self.raw_buf.len() < batch_bytes {
-        self.raw_buf.resize(batch_bytes, 0);
-      }
-      let n = self
-        .reader
-        .read(&mut self.raw_buf[..batch_bytes])
-        .map_err(|e| io_err("read error during decode", e))?;
-
-      if n == 0 {
-        break;
-      }
-
-      let actual_bytes = (n / bpf) * bpf;
-      if actual_bytes == 0 {
-        break;
-      }
-      let actual_frames = actual_bytes / bpf;
-
-      // C1: output slice uses samples (frames × channels)
-      let out_offset = total_frames_out * ch;
-      let out_len = actual_frames * ch;
-      self.decode_samples(
-        &self.raw_buf[..actual_bytes],
-        &mut buf[out_offset..out_offset + out_len],
-      );
-
-      total_frames_out += actual_frames;
-      self.position += actual_frames as u64;
-    }
-
-    if total_frames_out == 0 {
-      Ok(None)
+impl WavStream {
+  /// Read from the reader callback.
+  fn read_bytes(&self, buf: &mut [u8]) -> io::Result<usize> {
+    let ret = unsafe { (self.reader_read)(self.reader_ctx, buf.as_mut_ptr(), buf.len()) };
+    if ret < 0 {
+      Err(io::Error::other("reader read error"))
     } else {
-      Ok(Some(total_frames_out))
+      Ok(ret as usize)
     }
   }
 
-  fn seek_impl(&mut self, offset: u64) -> Result<(), AroundError> {
-    // H4: use InvalidPosition for out-of-range seeks
-    if offset > self.total_frames {
-      return Err(AroundError::InvalidPosition {
-        position_ms: 0,
-        // M1: compute duration from frame count
-        duration_ms: if self.sample_rate > 0 && self.total_frames > 0 {
-          Some((self.total_frames as u128 * 1000 / self.sample_rate as u128) as u64)
-        } else {
-          None
-        },
-      });
+  /// Seek using the reader callback.
+  fn seek_bytes(&self, pos: i64, whence: i32) -> io::Result<u64> {
+    let ret = unsafe { (self.reader_seek)(self.reader_ctx, pos, whence) };
+    if ret < 0 {
+      Err(io::Error::other("reader seek error"))
+    } else {
+      Ok(ret as u64)
     }
-
-    let byte_offset = self.data_start + offset * self.bytes_per_frame as u64;
-    self
-      .reader
-      .seek(SeekFrom::Start(byte_offset))
-      .map_err(|e| io_err("seek failed", e))?;
-
-    self.position = offset;
-    Ok(())
   }
 
-  // -----------------------------------------------------------------------
-  // Header parsing (unchanged from original WavDecoder)
-  // -----------------------------------------------------------------------
-
+  /// Parse RIFF/WAV header from the callback reader.
   fn parse_header(
-    reader: &mut dyn ReadSeek,
-  ) -> Result<(u32, u8, u8, u64, usize, u64), AroundError> {
-    // --- RIFF header ---
-    let mut riff = [0u8; 12];
-    reader
-      .read_exact(&mut riff)
-      .map_err(|e| io_err("failed to read RIFF header", e))?;
-    if &riff[0..4] != b"RIFF" || &riff[8..12] != b"WAVE" {
-      return Err(AroundError::DecodeError {
-        message: "not a valid WAV file".into(),
-      });
+    ctx: *mut c_void,
+    read_fn: around_core::codec::ReadFn,
+    seek_fn: around_core::codec::SeekFn,
+  ) -> Result<(u32, u8, u8, u64, usize, u64), String> {
+    // Use a temporary stream to parse the header.
+    let tmp = WavStream {
+      reader_ctx: ctx,
+      reader_read: read_fn,
+      reader_seek: seek_fn,
+      channels: 0,
+      bit_depth: 0,
+      data_start: 0,
+      bytes_per_frame: 0,
+      total_frames: 0,
+      position: 0,
+      raw_buf: Vec::new(),
+    };
+
+    let mut riff = [0u8; 4];
+    tmp
+      .read_bytes(&mut riff)
+      .map_err(|e| format!("read RIFF: {}", e))?;
+    if &riff != b"RIFF" {
+      return Err("not a RIFF file".into());
     }
 
-    // --- Scan chunks ---
-    let mut fmt_info: Option<(u32, u8, u16)> = None;
-    let mut data_start: Option<u64> = None;
-    let mut data_size: u64 = 0;
+    let mut size_buf = [0u8; 4];
+    tmp
+      .read_bytes(&mut size_buf)
+      .map_err(|e| format!("read size: {}", e))?;
+
+    let mut wave = [0u8; 4];
+    tmp
+      .read_bytes(&mut wave)
+      .map_err(|e| format!("read WAVE: {}", e))?;
+    if &wave != b"WAVE" {
+      return Err("not a WAVE file".into());
+    }
+
+    let mut sample_rate: u32 = 0;
+    let mut channels: u8 = 0;
+    let mut bit_depth: u8 = 0;
+    let mut data_start: u64 = 0;
+    let mut data_size: u32 = 0;
+    let mut found_fmt = false;
+    let mut found_data = false;
 
     loop {
-      let mut ck = [0u8; 8];
-      match reader.read_exact(&mut ck) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-        Err(e) => return Err(io_err("failed to read chunk header", e)),
+      let mut chunk_id = [0u8; 4];
+      match tmp.read_bytes(&mut chunk_id) {
+        Ok(4) => {}
+        Ok(_) => break,
+        Err(_) => break,
       }
+      let mut len_buf = [0u8; 4];
+      tmp
+        .read_bytes(&mut len_buf)
+        .map_err(|e| format!("read chunk len: {}", e))?;
+      let chunk_len = u32::from_le_bytes(len_buf);
 
-      let ck_id: [u8; 4] = [ck[0], ck[1], ck[2], ck[3]];
-      let ck_size = u32::from_le_bytes([ck[4], ck[5], ck[6], ck[7]]) as u64;
-
-      // C2: zero-size chunk guard — skip immediately to avoid infinite loop
-      if ck_size == 0 {
-        continue;
-      }
-
-      match &ck_id {
+      match &chunk_id {
         b"fmt " => {
-          if fmt_info.is_some() {
-            seek_rel(reader, ck_size)?;
-            continue;
-          }
+          let mut fmt_buf = [0u8; 16];
+          let to_read = chunk_len.min(16) as usize;
+          tmp
+            .read_bytes(&mut fmt_buf[..to_read])
+            .map_err(|e| format!("read fmt: {}", e))?;
 
-          let to_read = std::cmp::min(ck_size, 40) as usize;
-          let mut fmt_data = vec![0u8; to_read];
-          reader
-            .read_exact(&mut fmt_data)
-            .map_err(|e| io_err("failed to read fmt chunk", e))?;
-          if ck_size > 40 {
-            seek_rel(reader, ck_size - 40)?;
-          }
-
-          if to_read < 16 {
-            return Err(AroundError::DecodeError {
-              message: "fmt chunk too small".into(),
-            });
-          }
-
-          let audio_format = u16::from_le_bytes([fmt_data[0], fmt_data[1]]);
+          let audio_format = u16::from_le_bytes([fmt_buf[0], fmt_buf[1]]);
           if audio_format != 1 {
-            return Err(AroundError::DecodeError {
-              message: format!(
-                "unsupported WAV format: {} (only PCM=1 supported)",
-                audio_format
-              ),
-            });
+            return Err(format!("unsupported audio format: {}", audio_format));
           }
-
-          let channels = u16::from_le_bytes([fmt_data[2], fmt_data[3]]);
-          let sample_rate =
-            u32::from_le_bytes([fmt_data[4], fmt_data[5], fmt_data[6], fmt_data[7]]);
-          let bits_per_sample = u16::from_le_bytes([fmt_data[14], fmt_data[15]]);
-
-          // H2: validate bits_per_sample
-          if !matches!(bits_per_sample, 8 | 16 | 24 | 32) {
-            return Err(AroundError::DecodeError {
-              message: format!(
-                "unsupported bits per sample: {} (supported: 8, 16, 24, 32)",
-                bits_per_sample
-              ),
-            });
+          channels = u16::from_le_bytes([fmt_buf[2], fmt_buf[3]]) as u8;
+          sample_rate = u32::from_le_bytes([fmt_buf[4], fmt_buf[5], fmt_buf[6], fmt_buf[7]]);
+          bit_depth = u16::from_le_bytes([fmt_buf[14], fmt_buf[15]]) as u8;
+          if ![8, 16, 24, 32].contains(&bit_depth) {
+            return Err(format!("unsupported bit depth: {}", bit_depth));
           }
-
-          fmt_info = Some((sample_rate, channels as u8, bits_per_sample));
+          if channels == 0 || channels > 8 {
+            return Err(format!("unsupported channel count: {}", channels));
+          }
+          found_fmt = true;
+          // Skip remaining fmt bytes
+          if chunk_len > 16 {
+            let skip = (chunk_len - 16) as usize;
+            tmp
+              .seek_bytes(skip as i64, 1)
+              .map_err(|e| format!("skip fmt extra: {}", e))?;
+          }
         }
-
         b"data" => {
-          let pos = reader
-            .stream_position()
-            .map_err(|e| io_err("failed to get stream position", e))?;
-          data_start = Some(pos);
-          data_size = ck_size;
-          seek_rel(reader, ck_size)?;
+          data_start = tmp.position;
+          data_size = chunk_len;
+          found_data = true;
+          break; // data is the last chunk we care about
         }
-
         _ => {
-          let skip = (ck_size + 1) & !1;
-          seek_rel(reader, skip)?;
+          // Skip unknown chunk
+          tmp
+            .seek_bytes(chunk_len as i64, 1)
+            .map_err(|e| format!("skip chunk: {}", e))?;
         }
       }
     }
 
-    let (sample_rate, channels, bits_per_sample) = fmt_info.ok_or(AroundError::DecodeError {
-      message: "WAV file missing fmt chunk".into(),
-    })?;
+    if !found_fmt {
+      return Err("no fmt chunk found".into());
+    }
+    if !found_data {
+      return Err("no data chunk found".into());
+    }
 
-    let data_start = data_start.ok_or(AroundError::DecodeError {
-      message: "WAV file missing data chunk".into(),
-    })?;
-
-    reader
-      .seek(SeekFrom::Start(data_start))
-      .map_err(|e| io_err("failed to seek to data chunk", e))?;
-
-    let bytes_per_frame = (bits_per_sample / 8) as usize * channels as usize;
+    let bytes_per_frame = (channels as usize) * (bit_depth as usize / 8);
     let total_frames = if bytes_per_frame > 0 {
-      data_size / bytes_per_frame as u64
+      data_size as u64 / bytes_per_frame as u64
     } else {
       0
     };
@@ -260,139 +201,233 @@ impl WavState {
     Ok((
       sample_rate,
       channels,
-      bits_per_sample as u8,
+      bit_depth,
       data_start,
       bytes_per_frame,
       total_frames,
     ))
   }
+}
 
-  // -----------------------------------------------------------------------
-  // Sample decoding (unchanged from original WavDecoder)
-  // -----------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Codec trait implementation
+// ---------------------------------------------------------------------------
 
-  fn decode_samples(&self, pcm: &[u8], out: &mut [f32]) -> usize {
-    match self.bit_depth {
-      8 => {
-        for (i, &b) in pcm.iter().enumerate() {
-          out[i] = (b as f32 / 128.0) - 1.0;
-        }
-        pcm.len()
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+impl around_core::codec::Codec for WavCodec {
+  extern "C" fn probe(
+    &self,
+    header: *const u8,
+    header_len: usize,
+    filename: *const u8,
+    filename_len: usize,
+  ) -> u8 {
+    // Check RIFF magic.
+    if header_len >= 4 {
+      let magic = unsafe { std::slice::from_raw_parts(header, 4) };
+      if magic == b"RIFF" {
+        return 95;
       }
-      16 => {
-        let n = pcm.len() / 2;
-        for i in 0..n {
-          let sample = i16::from_le_bytes([pcm[i * 2], pcm[i * 2 + 1]]);
-          out[i] = sample as f32 / 32768.0;
-        }
-        n
+    }
+    // Check file extension.
+    if filename_len >= 4 {
+      let name = unsafe { std::slice::from_raw_parts(filename, filename_len) };
+      let name_str = std::str::from_utf8(name).unwrap_or("");
+      if name_str.to_lowercase().ends_with(".wav") {
+        return 60;
       }
-      24 => {
-        let n = pcm.len() / 3;
-        for i in 0..n {
-          let b0 = pcm[i * 3] as i32;
-          let b1 = pcm[i * 3 + 1] as i32;
-          let b2 = pcm[i * 3 + 2] as i32;
-          let val = b0 | (b1 << 8) | (b2 << 16);
-          let val = if val & 0x800000 != 0 {
-            val | !0xffffff
-          } else {
-            val
-          };
-          out[i] = val as f32 / 8388608.0;
+    }
+    0
+  }
+
+  extern "C" fn name(&self) -> *const u8 {
+    c"wav".as_ptr().cast()
+  }
+
+  extern "C" fn open(
+    &self,
+    reader_ctx: *mut c_void,
+    reader_read: around_core::codec::ReadFn,
+    reader_seek: around_core::codec::SeekFn,
+    out_stream: *mut *mut c_void,
+    out_info: *mut around_core::codec::StreamInfo,
+  ) -> i32 {
+    let (sample_rate, channels, bit_depth, data_start, bytes_per_frame, total_frames) =
+      match WavStream::parse_header(reader_ctx, reader_read, reader_seek) {
+        Ok(v) => v,
+        Err(e) => {
+          tracing::warn!(error = %e, "WAV open failed");
+          return -1;
         }
-        n
+      };
+
+    // Seek to data_start.
+    let tmp_seek = |pos: i64, whence: i32| -> Result<u64, String> {
+      let ret = unsafe { (reader_seek)(reader_ctx, pos, whence) };
+      if ret < 0 {
+        Err("seek failed".into())
+      } else {
+        Ok(ret as u64)
       }
-      32 => {
-        let n = pcm.len() / 4;
-        for i in 0..n {
-          let sample =
-            i32::from_le_bytes([pcm[i * 4], pcm[i * 4 + 1], pcm[i * 4 + 2], pcm[i * 4 + 3]]);
-          out[i] = sample as f32 / 2147483648.0;
+    };
+    if tmp_seek(data_start as i64, 0).is_err() {
+      return -2;
+    }
+
+    let initial_cap = READ_BATCH_FRAMES * bytes_per_frame;
+
+    let stream = Box::new(WavStream {
+      reader_ctx,
+      reader_read,
+      reader_seek,
+      channels,
+      bit_depth,
+      data_start,
+      bytes_per_frame,
+      total_frames,
+      position: 0,
+      raw_buf: Vec::with_capacity(initial_cap),
+    });
+
+    unsafe {
+      *out_stream = Box::into_raw(stream) as *mut c_void;
+    }
+    unsafe {
+      *out_info = around_core::codec::StreamInfo {
+        sample_rate,
+        channels,
+        total_frames,
+      };
+    }
+    0
+  }
+
+  extern "C" fn read(&self, stream: *mut c_void, buf: *mut f32, buf_len: usize) -> i32 {
+    if stream.is_null() || buf.is_null() {
+      return -1;
+    }
+    let s = unsafe { &mut *(stream as *mut WavStream) };
+    let out = unsafe { std::slice::from_raw_parts_mut(buf, buf_len) };
+    let bytes_per_sample = (s.bit_depth as usize) / 8;
+    let frame_size = s.channels as usize * bytes_per_sample;
+    let max_frames = out.len() / s.channels as usize;
+
+    let mut samples_written: i32 = 0;
+
+    for _frame in 0..max_frames {
+      if s.total_frames > 0 && s.position >= s.total_frames {
+        break;
+      }
+
+      // Read one frame of raw bytes — extract raw fields to avoid borrow conflicts.
+      s.raw_buf.resize(frame_size, 0);
+      let buf_ptr = s.raw_buf.as_mut_ptr();
+      let reader_ctx = s.reader_ctx;
+      let reader_read = s.reader_read;
+      let read_ret = unsafe { (reader_read)(reader_ctx, buf_ptr, frame_size) };
+      match read_ret {
+        0 => break,
+        n if (n as usize) < frame_size && n >= 0 => break,
+        n if n < 0 => break,
+        _ => {}
+      }
+
+      // Convert samples to f32.
+      for ch in 0..s.channels as usize {
+        let offset = ch * bytes_per_sample;
+        let sample_f32 = match s.bit_depth {
+          8 => s.raw_buf[offset] as i8 as f32 / 128.0,
+          16 => i16::from_le_bytes([s.raw_buf[offset], s.raw_buf[offset + 1]]) as f32 / 32768.0,
+          24 => {
+            i32::from_le_bytes([
+              s.raw_buf[offset],
+              s.raw_buf[offset + 1],
+              s.raw_buf[offset + 2],
+              if s.raw_buf[offset + 2] & 0x80 != 0 {
+                0xff
+              } else {
+                0
+              },
+            ]) as f32
+              / 8388608.0
+          } // 2^23
+          32 => {
+            i32::from_le_bytes([
+              s.raw_buf[offset],
+              s.raw_buf[offset + 1],
+              s.raw_buf[offset + 2],
+              s.raw_buf[offset + 3],
+            ]) as f32
+              / 2147483648.0
+          } // 2^31
+          _ => 0.0,
+        };
+        let idx = samples_written as usize + ch;
+        if idx < out.len() {
+          out[idx] = sample_f32;
         }
-        n
       }
-      _ => 0,
+      samples_written += s.channels as i32;
+      s.position += 1;
+    }
+
+    samples_written
+  }
+
+  extern "C" fn seek(&self, stream: *mut c_void, frame: u64) -> i64 {
+    if stream.is_null() {
+      return -1;
+    }
+    let s = unsafe { &mut *(stream as *mut WavStream) };
+
+    // Clamp to valid range.
+    let target = if s.total_frames > 0 {
+      frame.min(s.total_frames.saturating_sub(1))
+    } else {
+      frame
+    };
+
+    let byte_offset = target * s.bytes_per_frame as u64;
+    match s.seek_bytes((s.data_start + byte_offset) as i64, 0) {
+      Ok(_) => {
+        s.position = target;
+        target as i64
+      }
+      Err(_) => -2,
+    }
+  }
+
+  extern "C" fn drop(&self, stream: *mut c_void) {
+    if !stream.is_null() {
+      unsafe {
+        drop(Box::from_raw(stream as *mut WavStream));
+      }
     }
   }
 }
 
 // ---------------------------------------------------------------------------
-// VTable wrappers (unsafe fn → safe method)
+// FFI exports for dynamic loading
 // ---------------------------------------------------------------------------
 
-unsafe fn wav_read(
-  data: *mut std::ffi::c_void,
-  buf: &mut [f32],
-) -> Result<Option<usize>, AroundError> {
-  let state = unsafe { &mut *(data as *mut WavState) };
-  state.read_impl(buf)
-}
-
-unsafe fn wav_seek(data: *mut std::ffi::c_void, frame: u64) -> Result<(), AroundError> {
-  let state = unsafe { &mut *(data as *mut WavState) };
-  state.seek_impl(frame)
-}
-
-unsafe fn wav_drop(data: *mut std::ffi::c_void) {
-  unsafe { drop(Box::from_raw(data as *mut WavState)) };
-}
-
-// ---------------------------------------------------------------------------
-// Static vtable
-// ---------------------------------------------------------------------------
-
-static WAV_VTABLE: AudioStreamVTable = AudioStreamVTable {
-  read: wav_read,
-  seek: wav_seek,
-  drop: wav_drop,
-};
-
-// ---------------------------------------------------------------------------
-// open_fn
-// ---------------------------------------------------------------------------
-
-fn wav_open(reader: Box<dyn ReadSeek + Send>) -> Result<AudioStream, AroundError> {
-  let state = WavState::open(reader)?;
-  let sample_rate = state.sample_rate;
-  let channels = state.channels;
-  let total_frames = state.total_frames;
-  let data = Box::into_raw(Box::new(state)) as *mut std::ffi::c_void;
-
-  unsafe {
-    Ok(AudioStream::new(
-      data,
-      &WAV_VTABLE,
-      sample_rate,
-      channels,
-      total_frames,
-    ))
+/// Codec factory for dynamic loading via the extension framework.
+/// Returns a `*mut c_void` pointing to a heap-allocated `DynCodecRef`
+/// (stabby fat pointer). The register extracts the vtable from the Dyn layout.
+/// `index` 0 returns the singleton; `index >= 1` returns null.
+///
+/// # Safety
+///
+/// Callers must ensure `index` is within the valid range (0 for the singleton)
+/// and that the returned pointer is a heap-allocated `DynCodecRef` that the
+/// framework takes ownership of.
+#[no_mangle]
+pub unsafe extern "C" fn around_core_codec_codec_create(index: usize) -> *mut c_void {
+  if index == 0 {
+    use stabby::boxed::Box as StabbyBox;
+    let codec: around_core::codec::DynCodecRef =
+      around_core::codec::DynCodecRef::from(StabbyBox::new(WavCodec));
+    std::boxed::Box::into_raw(std::boxed::Box::new(codec)) as *mut c_void
+  } else {
+    std::ptr::null_mut()
   }
-}
-
-// ---------------------------------------------------------------------------
-// Public codec info (engine pushes into registry explicitly)
-// ---------------------------------------------------------------------------
-
-/// Static codec descriptor. The engine calls `registry.push(WAV_INFO)`.
-pub static WAV_INFO: CodecInfo = CodecInfo::new("wav", WAV_FORMATS, wav_open);
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn io_err(context: &str, e: io::Error) -> AroundError {
-  AroundError::DecodeError {
-    message: format!("{}: {}", context, e),
-  }
-}
-
-fn seek_rel(reader: &mut (impl Seek + ?Sized), offset: u64) -> Result<(), AroundError> {
-  if offset == 0 {
-    return Ok(());
-  }
-  reader
-    .seek(SeekFrom::Current(offset as i64))
-    .map_err(|e| io_err("seek failed", e))?;
-  Ok(())
 }

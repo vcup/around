@@ -9,7 +9,6 @@ use std::sync::Arc;
 use tokio::io::BufReader;
 use tokio::net::UdpSocket;
 
-use crate::extensions::ExtensionManager;
 use crate::ipc::codec::IpcCodec;
 use crate::ipc::types::PlaybackState;
 use crate::Engine;
@@ -80,7 +79,6 @@ pub(crate) async fn serve_udp<C: IpcCodec + Clone>(
   state: Arc<std::sync::Mutex<PlaybackState>>,
   socket: Arc<UdpSocket>,
   codec: C,
-  ext_mgr: Arc<ExtensionManager>,
 ) {
   let mut buf = vec![0u8; MAX_DATAGRAM];
 
@@ -117,7 +115,7 @@ pub(crate) async fn serve_udp<C: IpcCodec + Clone>(
       }
     };
 
-    let resp = crate::ipc::handle_command(cmd, &engine, &state, &ext_mgr).await;
+    let resp = crate::ipc::handle_command(cmd, &engine, &state).await;
 
     let mut response_buf = Vec::new();
     {

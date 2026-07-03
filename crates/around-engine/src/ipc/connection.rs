@@ -1,7 +1,6 @@
 //! Connection handling: accept loop + per-command command processing.
 
 use super::handle_command;
-use crate::extensions::ExtensionManager;
 use crate::ipc::codec::{IpcCodec, IpcWire};
 use crate::ipc::types::{IpcCommand, PlaybackState};
 use crate::pipeline::Engine;
@@ -12,14 +11,9 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 
 /// Accept loop — processes connections sequentially.
-///
-/// Processes each connection inline (no spawn) for simplicity and Send compatibility.
-/// For concurrent client support, connections are handled sequentially per accept loop —
-/// multiple accept loops run in parallel via separate tokio tasks per transport.
 pub(crate) async fn serve<F, S>(
   engine: &Arc<Engine>,
   state: &Arc<Mutex<PlaybackState>>,
-  ext_mgr: &Arc<ExtensionManager>,
   codec: IpcWire,
   mut accept: F,
 ) where
@@ -41,10 +35,9 @@ pub(crate) async fn serve<F, S>(
 
     let eng = engine.clone();
     let st = state.clone();
-    let ext = ext_mgr.clone();
     let cdc = codec.clone();
 
-    if let Err(e) = handle_connection(stream, eng, st, ext, cdc).await {
+    if let Err(e) = handle_connection(stream, eng, st, cdc).await {
       tracing::error!(?e, "connection error");
     }
   }
@@ -55,7 +48,6 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
   stream: S,
   engine: Arc<Engine>,
   state: Arc<Mutex<PlaybackState>>,
-  ext_mgr: Arc<ExtensionManager>,
   codec: impl IpcCodec,
 ) -> io::Result<()> {
   let (reader, mut writer) = tokio::io::split(stream);
@@ -71,7 +63,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
       }
     };
 
-    let resp = handle_command(cmd, &engine, &state, &ext_mgr).await;
+    let resp = handle_command(cmd, &engine, &state).await;
     if let Err(e) = codec.write_response(&mut writer, &resp).await {
       tracing::warn!(?e, "failed to write IPC response");
       break;

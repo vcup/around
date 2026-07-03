@@ -1,12 +1,9 @@
 // Clippy: Mutex poisoning panics are intentional — they indicate unrecoverable bugs.
 #![allow(clippy::expect_used)]
-
-use crate::extensions::ExtensionManager;
 use crate::ipc::types::{
   CodecDescriptor, ErrorCode, IpcResponse, PlaybackState, TrackInfo, TrackState,
 };
 use crate::pipeline::Engine;
-use around_core::AroundError;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -206,14 +203,8 @@ pub(crate) fn scan_and_remove_stale_temp_files() -> Vec<String> {
   removed
 }
 
-pub(crate) fn handle_cleanup(ext_mgr: &Arc<ExtensionManager>) -> IpcResponse {
-  let mut removed: Vec<String> = ext_mgr
-    .cleanup_temp_files()
-    .iter()
-    .map(|p| p.display().to_string())
-    .collect();
-
-  removed.extend(scan_and_remove_stale_temp_files());
+pub(crate) fn handle_cleanup() -> IpcResponse {
+  let removed: Vec<String> = scan_and_remove_stale_temp_files();
 
   let mut resp = IpcResponse::ok();
   resp.removed_files = Some(removed);
@@ -226,69 +217,91 @@ pub(crate) fn handle_cleanup(ext_mgr: &Arc<ExtensionManager>) -> IpcResponse {
   resp
 }
 
-pub(crate) fn handle_list_codecs(ext_mgr: &Arc<ExtensionManager>) -> IpcResponse {
-  let codecs = ext_mgr.list_codecs();
+pub(crate) fn handle_list_codecs() -> IpcResponse {
+  let framework = around_extensions::Framework::instance();
+  let entries = framework.index_entries();
+  let codecs: Vec<CodecDescriptor> = entries
+    .into_iter()
+    .map(|(name, path)| CodecDescriptor {
+      name,
+      formats: Vec::new(),
+      source: "scanned".into(),
+      path: Some(path.to_string_lossy().into_owned()),
+    })
+    .collect();
+
   let mut resp = IpcResponse::ok();
-  resp.codecs = Some(
-    codecs
-      .iter()
-      .map(|d| CodecDescriptor {
-        name: d.name.clone(),
-        formats: d.formats.clone(),
-        source: d.source.clone(),
-        path: d.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
-      })
-      .collect(),
-  );
+  resp.codecs = Some(codecs);
   resp
 }
 
-pub(crate) fn handle_load_codec(ext_mgr: &Arc<ExtensionManager>, path: &str) -> IpcResponse {
-  match ext_mgr.load_path(std::path::Path::new(path)) {
-    Ok(info) => {
+pub(crate) fn handle_load_codec(path: &str) -> IpcResponse {
+  match around_extensions::Framework::instance().load(path) {
+    Ok(_lib) => {
       let mut resp = IpcResponse::ok();
       resp.codecs = Some(vec![CodecDescriptor {
-        name: info.name,
-        formats: info.formats,
-        source: info.source,
-        path: info.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        name: path.to_string(),
+        formats: Vec::new(),
+        source: "loaded".into(),
+        path: Some(path.to_string()),
       }]);
       resp
     }
     Err(e) => {
-      let (code, msg) = map_codec_error(&e);
+      let (code, msg) = map_framework_error(&e);
       IpcResponse::error(code, &msg)
     }
   }
 }
 
-pub(crate) fn handle_load_codec_bytes(
-  ext_mgr: &Arc<ExtensionManager>,
-  data: Vec<u8>,
-) -> IpcResponse {
-  match ext_mgr.load_bytes(&data) {
-    Ok(info) => {
+pub(crate) fn handle_load_codec_bytes(data: Vec<u8>) -> IpcResponse {
+  use std::hash::{Hash, Hasher};
+  let mut h = std::collections::hash_map::DefaultHasher::new();
+  data.hash(&mut h);
+  let hash = h.finish();
+
+  let tmp_path = std::env::temp_dir().join(format!(
+    "around_codec_{}_{:016x}.{}",
+    std::process::id(),
+    hash,
+    std::env::consts::DLL_EXTENSION
+  ));
+
+  if let Err(e) = std::fs::write(&tmp_path, &data) {
+    return IpcResponse::error(
+      ErrorCode::CodecLoadFailed,
+      &format!("failed to write temp file: {}", e),
+    );
+  }
+
+  let name = tmp_path
+    .file_stem()
+    .and_then(|s| s.to_str())
+    .unwrap_or("unknown");
+
+  match around_extensions::Framework::instance().load(name) {
+    Ok(_lib) => {
       let mut resp = IpcResponse::ok();
       resp.codecs = Some(vec![CodecDescriptor {
-        name: info.name,
-        formats: info.formats,
-        source: info.source,
-        path: info.path.as_ref().map(|p| p.to_string_lossy().into_owned()),
+        name: name.to_string(),
+        formats: Vec::new(),
+        source: "bytes".into(),
+        path: Some(tmp_path.to_string_lossy().into_owned()),
       }]);
       resp
     }
     Err(e) => {
-      let (code, msg) = map_codec_error(&e);
+      let _ = std::fs::remove_file(&tmp_path);
+      let (code, msg) = map_framework_error(&e);
       IpcResponse::error(code, &msg)
     }
   }
 }
 
-/// Map a codec-related error to an IPC error code.
-fn map_codec_error(e: &AroundError) -> (ErrorCode, String) {
+fn map_framework_error(e: &around_extensions::FrameworkError) -> (ErrorCode, String) {
   match e {
-    AroundError::CodecLoadFailed { .. } => (ErrorCode::CodecLoadFailed, e.to_string()),
-    _ => (ErrorCode::CodecLoadFailed, e.to_string()), // INTERNAL maps to generic load failure,
+    around_extensions::FrameworkError::NotFound(_) => (ErrorCode::CodecLoadFailed, e.to_string()),
+    _ => (ErrorCode::CodecLoadFailed, e.to_string()),
   }
 }
 

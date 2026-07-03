@@ -35,6 +35,7 @@ message IpcCommand {
     LoadCodecCommand load_codec = 8;
     LoadCodecBytesCommand load_codec_bytes = 9;
     CleanupCommand cleanup = 10;
+    ShutdownCommand shutdown = 11;
   }
 }
 
@@ -46,6 +47,7 @@ message StopCommand {}
 message StatusCommand {}
 message ListCodecsCommand {}
 message LoadCodecCommand { string path = 1; }
+message ShutdownCommand {}
 message LoadCodecBytesCommand { bytes data = 1; string name = 2; }
 message CleanupCommand {}
 

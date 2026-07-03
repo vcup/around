@@ -74,13 +74,22 @@ impl From<String> for ContentType {
   }
 }
 
+/// Channel interleave mode for audio data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Interleave {
+  /// Samples are interleaved: LRLRLR...
+  Interleaved,
+  /// Samples are planar: LLL...RRR...
+  Planar,
+}
 // --- SampleSpec ---
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SampleSpec {
   pub sample_rate: SampleRate,
   pub channels: ChannelLayout,
   pub bit_depth: BitDepth,
+  pub interleave: Interleave,
 }
 
 impl SampleSpec {
@@ -88,6 +97,7 @@ impl SampleSpec {
     sample_rate: SampleRate,
     channels: ChannelLayout,
     bit_depth: BitDepth,
+    interleave: Interleave,
   ) -> Result<Self, &'static str> {
     if sample_rate == 0 {
       return Err("sample_rate must be > 0");
@@ -99,19 +109,23 @@ impl SampleSpec {
       sample_rate,
       channels,
       bit_depth,
+      interleave,
     })
   }
-}
 
-// --- AudioFormat ---
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AudioFormat {
-  pub container: String,
-  pub codec: String,
-  pub mime_type: String,
-  pub sample_spec: SampleSpec,
-  pub bitrate: Option<u64>,
+  /// Convenience: interleaved stereo at standard bit depth.
+  pub fn interleaved(
+    sample_rate: SampleRate,
+    channels: ChannelLayout,
+    bit_depth: BitDepth,
+  ) -> Result<Self, &'static str> {
+    Self::new(
+      sample_rate,
+      channels,
+      bit_depth,
+      Interleave::Interleaved,
+    )
+  }
 }
 
 // --- ExtensionSource ---

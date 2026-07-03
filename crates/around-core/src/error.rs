@@ -96,3 +96,30 @@ impl fmt::Display for AroundError {
 }
 
 impl std::error::Error for AroundError {}
+
+impl From<std::io::Error> for AroundError {
+  fn from(e: std::io::Error) -> Self {
+    match e.kind() {
+      std::io::ErrorKind::NotFound => Self::FileNotFound {
+        path: e.to_string(),
+      },
+      _ => Self::Internal {
+        message: format!("I/O error: {}", e),
+      },
+    }
+  }
+}
+
+impl From<String> for AroundError {
+  fn from(s: String) -> Self {
+    Self::Internal { message: s }
+  }
+}
+
+impl From<&str> for AroundError {
+  fn from(s: &str) -> Self {
+    Self::Internal {
+      message: s.to_string(),
+    }
+  }
+}

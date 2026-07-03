@@ -1,275 +1,273 @@
-//! Audio pipeline: Source → Codec → Output Sink.
+//! Audio pipeline: multi-stream engine (ADR-0005 compliant).
+//!
+//! Single `Engine` manages 0..N concurrent `Stream`s. Each stream has
+//! independent state via all-Atomic `StreamState` and `CancellationToken`.
 
-// Clippy: Mutex poisoning panics are intentional — they indicate unrecoverable bugs.
+use crate::filter_chain::FilterChain;
 use crate::ipc::types::{PlaybackState, TrackState};
-use crate::output::AudioOutput;
-use around_core::{AroundError, AudioStream, CodecRegistry, Source, SourceCapabilities};
+use crate::output::create_output;
+use around_core::codec::{init_codec, CodecDyn, CodecRegister, DynCodecRef, StreamInfo};
+use around_core::state::PlaybackStatus;
+use around_core::{AroundError, SampleSpec, Source, SourceCapabilities};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::ffi::c_void;
 use std::io::Read;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::sync::Notify;
+use std::mem::ManuallyDrop;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+// ---------------------------------------------------------------------------
+// StreamId
+// ---------------------------------------------------------------------------
+
+pub type StreamId = u64;
+static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_stream_id() -> StreamId {
+  NEXT_STREAM_ID.fetch_add(1, Ordering::SeqCst)
+}
+
+// ---------------------------------------------------------------------------
+// StreamState — all-Atomic per-stream state
+// ---------------------------------------------------------------------------
+
+pub struct StreamState {
+  status: AtomicU8,
+  pub position_ms: AtomicU64,
+  pub device_lost: AtomicBool,
+  pub active: AtomicBool,
+}
+
+impl StreamState {
+  pub fn new() -> Self {
+    Self {
+      status: AtomicU8::new(PlaybackStatus::Stopped as u8),
+      position_ms: AtomicU64::new(0),
+      device_lost: AtomicBool::new(false),
+      active: AtomicBool::new(false),
+    }
+  }
+
+  pub fn status(&self) -> PlaybackStatus {
+    let raw = self.status.load(Ordering::SeqCst);
+    match raw {
+      0 => PlaybackStatus::Playing,
+      1 => PlaybackStatus::Paused,
+      2 => PlaybackStatus::Stopped,
+      3 => PlaybackStatus::Buffering,
+      _ => PlaybackStatus::Error,
+    }
+  }
+
+  pub fn set_status(&self, s: PlaybackStatus) {
+    self.status.store(s as u8, Ordering::SeqCst);
+  }
+}
+
+impl Default for StreamState {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Stream handle (stored in Engine)
+// ---------------------------------------------------------------------------
+
+struct ActiveStream {
+  id: StreamId,
+  state: Arc<StreamState>,
+  cancel: CancellationToken,
+}
+
+// ---------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------
 
 pub struct Engine {
   config: crate::config::EngineConfig,
-  registry: CodecRegistry,
-  running: Arc<AtomicBool>,
   device_lost: Arc<AtomicBool>,
-  paused: Arc<AtomicBool>,
-  seek_target_ms: Arc<Mutex<Option<u64>>>,
-  shutdown: Arc<AtomicBool>,
-  shutdown_signal: Arc<Notify>,
+  streams: RwLock<HashMap<StreamId, ActiveStream>>,
+  shutdown_token: CancellationToken,
 }
 
 pub struct PlaybackHandle {
-  pub output_format: around_core::SampleSpec,
-  running: Arc<AtomicBool>,
+  pub output_format: SampleSpec,
+  pub stream_id: StreamId,
 }
 
 impl PlaybackHandle {
-  pub fn stop(&self) {
-    self.running.store(false, Ordering::SeqCst);
-  }
-  pub fn is_running(&self) -> bool {
-    self.running.load(Ordering::SeqCst)
+  pub fn stream_id(&self) -> StreamId {
+    self.stream_id
   }
 }
 
+// ---------------------------------------------------------------------------
+// Reader callback helpers
+// ---------------------------------------------------------------------------
+
+trait ReadSend: Read + Send {}
+impl<T: Read + Send> ReadSend for T {}
+
+struct ReaderBridge<R: Read + Send> {
+  reader: R,
+}
+
+unsafe extern "C" fn read_cb(ctx: *mut c_void, buf: *mut u8, len: usize) -> i64 {
+  let bridge = &mut *(ctx as *mut ReaderBridge<Box<dyn ReadSend>>);
+  let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+  match bridge.reader.read(buf_slice) {
+    Ok(n) => n as i64,
+    Err(_) => -1,
+  }
+}
+
+unsafe extern "C" fn seek_cb(_ctx: *mut c_void, _pos: i64, _whence: i32) -> i64 {
+  -1
+}
+
+// ---------------------------------------------------------------------------
+// CodecHandle — dynamic dispatch through CodecRegister
+// ---------------------------------------------------------------------------
+
+/// Handle to a registered codec. Holds raw vtable + codec data pointers.
+/// Methods dispatch through the vtable directly, avoiding ownership issues.
+struct CodecHandle {
+  vtable: *const (),
+  codec_data: *mut (),
+}
+
+impl CodecHandle {
+  /// Call `Codec::read` through the vtable.
+  unsafe fn read(&self, stream: *mut c_void, buf: *mut f32, buf_len: usize) -> i32 {
+    // VTable layout (stabby #[repr(C)]): methods in declaration order.
+    // read is the 4th method (after probe, name, open).
+    type ReadMethod = unsafe extern "C" fn(*const (), *mut c_void, *mut f32, usize) -> i32;
+    let vtable = self.vtable as *const ReadMethod;
+    let read_fn = unsafe { *vtable.add(3) };
+    unsafe { read_fn(self.codec_data as *const (), stream, buf, buf_len) }
+  }
+
+  /// Call `Codec::drop` through the vtable. Named `destroy` to avoid conflict
+  /// with `Drop::drop`.
+  unsafe fn destroy(&self, stream: *mut c_void) {
+    // drop is the 6th method (after probe, name, open, read, seek).
+    type DropMethod = unsafe extern "C" fn(*const (), *mut c_void);
+    let vtable = self.vtable as *const DropMethod;
+    let drop_fn = unsafe { *vtable.add(5) };
+    unsafe { drop_fn(self.codec_data as *const (), stream) };
+  }
+
+  /// Call `Codec::name` through the vtable.
+  unsafe fn name(&self) -> *const u8 {
+    // name is the 2nd method (after probe).
+    type NameMethod = unsafe extern "C" fn(*const ()) -> *const u8;
+    let vtable = self.vtable as *const NameMethod;
+    let name_fn = unsafe { *vtable.add(1) };
+    unsafe { name_fn(self.codec_data as *const ()) }
+  }
+
+  /// Create a non-owning DynCodecRef view for calling trait methods
+  /// through the CodecDyn trait (probe, open).
+  fn as_ref(&self) -> ManuallyDrop<DynCodecRef> {
+    unsafe { ManuallyDrop::new(CodecRegister::from_raw(self.vtable, self.codec_data)) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Engine impl
+// ---------------------------------------------------------------------------
+
 impl Engine {
   pub fn new(config: crate::config::EngineConfig) -> Self {
-    let mut registry = CodecRegistry::new();
-    registry.push(around_codec_wav::WAV_INFO);
+    init_codec();
     Self {
       config,
-      registry,
       device_lost: Arc::new(AtomicBool::new(false)),
-      running: Arc::new(AtomicBool::new(false)),
-      paused: Arc::new(AtomicBool::new(false)),
-      seek_target_ms: Arc::new(Mutex::new(None)),
-      shutdown: Arc::new(AtomicBool::new(false)),
-      shutdown_signal: Arc::new(Notify::new()),
+      streams: RwLock::new(HashMap::new()),
+      shutdown_token: CancellationToken::new(),
     }
   }
 
-  pub fn registry_mut(&mut self) -> &mut CodecRegistry {
-    &mut self.registry
-  }
-  pub fn registry(&self) -> &CodecRegistry {
-    &self.registry
-  }
-
-  // -----------------------------------------------------------------------
-  // FR-002: Format detection + codec selection
-  //
-  // Algorithm (seekable sources):
-  //
-  //   1. Extension detection (zero I/O).
-  //   2. Try extension-matched codecs immediately — no magic bytes read
-  //      if one succeeds. This preserves the "extension first, zero I/O"
-  //      design intent.
-  //   3. If all extension codecs fail (or no extension): read magic bytes
-  //      from a probe, detect format. If extension and magic disagree,
-  //      log a warning (magic wins per FR-002).
-  //   4. Try magic-matched codecs not yet attempted.
-  //   5. Try all remaining codecs in registration order.
-  //
-  // Non-seekable sources: pre-read probe into PrefixReader, detect format,
-  // try the best-matching codec. No multi-codec retry because open_fn
-  // takes Box<dyn ReadSeek> by value (ownership lost on failure).
-  // Full retry for non-seekable requires an API change deferred to
-  // a future iteration.
-  // -----------------------------------------------------------------------
-
-  fn open_codec(
-    registry: &CodecRegistry,
-    source: &dyn Source,
-    seekable: bool,
-  ) -> Result<(AudioStream, &'static str), AroundError> {
-    // ---- Phase 1: Extension detection (zero I/O) ----
-    let ext = Path::new(&source.identifier())
-      .extension()
-      .and_then(|e| e.to_str())
-      .map(|e| e.to_lowercase());
-
-    let ext_codecs = registry.by_extension(ext.as_deref().unwrap_or(""));
-
-    // ---- Phase 2: Try extension-matched codecs first ----
-    // No I/O for magic bytes yet — we only open the source and pass it
-    // to the codec. If a codec succeeds, we never read magic bytes.
-    if !ext_codecs.is_empty() && seekable {
-      for codec in &ext_codecs {
-        let reader = source.open_seekable()?;
-        match (codec.open_fn)(reader) {
-          Ok(stream) => return Ok((stream, codec.name)),
-          Err(_) => continue,
-        }
-      }
-      // All extension-matched codecs failed. Fall through to magic.
-    } else if !ext_codecs.is_empty() {
-      // Non-seekable: try first extension-matched codec with PrefixReader.
-      // (Only one attempt — ownership constraint.)
-      let raw = source.open()?;
-      let mut prefix = around_core::PrefixReader::new(raw, 65536);
-      // Read probe for potential magic fallback.
-      let mut probe = vec![0u8; 4096];
-      let _ = prefix.read(&mut probe);
-      prefix.rewind();
-      // Try first ext codec.
-      if let Some(codec) = ext_codecs.first() {
-        match (codec.open_fn)(Box::new(prefix)) {
-          Ok(stream) => return Ok((stream, codec.name)),
-          Err(_) => {
-            // PrefixReader consumed. Fall through to magic detection
-            // using the probe we already read.
-          }
-        }
-      }
-      // Re-open for magic fallback on non-seekable.
-      let raw = source.open()?;
-      let mut prefix = around_core::PrefixReader::new(raw, 65536);
-      let _ = prefix.read(&mut vec![0u8; 4096]);
-      prefix.rewind();
-      let magic_codecs = registry.by_magic(&probe);
-      if let Some(codec) = magic_codecs.first() {
-        return match (codec.open_fn)(Box::new(prefix)) {
-          Ok(stream) => Ok((stream, codec.name)),
-          Err(e) => Err(e),
-        };
-      }
-      return Err(AroundError::UnsupportedFormat {
-        format: ext,
-        reason: "no codec could open the source".into(),
-      });
-    }
-
-    // ---- Phase 3: Magic detection ----
-    // We reach here if:
-    //   (a) No extension match, OR
-    //   (b) All extension-matched codecs failed (seekable path)
-    //
-    // Now we need I/O: read magic bytes, detect format.
-    let (_probe, magic_codecs) = {
-      let mut reader = source.open_seekable()?;
-      let mut probe = vec![0u8; 4096];
-      let _ = reader.read(&mut probe);
-      reader
-        .seek(std::io::SeekFrom::Start(0))
-        .map_err(|e| AroundError::DecodeError {
-          message: format!("failed to seek after probe: {}", e),
-        })?;
-      let magic = registry.by_magic(&probe);
-      (probe, magic)
-    };
-
-    if ext_codecs.is_empty() && magic_codecs.is_empty() {
-      return Err(AroundError::UnsupportedFormat {
-        format: ext,
-        reason: "no matching codec".into(),
-      });
-    }
-
-    // Conflict: extension and magic disagree → warn, magic wins.
-    if !ext_codecs.is_empty()
-      && !magic_codecs.is_empty()
-      && !same_codec_set(&ext_codecs, &magic_codecs)
-    {
-      tracing::warn!(
-        "extension .{} disagrees with magic bytes, using magic-detected codec",
-        ext.as_deref().unwrap_or("<none>")
-      );
-    }
-
-    // ---- Phase 4: Try magic-matched codecs ----
-    // Skip codecs already tried in Phase 2 (extension-matched).
-    let tried_names: Vec<&str> = ext_codecs.iter().map(|c| c.name).collect();
-    for codec in &magic_codecs {
-      if tried_names.contains(&codec.name) {
-        continue;
-      }
-      let reader = source.open_seekable()?;
-      match (codec.open_fn)(reader) {
-        Ok(stream) => return Ok((stream, codec.name)),
-        Err(_) => continue,
-      }
-    }
-
-    // ---- Phase 5: Try ALL remaining codecs ----
-    // Everything not yet tried, in registration order.
-    let all_tried: Vec<&str> = tried_names
-      .into_iter()
-      .chain(magic_codecs.iter().map(|c| c.name))
-      .collect();
-    for codec in registry.all() {
-      if all_tried.contains(&codec.name) {
-        continue;
-      }
-      let reader = source.open_seekable()?;
-      match (codec.open_fn)(reader) {
-        Ok(stream) => return Ok((stream, codec.name)),
-        Err(_) => continue,
-      }
-    }
-
-    Err(AroundError::UnsupportedFormat {
-      format: ext,
-      reason: "no codec could open the source".into(),
-    })
-  }
-
-  /// Play a source. Blocks until playback completes or stop/pause/seek is signaled.
+  /// Play a source. Blocks until playback completes or stop is signaled.
+  /// Handles pause/resume internally. Returns stream_id.
   pub fn play(
     &self,
     source: Box<dyn Source>,
-    state: Arc<Mutex<PlaybackState>>,
+    state: Arc<std::sync::Mutex<PlaybackState>>,
   ) -> Result<PlaybackHandle, AroundError> {
     let seekable = source.capabilities().contains(SourceCapabilities::SEEKABLE);
+    let (stream_ptr, info, codec_handle) = Self::open_codec(source.as_ref(), seekable)?;
+    let codec_name = unsafe {
+      let p = codec_handle.name();
+      std::ffi::CStr::from_ptr(p as *const i8)
+        .to_string_lossy()
+        .into_owned()
+    };
 
-    let (mut audio_stream, codec_name) =
-      Self::open_codec(&self.registry, source.as_ref(), seekable)?;
-
-    let sample_rate = audio_stream.sample_rate as u64;
-    // Guard against buggy codecs returning sample_rate=0 (would panic on division).
+    let sample_rate = info.sample_rate as u64;
     if sample_rate == 0 {
+      unsafe { codec_handle.destroy(stream_ptr) };
       return Err(AroundError::DecodeError {
         message: "codec returned sample_rate=0".into(),
       });
     }
-    let output_format =
-      around_core::SampleSpec::new(audio_stream.sample_rate, audio_stream.channels, 16).map_err(
-        |e| AroundError::DecodeError {
-          message: format!("invalid stream spec: {}", e),
-        },
-      )?;
+    let channels = info.channels;
+    let total_frames = info.total_frames;
 
-    let duration_ms = if audio_stream.total_frames > 0 {
-      Some((audio_stream.total_frames as u128 * 1000 / sample_rate as u128) as u64)
+    let output_format = SampleSpec::interleaved(sample_rate as u32, channels, 16).map_err(|e| {
+      AroundError::DecodeError {
+        message: format!("invalid stream spec: {}", e),
+      }
+    })?;
+
+    // Build filter chain (empty = passthrough; filters added per user config).
+    let decode_spec =
+      SampleSpec::interleaved(sample_rate as u32, channels, 16).unwrap_or(output_format);
+    let mut filter_chain = FilterChain::build(decode_spec, vec![], output_format);
+
+    let duration_ms = if total_frames > 0 {
+      Some((total_frames as u128 * 1000 / sample_rate as u128) as u64)
     } else {
       None
     };
 
+    let stream_id = next_stream_id();
+    let stream_state = Arc::new(StreamState::new());
+    stream_state.set_status(PlaybackStatus::Buffering);
+    stream_state.active.store(true, Ordering::SeqCst);
+    stream_state.position_ms.store(0, Ordering::SeqCst);
+
+    let cancel = self.shutdown_token.child_token();
+
+    // Store the stream.
+    let active = ActiveStream {
+      id: stream_id,
+      state: Arc::clone(&stream_state),
+      cancel: cancel.clone(),
+    };
+    self.streams.write().insert(stream_id, active);
+
+    // Update shared IPC state.
     let epoch = {
       let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-      st.state = TrackState::Buffering;
       st.playing = true;
       st.position_ms = 0;
       st.output_format = Some(output_format);
-      st.format_name = Some(codec_name.to_string());
+      st.format_name = Some(codec_name.clone());
       st.seekable = seekable;
       st.duration_ms = duration_ms;
+      st.state = TrackState::Buffering;
+      st.epoch += 1;
       st.epoch
     };
 
-    let running = Arc::clone(&self.running);
-    running.store(true, Ordering::SeqCst);
-    self.paused.store(false, Ordering::SeqCst);
-    *self
-      .seek_target_ms
-      .lock()
-      .unwrap_or_else(|e| e.into_inner()) = None;
-
-    let output = Arc::new(AudioOutput::new(4));
-    let output_sender = output.sender_clone();
+    // --- Audio output setup (ringbuf) ---
+    let (mut producer, consumer) = create_output(16384);
+    let consumer = Arc::new(std::sync::Mutex::new(consumer));
 
     let host = cpal::default_host();
     let device = host
@@ -283,22 +281,19 @@ impl Engine {
         message: format!("audio device error: {}", e),
       })?;
 
-    let output_cb = Arc::clone(&output);
+    let consumer_clone = Arc::clone(&consumer);
     let device_lost_flag = Arc::clone(&self.device_lost);
     let cpal_stream = device
       .build_output_stream(
         &config.into(),
         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-          let mut written = 0;
-          while written < data.len() {
-            if let Some(chunk) = output_cb.try_recv() {
-              let to_copy = chunk.len().min(data.len() - written);
-              data[written..written + to_copy].copy_from_slice(&chunk[..to_copy]);
-              written += to_copy;
-            } else {
-              data[written..].fill(0.0);
-              break;
+          if let Ok(mut cons) = consumer_clone.lock() {
+            let popped = cons.pop_slice(data);
+            if popped < data.len() {
+              data[popped..].fill(0.0);
             }
+          } else {
+            data.fill(0.0);
           }
         },
         move |err| {
@@ -314,9 +309,9 @@ impl Engine {
     cpal_stream.play().map_err(|e| AroundError::Internal {
       message: format!("failed to start audio output stream: {}", e),
     })?;
-
-    let _span = tracing::info_span!("playback").entered();
-    tracing::info!(codec = codec_name, "starting playback");
+    // --- Decode loop (blocking) ---
+    let _span = tracing::info_span!("playback", stream_id).entered();
+    tracing::info!(stream_id, codec = codec_name, "starting playback");
 
     {
       let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
@@ -325,12 +320,22 @@ impl Engine {
 
     let max_ch = output_format.channels.max(1) as usize;
     let mut buf = vec![0.0f32; 4096 * max_ch];
-    let mut total_frames = 0usize;
+    let mut total_frames: u64 = 0;
     let mut consecutive_errors = 0u32;
 
-    while running.load(Ordering::SeqCst) {
+    stream_state.set_status(PlaybackStatus::Playing);
+
+    loop {
+      // Check cancellation.
+      if cancel.is_cancelled() {
+        tracing::debug!(stream_id, "stream cancelled");
+        break;
+      }
+
       if self.device_lost.load(Ordering::SeqCst) {
-        tracing::warn!("playback paused: audio device lost");
+        tracing::warn!(stream_id, "audio device lost");
+        stream_state.set_status(PlaybackStatus::Error);
+        stream_state.device_lost.store(true, Ordering::SeqCst);
         {
           let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
           st.device_lost = true;
@@ -343,120 +348,173 @@ impl Engine {
         }
       }
 
-      if self.paused.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+      // Check pause.
+      if stream_state.status() == PlaybackStatus::Paused {
+        std::thread::sleep(std::time::Duration::from_millis(20));
         continue;
       }
 
-      if seekable {
-        if let Some(target_ms) = self
-          .seek_target_ms
-          .lock()
-          .unwrap_or_else(|e| e.into_inner())
-          .take()
-        {
-          let frame = target_ms * sample_rate / 1000;
-          if let Err(e) = audio_stream.seek(frame) {
-            tracing::warn!(?e, target_ms, "seek failed, continuing");
-          } else {
-            total_frames = frame as usize;
-            let pos = total_frames as u64 * 1000 / sample_rate;
-            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-            st.position_ms = pos;
-            st.state = TrackState::Playing;
-          }
-        }
+      let n = unsafe { codec_handle.read(stream_ptr, buf.as_mut_ptr(), buf.len()) };
+      if n > 0 {
+        let sample_count = n as usize;
+        // Run through filter chain (currently passthrough; filters added per user config).
+        let processed = filter_chain.process(&mut buf[..sample_count], channels);
+        producer.push_slice(&buf[..processed]);
+        total_frames += (n as u64) / channels as u64;
+        consecutive_errors = 0;
+        let pos = total_frames * 1000 / sample_rate;
+        stream_state.position_ms.store(pos, Ordering::SeqCst);
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        st.position_ms = pos;
+      } else if n == 0 {
+        break; // EOF
       } else {
-        let _ = self
-          .seek_target_ms
-          .lock()
-          .unwrap_or_else(|e| e.into_inner())
-          .take();
-      }
-
-      match audio_stream.read(&mut buf) {
-        Ok(Some(n)) => {
-          let sample_count = n * output_format.channels as usize;
-          let samples = buf[..sample_count].to_vec();
-          if output_sender.send(samples).is_err() {
-            tracing::warn!("audio output disconnected, stopping");
-            break;
-          }
-          total_frames += n;
-          consecutive_errors = 0;
-          let position_ms = total_frames as u64 * 1000 / sample_rate;
-          let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-          st.position_ms = position_ms;
-        }
-        Ok(None) => break,
-        Err(e) => {
-          consecutive_errors += 1;
-          tracing::warn!(?e, consecutive_errors, "decode error during playback");
-          if consecutive_errors >= 3 {
-            tracing::error!(?e, "too many consecutive decode errors, stopping");
-            {
-              let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-              if st.epoch == epoch {
-                st.state = TrackState::Error;
-                st.playing = false;
-              }
+        consecutive_errors += 1;
+        tracing::warn!(stream_id, n, consecutive_errors, "decode error");
+        if consecutive_errors >= 3 {
+          stream_state.set_status(PlaybackStatus::Error);
+          {
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.epoch == epoch {
+              st.state = TrackState::Error;
+              st.playing = false;
             }
-            return Err(e);
           }
+          unsafe { codec_handle.destroy(stream_ptr) };
+          return Err(AroundError::DecodeError {
+            message: format!("decode error: code {}", n),
+          });
         }
       }
     }
 
-    tracing::info!(total_frames, "playback complete");
-    running.store(false, Ordering::SeqCst);
+    tracing::info!(stream_id, total_frames, "playback complete");
+    stream_state.set_status(PlaybackStatus::Stopped);
+    stream_state.active.store(false, Ordering::SeqCst);
+    unsafe { codec_handle.destroy(stream_ptr) };
 
     {
       let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
       if st.epoch == epoch {
         st.state = TrackState::Stopped;
         st.playing = false;
-        st.position_ms = total_frames as u64 * 1000 / sample_rate;
+        st.position_ms = total_frames * 1000 / sample_rate;
       }
     }
 
+    // Cleanup stream from engine.
+    self.streams.write().remove(&stream_id);
+
     Ok(PlaybackHandle {
       output_format,
-      running: Arc::clone(&self.running),
+      stream_id,
     })
+  }
+
+  /// Stop a specific stream by ID, or all streams if id is None.
+  pub fn stop_stream(&self, id: Option<StreamId>) {
+    let streams = self.streams.read();
+    if let Some(id) = id {
+      if let Some(s) = streams.get(&id) {
+        s.cancel.cancel();
+        s.state.set_status(PlaybackStatus::Stopped);
+      }
+    } else {
+      for s in streams.values() {
+        s.cancel.cancel();
+        s.state.set_status(PlaybackStatus::Stopped);
+      }
+    }
+  }
+
+  /// Pause a specific stream.
+  pub fn pause_stream(&self, id: StreamId) {
+    let streams = self.streams.read();
+    if let Some(s) = streams.get(&id) {
+      s.state.set_status(PlaybackStatus::Paused);
+      tracing::debug!(id, "stream paused");
+    }
+  }
+
+  /// Resume a specific stream.
+  pub fn resume_stream(&self, id: StreamId) {
+    let streams = self.streams.read();
+    if let Some(s) = streams.get(&id) {
+      s.state.set_status(PlaybackStatus::Playing);
+      tracing::debug!(id, "stream resumed");
+    }
+  }
+
+  /// Get state for a specific stream.
+  pub fn stream_state(&self, id: StreamId) -> Option<Arc<StreamState>> {
+    self.streams.read().get(&id).map(|s| Arc::clone(&s.state))
+  }
+
+  /// List all stream IDs.
+  pub fn stream_ids(&self) -> Vec<StreamId> {
+    self.streams.read().keys().copied().collect()
+  }
+
+  /// Returns the sole active stream ID, or None.
+  pub fn sole_stream_id(&self) -> Option<StreamId> {
+    let streams = self.streams.read();
+    let active: Vec<StreamId> = streams
+      .values()
+      .filter(|s| s.state.active.load(Ordering::SeqCst))
+      .map(|s| s.id)
+      .collect();
+    if active.len() == 1 {
+      Some(active[0])
+    } else {
+      None
+    }
+  }
+
+  /// Shutdown all streams and the engine.
+  pub fn shutdown(&self) {
+    self.shutdown_token.cancel();
+    for s in self.streams.read().values() {
+      s.cancel.cancel();
+    }
+  }
+
+  pub fn is_shutdown(&self) -> bool {
+    self.shutdown_token.is_cancelled()
+  }
+
+  // Legacy methods for backward compat with single-stream IPC.
+  pub fn stop(&self) {
+    self.stop_stream(None);
+  }
+
+  pub fn pause(&self) {
+    if let Some(id) = self.sole_stream_id() {
+      self.pause_stream(id);
+    }
+  }
+
+  pub fn resume(&self) {
+    if let Some(id) = self.sole_stream_id() {
+      self.resume_stream(id);
+    }
+  }
+
+  pub fn seek(&self, _position_ms: u64) {
+    // Seek not yet implemented for multi-stream.
+  }
+
+  pub fn running(&self) -> bool {
+    self
+      .streams
+      .read()
+      .values()
+      .any(|s| s.state.active.load(Ordering::SeqCst))
   }
 
   pub fn config(&self) -> &crate::config::EngineConfig {
     &self.config
   }
-  pub fn stop(&self) {
-    self.running.store(false, Ordering::SeqCst);
-  }
-  pub fn pause(&self) {
-    self.paused.store(true, Ordering::SeqCst);
-  }
-  pub fn resume(&self) {
-    self.paused.store(false, Ordering::SeqCst);
-  }
-  pub fn seek(&self, position_ms: u64) {
-    *self
-      .seek_target_ms
-      .lock()
-      .unwrap_or_else(|e| e.into_inner()) = Some(position_ms);
-  }
-  pub fn shutdown(&self) {
-    self.shutdown.store(true, Ordering::SeqCst);
-    self.shutdown_signal.notify_one();
-  }
-  pub fn is_shutdown(&self) -> bool {
-    self.shutdown.load(Ordering::SeqCst)
-  }
-  /// Returns a future that resolves when `shutdown()` is called.
-  pub fn shutdown_signal(&self) -> impl std::future::Future<Output = ()> + Send + '_ {
-    let notified = self.shutdown_signal.notified();
-    async move {
-      notified.await;
-    }
-  }
+
   pub fn notify_device_lost(&self) {
     self.device_lost.store(true, Ordering::SeqCst);
     tracing::warn!("audio output device disconnected");
@@ -464,75 +522,120 @@ impl Engine {
       self.stop();
     }
   }
+
   pub fn is_device_lost(&self) -> bool {
     self.device_lost.load(Ordering::SeqCst)
   }
-}
 
-fn same_codec_set(a: &[&around_core::CodecInfo], b: &[&around_core::CodecInfo]) -> bool {
-  if a.len() != b.len() {
-    return false;
-  }
-  a.iter().all(|ca| b.iter().any(|cb| std::ptr::eq(*ca, *cb)))
-}
+  // -----------------------------------------------------------------------
+  // Codec opening (internal)
+  // -----------------------------------------------------------------------
 
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use around_core::FormatSignature;
+  fn open_codec(
+    source: &dyn Source,
+    _seekable: bool,
+  ) -> Result<(*mut c_void, StreamInfo, CodecHandle), AroundError> {
+    let register = init_codec();
 
-  fn make_codec(
-    name: &'static str,
-    ext: &'static str,
-    magic: &'static [u8],
-  ) -> around_core::CodecInfo {
-    let fmts: &'static [FormatSignature] =
-      Box::leak(Box::new([
-        FormatSignature::from_extension(ext, "test").with_magic(magic)
-      ]));
-    around_core::CodecInfo::new(name, fmts, |_| unreachable!())
-  }
+    // --- Phase 1: Read header bytes for probing (separate reader) ---
+    let header_buf = {
+      let probe_reader = source.open_seekable()?;
+      let probe_reader: Box<dyn ReadSend> = Box::new(probe_reader);
+      let probe_ctx = Box::into_raw(Box::new(ReaderBridge {
+        reader: probe_reader,
+      })) as *mut c_void;
+      let mut buf = [0u8; 8192];
+      let n = unsafe { read_cb(probe_ctx, buf.as_mut_ptr(), buf.len()) };
+      if !probe_ctx.is_null() {
+        unsafe {
+          drop(Box::from_raw(
+            probe_ctx as *mut ReaderBridge<Box<dyn ReadSend>>,
+          ));
+        }
+      }
+      let len = if n > 0 { n as usize } else { 0 };
+      buf[..len].to_vec()
+    };
 
-  #[test]
-  fn same_codec_set_empty() {
-    assert!(same_codec_set(&[], &[]));
-  }
+    let header = &header_buf[..];
+    let filename = b"";
 
-  #[test]
-  fn same_codec_set_single_identical() {
-    let a = make_codec("wav", "wav", b"RIFF");
-    assert!(same_codec_set(&[&a], &[&a]));
-  }
+    // --- Phase 2: Probe through CodecRegister ---
+    let mut best_conf = 0u8;
+    let mut best_vtable: *const () = std::ptr::null();
+    let mut best_codec_data: *mut () = std::ptr::null_mut();
 
-  #[test]
-  fn same_codec_set_different_length() {
-    let a = make_codec("wav", "wav", b"RIFF");
-    let b = make_codec("mp3", "mp3", b"ID3");
-    assert!(!same_codec_set(&[&a], &[&a, &b]));
-  }
+    register.for_each_entry(|vtable_ptr, entry_ptr| {
+      // SAFETY: for_each_entry yields (vtable, entry) pairs from the register.
+      // The entry is a heap-allocated DynCodecRef. At offset 0 is the codec data
+      // pointer (the Box<()> containing the codec instance).
+      let codec_data = unsafe { *(entry_ptr as *mut *mut ()) };
+      let probe_ref = unsafe { ManuallyDrop::new(CodecRegister::from_raw(vtable_ptr, codec_data)) };
+      let conf = probe_ref.probe(
+        header.as_ptr(),
+        header.len(),
+        filename.as_ptr(),
+        filename.len(),
+      );
+      if conf >= 50 && conf > best_conf {
+        best_conf = conf;
+        best_vtable = vtable_ptr;
+        best_codec_data = codec_data;
+      }
+    });
 
-  #[test]
-  fn same_codec_set_different_items() {
-    let a = make_codec("wav", "wav", b"RIFF");
-    let b = make_codec("mp3", "mp3", b"ID3");
-    assert!(!same_codec_set(&[&a], &[&b]));
-  }
+    // --- Phase 3: Choose codec and open with a fresh reader ---
+    let chosen_handle = if !best_vtable.is_null() {
+      CodecHandle {
+        vtable: best_vtable,
+        codec_data: best_codec_data,
+      }
+    } else {
+      // Built-in fallback: create temporary DynCodecRef for WavCodec
+      let temp: ManuallyDrop<DynCodecRef> = ManuallyDrop::new(DynCodecRef::from(
+        stabby::boxed::Box::new(around_codec_wav::WavCodec),
+      ));
+      // SAFETY: ManuallyDrop<DynCodecRef> is repr(transparent); reading offset 0
+      // gives the inner codec data pointer, offset size_of::<*mut ()>() gives the vtable.
+      let temp_inner: &DynCodecRef = &temp;
+      let cd = unsafe { *(temp_inner as *const DynCodecRef as *const *mut ()) };
+      let vt = unsafe {
+        *((temp_inner as *const DynCodecRef as *const u8).add(std::mem::size_of::<*mut ()>())
+          as *const *const ())
+      };
+      // temp is dropped here — ManuallyDrop prevents double-free
+      CodecHandle {
+        vtable: vt,
+        codec_data: cd,
+      }
+    };
 
-  #[test]
-  fn same_codec_set_same_items_different_order() {
-    let a = make_codec("wav", "wav", b"RIFF");
-    let b = make_codec("mp3", "mp3", b"ID3");
-    assert!(same_codec_set(&[&a, &b], &[&b, &a]));
-  }
+    let reader = source.open_seekable()?;
+    let reader: Box<dyn ReadSend> = Box::new(reader);
+    let reader_ctx = Box::into_raw(Box::new(ReaderBridge { reader })) as *mut c_void;
 
-  #[test]
-  fn same_codec_set_pointer_identity() {
-    // Two distinct CodecInfo values with same fields are NOT the same
-    // (same_codec_set uses pointer identity, not structural equality).
-    let a1 = make_codec("wav", "wav", b"RIFF");
-    let a2 = make_codec("wav", "wav", b"RIFF");
-    assert!(!same_codec_set(&[&a1], &[&a2]));
-    // But same pointer IS same
-    assert!(same_codec_set(&[&a1], &[&a1]));
+    let mut stream: *mut c_void = std::ptr::null_mut();
+    let mut info: StreamInfo = unsafe { std::mem::zeroed() };
+    let rc = {
+      let codec_ref = chosen_handle.as_ref();
+      codec_ref.open(reader_ctx, read_cb, seek_cb, &mut stream, &mut info)
+    };
+
+    if !reader_ctx.is_null() {
+      unsafe {
+        drop(Box::from_raw(
+          reader_ctx as *mut ReaderBridge<Box<dyn ReadSend>>,
+        ));
+      }
+    }
+
+    if rc == 0 && !stream.is_null() {
+      Ok((stream, info, chosen_handle))
+    } else {
+      Err(AroundError::UnsupportedFormat {
+        format: Some("unknown".into()),
+        reason: "no codec could open the source".into(),
+      })
+    }
   }
 }

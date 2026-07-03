@@ -10,14 +10,14 @@ pub mod source;
 pub mod state;
 pub mod types;
 
-// Re-export all public types at crate root for convenience
-pub use codec::{AudioStream, AudioStreamVTable, CodecInfo, CodecRegistry, PrefixReader};
+// Re-export primary types from codec (ADR-0004 stabby codec system)
+pub use codec::{init_codec, Codec, CodecRegister, DynCodecRef, ReadFn, SeekFn, StreamInfo};
 pub use error::AroundError;
 pub use metadata::Metadata;
-pub use source::{FormatSignature, ReadSeek, Source, SourceCapabilities};
-pub use state::{PlaybackStatus, PAUSED, PLAYING, STOPPED};
+pub use source::{ReadSeek, Source, SourceCapabilities};
+pub use state::PlaybackStatus;
 pub use types::{
-  AudioFormat, BitDepth, ChannelLayout, ContentType, ExtensionSource, SampleRate, SampleSpec,
+  BitDepth, ChannelLayout, ContentType, ExtensionSource, Interleave, SampleRate, SampleSpec,
   BIT_DEPTH_16, BIT_DEPTH_24, BIT_DEPTH_32, BIT_DEPTH_64, BIT_DEPTH_8, CHANNEL_MONO, CHANNEL_QUAD,
   CHANNEL_STEREO, CHANNEL_SURROUND_2_1, CHANNEL_SURROUND_5_1, CHANNEL_SURROUND_7_1,
   SAMPLE_RATE_176400, SAMPLE_RATE_192000, SAMPLE_RATE_44100, SAMPLE_RATE_48000, SAMPLE_RATE_88200,
