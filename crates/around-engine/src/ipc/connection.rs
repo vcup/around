@@ -2,21 +2,17 @@
 
 use super::handle_command;
 use crate::ipc::codec::{IpcCodec, IpcWire};
-use crate::ipc::types::{IpcCommand, PlaybackState};
+use crate::ipc::types::IpcCommand;
 use crate::pipeline::Engine;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 
 /// Accept loop — processes connections sequentially.
-pub(crate) async fn serve<F, S>(
-  engine: &Arc<Engine>,
-  state: &Arc<Mutex<PlaybackState>>,
-  codec: IpcWire,
-  mut accept: F,
-) where
+pub(crate) async fn serve<F, S>(engine: &Arc<Engine>, codec: IpcWire, mut accept: F)
+where
   F: FnMut() -> Pin<Box<dyn Future<Output = io::Result<S>> + Send>>,
   S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -34,10 +30,9 @@ pub(crate) async fn serve<F, S>(
     };
 
     let eng = engine.clone();
-    let st = state.clone();
     let cdc = codec.clone();
 
-    if let Err(e) = handle_connection(stream, eng, st, cdc).await {
+    if let Err(e) = handle_connection(stream, eng, cdc).await {
       tracing::error!(?e, "connection error");
     }
   }
@@ -47,7 +42,6 @@ pub(crate) async fn serve<F, S>(
 pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
   stream: S,
   engine: Arc<Engine>,
-  state: Arc<Mutex<PlaybackState>>,
   codec: impl IpcCodec,
 ) -> io::Result<()> {
   let (reader, mut writer) = tokio::io::split(stream);
@@ -63,7 +57,7 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
       }
     };
 
-    let resp = handle_command(cmd, &engine, &state).await;
+    let resp = handle_command(cmd, &engine).await;
     if let Err(e) = codec.write_response(&mut writer, &resp).await {
       tracing::warn!(?e, "failed to write IPC response");
       break;

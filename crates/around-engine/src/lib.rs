@@ -11,7 +11,6 @@ pub mod platform;
 pub use config::EngineConfig;
 pub use ipc::run_ipc_server;
 pub use ipc::types::{
-  CodecDescriptor, ErrorCode, IpcCommand, IpcResponse, PlaybackState, ResponseStatus, TrackInfo,
-  TrackState,
+  CodecDescriptor, ErrorCode, IpcCommand, IpcResponse, ResponseStatus, StreamStatus, TrackInfo,
 };
-pub use pipeline::Engine;
+pub use pipeline::{Engine, PlaybackHandle, PreparedStream, SeekError, StreamId, StreamState};

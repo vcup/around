@@ -3,15 +3,13 @@
 // Clippy: expect() on startup-critical operations is intentional — failure to initialise is unrecoverable.
 #![allow(clippy::expect_used)]
 
-use around_core::Source;
 use around_engine::ipc::types::{IpcCommand, IpcResponse, ResponseStatus};
-use around_engine::{Engine, EngineConfig, PlaybackState};
-use around_source_file::FileSource;
+use around_engine::{Engine, EngineConfig};
 use clap::{Parser, Subcommand};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 #[derive(Parser)]
@@ -43,26 +41,50 @@ enum Commands {
     /// Enable UDP cross-host listener (FR-014)
     #[arg(long)]
     ipc_listen_udp: Option<String>,
+
+    /// Stream ID to use (optional)
+    #[arg(long)]
+    stream_id: Option<u64>,
   },
 
   /// Pause playback
-  Pause,
+  Pause {
+    /// Stream ID to pause (optional, pauses sole active stream)
+    #[arg(long)]
+    stream_id: Option<u64>,
+  },
 
   /// Resume playback
-  Resume,
+  Resume {
+    /// Stream ID to resume (optional, resumes sole active stream)
+    #[arg(long)]
+    stream_id: Option<u64>,
+  },
 
   /// Seek to a position (in seconds)
   Seek {
     /// Position in seconds
     #[arg(short, long)]
     position: f64,
+
+    /// Stream ID to seek (optional, seeks sole active stream)
+    #[arg(long)]
+    stream_id: Option<u64>,
   },
 
   /// Stop playback
-  Stop,
+  Stop {
+    /// Stream ID to stop (optional, stops all playback)
+    #[arg(long)]
+    stream_id: Option<u64>,
+  },
 
   /// Show playback status
-  Status,
+  Status {
+    /// Stream ID (optional, shows all streams)
+    #[arg(long)]
+    stream_id: Option<u64>,
+  },
 
   /// Load a codec extension from a shared library file
   LoadCodec {
@@ -103,38 +125,42 @@ fn main() {
       path,
       ipc_listen_tcp,
       ipc_listen_udp,
+      stream_id,
     } => {
-      if let Err(e) = cmd_play(path, ipc_listen_tcp, ipc_listen_udp, remote) {
+      if let Err(e) = cmd_play(path, ipc_listen_tcp, ipc_listen_udp, stream_id, remote) {
         eprintln!("error: {}", e);
         std::process::exit(1);
       }
     }
-    Commands::Pause => {
-      if let Err(e) = cmd_pause(remote) {
+    Commands::Pause { stream_id } => {
+      if let Err(e) = cmd_pause(stream_id, remote) {
         eprintln!("error: {}", e);
         std::process::exit(1);
       }
     }
-    Commands::Resume => {
-      if let Err(e) = cmd_resume(remote) {
+    Commands::Resume { stream_id } => {
+      if let Err(e) = cmd_resume(stream_id, remote) {
         eprintln!("error: {}", e);
         std::process::exit(1);
       }
     }
-    Commands::Seek { position } => {
-      if let Err(e) = cmd_seek(position, remote) {
+    Commands::Seek {
+      position,
+      stream_id,
+    } => {
+      if let Err(e) = cmd_seek(position, stream_id, remote) {
         eprintln!("error: {}", e);
         std::process::exit(1);
       }
     }
-    Commands::Stop => {
-      if let Err(e) = cmd_stop(remote) {
+    Commands::Stop { stream_id } => {
+      if let Err(e) = cmd_stop(stream_id, remote) {
         eprintln!("error: {}", e);
         std::process::exit(1);
       }
     }
-    Commands::Status => {
-      if let Err(e) = cmd_status(remote) {
+    Commands::Status { stream_id } => {
+      if let Err(e) = cmd_status(stream_id, remote) {
         eprintln!("error: {}", e);
         std::process::exit(1);
       }
@@ -176,14 +202,16 @@ fn cmd_play(
   path: PathBuf,
   ipc_listen_tcp: Option<String>,
   ipc_listen_udp: Option<String>,
+  stream_id: Option<u64>,
   remote: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
   // Auto-detect: if an engine is already running, delegate to it.
   if remote.is_none() {
-    let probe = IpcCommand::Status;
+    let probe = IpcCommand::Status { stream_id: None };
     if send_ipc_command(&probe, None).is_ok() {
       let play_cmd = IpcCommand::Play {
         path: path.display().to_string(),
+        stream_id,
       };
       let resp = send_ipc_command(&play_cmd, None)?;
       if resp.status == ResponseStatus::Ok {
@@ -204,13 +232,6 @@ fn cmd_play(
   // Build IpcConfig from CLI flags.
   let ipc_config = around_engine::ipc::IpcConfig::from_cli_env(ipc_listen_tcp, ipc_listen_udp)?;
 
-  // Shared state: the decode thread updates position/state in real-time,
-  // the IPC server reads it to serve status/pause/resume/seek commands.
-  let state = Arc::new(Mutex::new(PlaybackState::default()));
-
-  let source = FileSource::new(&path);
-  let source_box: Box<dyn Source> = Box::new(source);
-
   // Set up Ctrl+C handler before starting playback.
   let eng = engine.clone();
   ctrlc::set_handler(move || {
@@ -222,7 +243,6 @@ fn cmd_play(
 
   // Start IPC server on a background thread for control commands.
   let ipc_engine = engine.clone();
-  let ipc_state = state.clone();
   let port_file = std::env::temp_dir().join("around.port");
   let ipc_handle = std::thread::spawn(move || {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -252,7 +272,7 @@ fn cmd_play(
         });
       }
 
-      if let Err(e) = around_engine::ipc::run_ipc_server(ipc_config, ipc_engine, ipc_state).await {
+      if let Err(e) = around_engine::ipc::run_ipc_server(ipc_config, ipc_engine).await {
         tracing::error!(?e, "IPC server error");
       }
     });
@@ -260,21 +280,11 @@ fn cmd_play(
 
   tracing::info!("playing '{}'", path.display());
 
-  // Run play() on a background thread.
-  let eng = engine.clone();
-  let play_state = state.clone();
-  let play_thread = thread::spawn(move || eng.play(source_box, play_state));
-
-  match play_thread.join() {
-    Ok(Ok(handle)) => {
-      tracing::info!(
-        "playback complete ({} Hz, {} channels)",
-        handle.output_format.sample_rate,
-        handle.output_format.channels
-      );
-      drop(handle);
-    }
-    Ok(Err(e)) => {
+  // Use prepare() + run_stream() instead of the deprecated play().
+  let source = around_source_file::FileSource::new(&path);
+  let prepared = match engine.prepare(Box::new(source)) {
+    Ok(p) => p,
+    Err(e) => {
       engine.shutdown();
       let _ = std::fs::read_to_string(&port_file)
         .ok()
@@ -283,6 +293,32 @@ fn cmd_play(
       let _ = ipc_handle.join();
       let _ = std::fs::remove_file(&port_file);
       return Err(Box::new(e));
+    }
+  };
+
+  let sid = prepared.stream_id;
+
+  // Run the blocking decode loop on a background thread.
+  let eng = engine.clone();
+  let play_thread = thread::spawn(move || eng.run_stream(sid));
+
+  match play_thread.join() {
+    Ok(result) => {
+      if let Err(e) = result {
+        engine.shutdown();
+        let _ = std::fs::read_to_string(&port_file)
+          .ok()
+          .and_then(|p| p.trim().parse::<u16>().ok())
+          .and_then(|p| TcpStream::connect(format!("127.0.0.1:{}", p)).ok());
+        let _ = ipc_handle.join();
+        let _ = std::fs::remove_file(&port_file);
+        return Err(Box::new(e));
+      }
+      tracing::info!(
+        "playback complete ({} Hz, {} channels)",
+        prepared.output_format.sample_rate,
+        prepared.output_format.channels
+      );
     }
     Err(_panic) => {
       engine.shutdown();
@@ -323,14 +359,12 @@ fn send_ipc_command(
   req: &IpcCommand,
   remote: Option<&str>,
 ) -> Result<IpcResponse, Box<dyn std::error::Error>> {
-  // 1. Direct remote connection (--remote flag).
   if let Some(addr) = remote {
-    let socket_addr: std::net::SocketAddr = addr.parse()?;
-    let stream = TcpStream::connect_timeout(&socket_addr, std::time::Duration::from_secs(3))?;
+    let stream = TcpStream::connect(addr)?;
     return send_over_tcp_stream(req, stream);
   }
 
-  // 2. Try native transport first.
+  // Try native transport first.
   #[cfg(unix)]
   {
     if let Ok(resp) = try_unix_socket_command(req) {
@@ -344,17 +378,11 @@ fn send_ipc_command(
     }
   }
 
-  // 3. TCP fallback via port file.
-  let port_file = std::env::temp_dir().join("around.port");
-  let port = std::fs::read_to_string(&port_file)
-    .map_err(|_| "no engine instance running (tried native transport and port file)")?;
-  let port: u16 = port
-    .trim()
-    .parse()
-    .map_err(|_| format!("invalid port in port file: {}", port))?;
-
-  let fallback_addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()?;
-  let stream = TcpStream::connect_timeout(&fallback_addr, std::time::Duration::from_secs(3))?;
+  // Fallback: read port file and connect via TCP.
+  let port_path = std::env::temp_dir().join("around.port");
+  let port_str = std::fs::read_to_string(&port_path)?;
+  let port: u16 = port_str.trim().parse()?;
+  let stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
   send_over_tcp_stream(req, stream)
 }
 
@@ -366,17 +394,20 @@ fn send_over_tcp_stream(
   let mut reader = BufReader::new(&stream);
   let mut writer = BufWriter::new(&stream);
 
-  let request = serde_json::to_string(req)?;
-  writer.write_all(request.as_bytes())?;
-  writer.write_all(b"\n")?;
+  // Write JSON command as length-delimited frame.
+  let json = serde_json::to_vec(req)?;
+  writer.write_all(&(json.len() as u64).to_le_bytes())?;
+  writer.write_all(&json)?;
   writer.flush()?;
-  stream.shutdown(std::net::Shutdown::Write)?;
 
-  let mut buf = String::new();
-  reader.read_to_string(&mut buf)?;
-
-  let response: IpcResponse = serde_json::from_str(&buf)?;
-  Ok(response)
+  // Read JSON response with length prefix.
+  let mut len_buf = [0u8; 8];
+  reader.read_exact(&mut len_buf)?;
+  let resp_len = u64::from_le_bytes(len_buf) as usize;
+  let mut resp_buf = vec![0u8; resp_len];
+  reader.read_exact(&mut resp_buf)?;
+  let resp: IpcResponse = serde_json::from_slice(&resp_buf)?;
+  Ok(resp)
 }
 
 /// Try to send a command via the Unix domain socket (Linux/macOS).
@@ -386,21 +417,21 @@ fn try_unix_socket_command(req: &IpcCommand) -> Result<IpcResponse, Box<dyn std:
 
   let socket_path = resolve_unix_socket_path();
   let stream = UnixStream::connect(&socket_path)?;
-
   let mut reader = BufReader::new(&stream);
   let mut writer = BufWriter::new(&stream);
 
-  let request = serde_json::to_string(req)?;
-  writer.write_all(request.as_bytes())?;
-  writer.write_all(b"\n")?;
+  let json = serde_json::to_vec(req)?;
+  writer.write_all(&(json.len() as u64).to_le_bytes())?;
+  writer.write_all(&json)?;
   writer.flush()?;
-  stream.shutdown(std::net::Shutdown::Write)?;
 
-  let mut buf = String::new();
-  reader.read_to_string(&mut buf)?;
-
-  let response: IpcResponse = serde_json::from_str(&buf)?;
-  Ok(response)
+  let mut len_buf = [0u8; 8];
+  reader.read_exact(&mut len_buf)?;
+  let resp_len = u64::from_le_bytes(len_buf) as usize;
+  let mut resp_buf = vec![0u8; resp_len];
+  reader.read_exact(&mut resp_buf)?;
+  let resp: IpcResponse = serde_json::from_slice(&resp_buf)?;
+  Ok(resp)
 }
 
 /// Resolve the Unix socket path (mirrors engine's resolve_socket_dir).
@@ -420,34 +451,67 @@ fn resolve_unix_socket_path() -> std::path::PathBuf {
 /// Try to send a command via the Windows named pipe.
 #[cfg(windows)]
 fn try_named_pipe_command(req: &IpcCommand) -> Result<IpcResponse, Box<dyn std::error::Error>> {
-  // Open the named pipe as a file.
-  let pipe = std::fs::OpenOptions::new()
-    .read(true)
-    .write(true)
-    .open(r"\\.\pipe\around")?;
+  // Windows named pipe implementation for IPC.
+  use std::io::ErrorKind;
+  use windows::Win32::Foundation::HANDLE;
+  use windows::Win32::Storage::FileSystem::CreateFileA;
+  use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
+  use windows::Win32::Storage::FileSystem::GENERIC_READ;
+  use windows::Win32::Storage::FileSystem::GENERIC_WRITE;
+  use windows::Win32::Storage::FileSystem::OPEN_EXISTING;
 
-  let mut reader = BufReader::new(&pipe);
-  let mut writer = BufWriter::new(&pipe);
+  let pipe_name = r"\\.\pipe\around\0";
+  let handle = unsafe {
+    CreateFileA(
+      pipe_name,
+      GENERIC_READ | GENERIC_WRITE,
+      windows::Win32::Storage::FileSystem::FILE_SHARE_NONE,
+      None,
+      OPEN_EXISTING,
+      FILE_FLAG_OVERLAPPED,
+      HANDLE::default(),
+    )
+  };
 
-  let request = serde_json::to_string(req)?;
-  writer.write_all(request.as_bytes())?;
-  writer.write_all(b"\n")?;
-  writer.flush()?;
-  drop(writer);
+  if handle.is_invalid() {
+    return Err("Failed to connect to named pipe".into());
+  }
 
-  let mut buf = String::new();
-  reader.read_to_string(&mut buf)?;
+  // Use tokio's NamedPipeClient for async I/O.
+  let rt = tokio::runtime::Builder::new_current_thread()
+    .enable_io()
+    .build()?;
+  rt.block_on(async {
+    let client = tokio::net::windows::named_pipe::NamedPipeClient::new(pipe_name)?;
+    client.connect().await?;
 
-  let response: IpcResponse = serde_json::from_str(&buf)?;
-  Ok(response)
+    let (reader, mut writer) = tokio::io::split(client);
+    let mut reader = BufReader::new(reader);
+
+    let json = serde_json::to_vec(req)?;
+    writer.write_all(&(json.len() as u64).to_le_bytes()).await?;
+    writer.write_all(&json).await?;
+    writer.flush().await?;
+
+    let mut len_buf = [0u8; 8];
+    reader.read_exact(&mut len_buf).await?;
+    let resp_len = u64::from_le_bytes(len_buf) as usize;
+    let mut resp_buf = vec![0u8; resp_len];
+    reader.read_exact(&mut resp_buf).await?;
+    let resp: IpcResponse = serde_json::from_slice(&resp_buf)?;
+    Ok(resp)
+  })
 }
 
 // ---------------------------------------------------------------------------
 // Command implementations
 // ---------------------------------------------------------------------------
 
-fn cmd_pause(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-  let req = IpcCommand::Pause;
+fn cmd_pause(
+  stream_id: Option<u64>,
+  remote: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let req = IpcCommand::Pause { stream_id };
   let resp = send_ipc_command(&req, remote)?;
   match resp.status {
     ResponseStatus::Ok => println!("Paused."),
@@ -456,8 +520,11 @@ fn cmd_pause(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
   Ok(())
 }
 
-fn cmd_resume(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-  let req = IpcCommand::Resume;
+fn cmd_resume(
+  stream_id: Option<u64>,
+  remote: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let req = IpcCommand::Resume { stream_id };
   let resp = send_ipc_command(&req, remote)?;
   match resp.status {
     ResponseStatus::Ok => println!("Resumed."),
@@ -466,12 +533,19 @@ fn cmd_resume(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
   Ok(())
 }
 
-fn cmd_seek(position: f64, remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_seek(
+  position: f64,
+  stream_id: Option<u64>,
+  remote: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
   if position < 0.0 {
     return Err("position must be non-negative".into());
   }
   let position_ms = (position * 1000.0) as u64;
-  let req = IpcCommand::Seek { position_ms };
+  let req = IpcCommand::Seek {
+    position_ms,
+    stream_id,
+  };
   let resp = send_ipc_command(&req, remote)?;
   match resp.status {
     ResponseStatus::Ok => println!("Seeked to {}s.", position),
@@ -480,8 +554,11 @@ fn cmd_seek(position: f64, remote: Option<&str>) -> Result<(), Box<dyn std::erro
   Ok(())
 }
 
-fn cmd_stop(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-  let req = IpcCommand::Stop;
+fn cmd_stop(
+  stream_id: Option<u64>,
+  remote: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let req = IpcCommand::Stop { stream_id };
   let resp = send_ipc_command(&req, remote)?;
   match resp.status {
     ResponseStatus::Ok => println!("Stopped."),
@@ -490,17 +567,34 @@ fn cmd_stop(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
   Ok(())
 }
 
-fn cmd_status(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
-  let req = IpcCommand::Status;
+fn cmd_status(
+  stream_id: Option<u64>,
+  remote: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+  let req = IpcCommand::Status { stream_id };
   let resp = send_ipc_command(&req, remote)?;
   if resp.status == ResponseStatus::Ok {
-    if let Some(track) = &resp.track {
+    // Multi-stream output
+    if let Some(ref streams) = resp.streams {
+      for s in streams {
+        println!(
+          "Stream {}: {:?} at {}ms (seekable: {}, device_lost: {})",
+          s.stream_id, s.status, s.position_ms, s.seekable, s.device_lost,
+        );
+        if let Some(ref track) = s.track {
+          println!(
+            "  Track: {} ({} format, {}ms)",
+            track.path, track.format, track.duration_ms
+          );
+        }
+      }
+    } else if let Some(track) = &resp.track {
+      // Legacy single-stream output
       println!(
-        "State: {}",
+        "State: {:?}",
         resp
           .state
-          .map(|s| s.to_string())
-          .unwrap_or_else(|| "unknown".into())
+          .unwrap_or(around_engine::ipc::types::PlaybackStatus::Stopped)
       );
       println!("Track: {}", track.path);
       println!("Format: {} ({} ms)", track.format, track.duration_ms);
@@ -556,17 +650,15 @@ fn cmd_list_codecs(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error
 /// The parent process exits immediately; the child continues.
 #[cfg(unix)]
 fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
-  match unsafe { libc::fork() } {
-    -1 => Err("fork failed".into()),
-    0 => {
-      // Child: create new session, detach from controlling terminal.
-      if unsafe { libc::setsid() } == -1 {
-        return Err("setsid failed".into());
-      }
-      Ok(())
-    }
-    _ => std::process::exit(0),
-  }
+  use std::os::unix::process::CommandExt;
+  let args: Vec<String> = std::env::args().collect();
+  let child = std::process::Command::new(&args[0])
+    .args(&args[1..])
+    .env("AROUND_DAEMON_CHILD", "1")
+    .process_group(0)
+    .spawn()?;
+  println!("Daemonized with PID {}", child.id());
+  std::process::exit(0);
 }
 
 /// Re-spawn as a detached process with no console.
@@ -576,24 +668,20 @@ fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
 /// with environment variable AROUND_DAEMON_CHILD=1 set.
 #[cfg(windows)]
 fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
-  use std::os::windows::process::CommandExt;
-  let exe = std::env::current_exe()?;
-  let mut cmd = std::process::Command::new(exe);
-  cmd
-    .args(std::env::args().skip(1))
+  // On Windows, daemonize by spawning a detached process.
+  let args: Vec<String> = std::env::args().collect();
+  let child = std::process::Command::new(&args[0])
+    .args(&args[1..])
     .env("AROUND_DAEMON_CHILD", "1")
-    .creation_flags(0x00000008) // DETACHED_PROCESS
-    .stdin(std::process::Stdio::null())
-    .stdout(std::process::Stdio::null())
-    .stderr(std::process::Stdio::null());
-  cmd.spawn()?;
+    .creation_flags(std::process::CreationFlags::CREATE_NO_WINDOW)
+    .spawn()?;
+  println!("Daemonized with PID {}", child.id());
   std::process::exit(0);
 }
 
 fn cmd_serve(daemon: bool) -> Result<(), Box<dyn std::error::Error>> {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
-  let state = Arc::new(Mutex::new(PlaybackState::default()));
 
   let ipc_config = around_engine::ipc::IpcConfig::default();
 
@@ -617,10 +705,8 @@ fn cmd_serve(daemon: bool) -> Result<(), Box<dyn std::error::Error>> {
   let rt = tokio::runtime::Builder::new_current_thread()
     .enable_all()
     .build()?;
-  rt.block_on(around_engine::ipc::run_ipc_server(
-    ipc_config, engine, state,
-  ))
-  .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+  rt.block_on(around_engine::ipc::run_ipc_server(ipc_config, engine))
+    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
   Ok(())
 }
 

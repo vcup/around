@@ -4,9 +4,8 @@
 //! tokio's `net` feature (already enabled) includes named pipe support on Windows.
 
 use crate::ipc::codec::IpcCodec;
-use crate::ipc::types::PlaybackState;
 use crate::pipeline::Engine;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Create a named pipe server at `\\.\pipe\around`.
 pub(crate) async fn create_named_pipe(
@@ -22,7 +21,6 @@ pub(crate) async fn create_named_pipe(
 /// Accept loop for named pipe clients. Runs one connection at a time per pipe instance.
 pub(crate) async fn serve_pipe(
   engine: Arc<Engine>,
-  state: Arc<Mutex<PlaybackState>>,
   mut server: tokio::net::windows::named_pipe::NamedPipeServer,
   codec: impl IpcCodec + Clone + Send + 'static,
 ) {
@@ -37,7 +35,6 @@ pub(crate) async fn serve_pipe(
     }
 
     let eng = engine.clone();
-    let st = state.clone();
     let cdc = codec.clone();
 
     let next_pipe = match create_named_pipe().await {
@@ -48,7 +45,7 @@ pub(crate) async fn serve_pipe(
       }
     };
 
-    if let Err(e) = crate::ipc::connection::handle_connection(server, eng, st, cdc).await {
+    if let Err(e) = crate::ipc::connection::handle_connection(server, eng, cdc).await {
       tracing::error!(?e, "named pipe connection error");
     }
     server = next_pipe;

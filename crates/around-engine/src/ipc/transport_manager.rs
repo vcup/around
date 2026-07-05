@@ -2,13 +2,12 @@
 
 use crate::ipc::codec::IpcWire;
 use crate::ipc::config::IpcConfig;
-use crate::ipc::types::PlaybackState;
 use crate::pipeline::Engine;
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 
@@ -38,9 +37,10 @@ impl TransportManager {
       .unwrap_or_else(|| std::env::temp_dir().join("around.port"));
     #[cfg(unix)]
     let unix_socket = {
-      let (sp, _parent) = crate::ipc::transport_unix::resolve_socket_dir();
-      config.unix_socket_path.clone().unwrap_or(sp)
+      let (sp, _) = crate::ipc::transport_unix::resolve_socket_dir();
+      sp
     };
+
     Self {
       config,
       port_path,
@@ -60,42 +60,33 @@ impl TransportManager {
     if !self.config.check_running_instance {
       return Ok(());
     }
-    // 1. Check via configured TCP address.
-    if let Some(ref addr) = self.config.tcp_bind {
-      if tokio::net::TcpStream::connect(addr).await.is_ok() {
-        return Err(format!("engine already running on {}", addr).into());
-      }
-    }
-    // 2. Check via port file (ephemeral discovery).
-    if let Ok(port_str) = std::fs::read_to_string(&self.port_path) {
-      if let Ok(port) = port_str.trim().parse::<u16>() {
-        let addr = format!("127.0.0.1:{}", port);
-        if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-          return Err(format!("engine already running on port {}", port).into());
-        }
-      }
-      let _ = std::fs::remove_file(&self.port_path);
-    }
-    // 3. Check via Unix domain socket.
+
     #[cfg(unix)]
     {
-      if tokio::net::UnixStream::connect(&self.unix_socket)
-        .await
-        .is_ok()
-      {
-        return Err("another engine instance is already running (Unix socket in use)".into());
-      }
-      let _ = std::fs::remove_file(&self.unix_socket);
-    }
-    // 4. Check via Windows named pipe.
-    #[cfg(windows)]
-    {
-      use tokio::net::windows::named_pipe::ClientOptions;
-      let pipe_name = r"\\.\pipe\around";
-      if ClientOptions::new().open(pipe_name).is_ok() {
-        return Err("another engine instance is already running (named pipe in use)".into());
+      use tokio::net::UnixStream;
+      if UnixStream::connect(&self.unix_socket).await.is_ok() {
+        return Err("another engine instance is already running (unix socket)".into());
       }
     }
+
+    // TCP probe — try to read port file and connect.
+    if let Ok(port_str) = std::fs::read_to_string(&self.port_path) {
+      if let Ok(port) = port_str.trim().parse::<u16>() {
+        if TcpListener::bind(format!("127.0.0.1:{}", port))
+          .await
+          .is_err()
+        {
+          return Err(
+            "another engine instance is already running (port file exists and port is in use)"
+              .into(),
+          );
+        }
+        // Port file exists but port is free — stale port file from a crash.
+        // We'll overwrite it when we bind.
+        let _ = std::fs::remove_file(&self.port_path);
+      }
+    }
+
     Ok(())
   }
 
@@ -110,7 +101,6 @@ impl TransportManager {
   pub async fn start(
     &mut self,
     engine: Arc<Engine>,
-    state: Arc<Mutex<PlaybackState>>,
   ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut native_ok = false;
 
@@ -128,7 +118,6 @@ impl TransportManager {
           );
           native_ok = true;
           let eng = engine.clone();
-          let st = state.clone();
           let sp = self.unix_socket.clone();
           let force_json = self.config.force_json;
           let handle = tokio::spawn(async move {
@@ -138,7 +127,7 @@ impl TransportManager {
               Box::pin(async move { l.accept().await.map(|(s, _)| s) })
                 as Pin<Box<dyn Future<Output = io::Result<_>> + Send>>
             };
-            super::connection::serve(&eng, &st, IpcWire::select(force_json), accept).await;
+            super::connection::serve(&eng, IpcWire::select(force_json), accept).await;
             // FR-005: clean up socket file on exit.
             let _ = std::fs::remove_file(&sp);
           });
@@ -155,11 +144,9 @@ impl TransportManager {
             tracing::info!("IPC server listening on named pipe");
             native_ok = true;
             let eng = engine.clone();
-            let st = state.clone();
             let force_json = self.config.force_json;
             let handle = tokio::spawn(async move {
-              crate::ipc::transport_win::serve_pipe(eng, st, server, IpcWire::select(force_json))
-                .await;
+              crate::ipc::transport_win::serve_pipe(eng, server, IpcWire::select(force_json)).await;
             });
             self.handles.push(handle);
           }
@@ -194,7 +181,6 @@ impl TransportManager {
         tcp_listener.local_addr()?
       );
       let eng = engine.clone();
-      let st = state.clone();
       let pp = self.port_path.clone();
       let force_json = self.config.force_json;
       let handle = tokio::spawn(async move {
@@ -204,7 +190,7 @@ impl TransportManager {
           Box::pin(async move { l.accept().await.map(|(s, _)| s) })
             as Pin<Box<dyn Future<Output = io::Result<_>> + Send>>
         };
-        super::connection::serve(&eng, &st, IpcWire::select(force_json), accept).await;
+        super::connection::serve(&eng, IpcWire::select(force_json), accept).await;
         if needs_port_file {
           let _ = std::fs::remove_file(&pp);
         }
@@ -220,12 +206,10 @@ impl TransportManager {
       let udp_socket = UdpSocket::bind(addr).await?;
       tracing::info!("IPC server (UDP) listening on {}", udp_socket.local_addr()?);
       let eng = engine.clone();
-      let st = state.clone();
       let force_json = self.config.force_json;
       let handle = tokio::spawn(async move {
         crate::ipc::transport_udp::serve_udp(
           eng,
-          st,
           Arc::new(udp_socket),
           IpcWire::select(force_json),
         )

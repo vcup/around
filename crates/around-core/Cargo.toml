@@ -16,3 +16,4 @@ stabby-abi = { workspace = true, features = ["std", "test"] }
 parking_lot = { workspace = true }
 around-extensions = { workspace = true }
 around-extensions-macros = { workspace = true }
+serde = { workspace = true, features = ["derive"] }

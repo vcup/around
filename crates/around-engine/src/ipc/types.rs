@@ -1,18 +1,7 @@
 //! IPC types: shared between pipeline, IPC server, and CLI. Always compiled.
 
-use around_core::SampleSpec;
+pub use around_core::PlaybackStatus;
 use serde::{Deserialize, Serialize};
-
-/// Playback lifecycle states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TrackState {
-  Stopped,
-  Playing,
-  Paused,
-  Buffering,
-  Error,
-}
 
 /// Response status — binary outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,65 +22,48 @@ pub enum ErrorCode {
   CodecLoadFailed,
 }
 
-impl std::fmt::Display for TrackState {
-  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-    match self {
-      TrackState::Stopped => write!(f, "stopped"),
-      TrackState::Playing => write!(f, "playing"),
-      TrackState::Paused => write!(f, "paused"),
-      TrackState::Buffering => write!(f, "buffering"),
-      TrackState::Error => write!(f, "error"),
-    }
-  }
-}
-
-/// Shared playback state, updated by command handlers and readable via `status`.
-// Manual Default: state defaults to "stopped"
-impl Default for PlaybackState {
-  fn default() -> Self {
-    Self {
-      playing: false,
-      position_ms: 0,
-      duration_ms: None,
-      track_path: None,
-      format_name: None,
-      output_format: None,
-      seekable: false,
-      device_lost: false,
-      epoch: 0,
-      state: TrackState::Stopped,
-    }
-  }
-}
-
-#[derive(Debug, Clone)]
-pub struct PlaybackState {
-  pub playing: bool,
+/// Per-stream status snapshot for IPC responses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamStatus {
+  pub stream_id: u64,
+  pub status: PlaybackStatus,
   pub position_ms: u64,
-  pub duration_ms: Option<u64>,
-  pub track_path: Option<String>,
-  pub format_name: Option<String>,
-  pub output_format: Option<SampleSpec>,
   pub seekable: bool,
   pub device_lost: bool,
-  pub epoch: u64,
-  pub state: TrackState,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub track: Option<TrackInfo>,
 }
 
 /// Incoming IPC command, tagged by the `command` field in JSON.
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "command", rename_all = "snake_case")]
 pub enum IpcCommand {
   Play {
     path: String,
+    #[serde(default)]
+    stream_id: Option<u64>,
   },
-  Pause,
-  Resume,
+  Pause {
+    #[serde(default)]
+    stream_id: Option<u64>,
+  },
+  Resume {
+    #[serde(default)]
+    stream_id: Option<u64>,
+  },
   Seek {
     position_ms: u64,
+    #[serde(default)]
+    stream_id: Option<u64>,
   },
-  Stop,
-  Status,
+  Stop {
+    #[serde(default)]
+    stream_id: Option<u64>,
+  },
+  Status {
+    #[serde(default)]
+    stream_id: Option<u64>,
+  },
   ListCodecs,
   LoadCodec {
     path: String,
@@ -126,8 +98,19 @@ pub struct CodecDescriptor {
 
 /// Deserialize a base64 string into `Vec<u8>`.
 fn deser_base64_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
-  let s = String::deserialize(d)?;
-  base64_decode(&s).map_err(serde::de::Error::custom)
+  struct Base64Visitor;
+  impl<'de> serde::de::Visitor<'de> for Base64Visitor {
+    type Value = Vec<u8>;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+      write!(f, "a base64-encoded string")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Vec<u8>, E> {
+      base64_decode(v).map_err(serde::de::Error::custom)
+    }
+  }
+  d.deserialize_str(Base64Visitor)
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
@@ -160,7 +143,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 pub struct IpcResponse {
   pub status: ResponseStatus,
   #[serde(skip_serializing_if = "Option::is_none")]
-  pub state: Option<TrackState>,
+  pub state: Option<PlaybackStatus>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub position_ms: Option<u64>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -177,6 +160,12 @@ pub struct IpcResponse {
   pub device_lost: Option<bool>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub removed_files: Option<Vec<String>>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub stream_id: Option<u64>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub seekable: Option<bool>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub streams: Option<Vec<StreamStatus>>,
 }
 
 impl IpcResponse {
@@ -190,8 +179,11 @@ impl IpcResponse {
       track_id: None,
       track: None,
       codecs: None,
-      removed_files: None,
       device_lost: None,
+      removed_files: None,
+      stream_id: None,
+      seekable: None,
+      streams: None,
     }
   }
 
@@ -205,8 +197,11 @@ impl IpcResponse {
       track_id: None,
       track: None,
       codecs: None,
-      removed_files: None,
       device_lost: None,
+      removed_files: None,
+      stream_id: None,
+      seekable: None,
+      streams: None,
     }
   }
 }

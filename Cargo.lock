@@ -138,6 +138,7 @@ dependencies = [
  "around-extensions-macros",
  "bitflags 2.12.1",
  "parking_lot",
+ "serde",
  "stabby",
  "stabby-abi",
 ]

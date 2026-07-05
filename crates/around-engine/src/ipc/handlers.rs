@@ -1,176 +1,215 @@
 // Clippy: Mutex poisoning panics are intentional — they indicate unrecoverable bugs.
 #![allow(clippy::expect_used)]
-use crate::ipc::types::{
-  CodecDescriptor, ErrorCode, IpcResponse, PlaybackState, TrackInfo, TrackState,
-};
+use crate::ipc::types::{CodecDescriptor, ErrorCode, IpcResponse, StreamStatus, TrackInfo};
 use crate::pipeline::Engine;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+/// Resolve an optional stream_id to a concrete stream ID.
+/// If None, uses the sole active stream. Returns an error response if no stream found.
+fn resolve_stream_id(engine: &Arc<Engine>, stream_id: Option<u64>) -> Result<u64, IpcResponse> {
+  match stream_id {
+    Some(id) => Ok(id),
+    None => engine
+      .sole_stream_id()
+      .ok_or_else(|| IpcResponse::error(ErrorCode::NoTrack, "no active stream")),
+  }
+}
 
 pub(crate) fn handle_play(
   engine: &Arc<Engine>,
-  state: &Arc<Mutex<PlaybackState>>,
   path: String,
+  _stream_id: Option<u64>,
 ) -> IpcResponse {
   // Fast-fail: check file existence synchronously per IPC contract.
   if std::fs::metadata(&path).is_err() {
     return IpcResponse::error(ErrorCode::FileNotFound, &format!("No such file: {}", path));
   }
 
-  // Update state before spawning — the background task will refine it on
-  // completion (or failure).
-  // FR-009: VLC-style replace — stop any active playback before starting new.
-  engine.stop();
-  let epoch = {
-    let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-    st.epoch += 1;
-    st.track_path = Some(path.clone());
-    st.playing = true;
-    st.state = TrackState::Buffering;
-    st.format_name = None; // engine.play() will populate on successful codec open
-    st.device_lost = false;
-    st.duration_ms = None;
-    st.epoch
+  // Prepare the source — opens codec, creates stream, returns metadata.
+  let source = around_source_file::FileSource::new(PathBuf::from(&path));
+  let prepared = match engine.prepare(Box::new(source)) {
+    Ok(p) => p,
+    Err(e) => {
+      return IpcResponse::error(ErrorCode::CodecLoadFailed, &e.to_string());
+    }
   };
 
-  // Offload the blocking `engine.play()` call via spawn_blocking so the
-  // async runtime stays responsive.  Playback runs to completion in the
-  // background; the IPC client gets an immediate response.
-  //
-  // The engine.play() call now receives the shared state and updates
-  // position/state in real-time — no need for post-completion stitching.
-  let eng = engine.clone();
-  let st_play = Arc::clone(state);
-  let st_err = Arc::clone(state);
-  let path_bg = path;
-  tokio::spawn(async move {
-    let result = tokio::task::spawn_blocking(move || {
-      let source = around_source_file::FileSource::new(PathBuf::from(&path_bg));
-      eng.play(Box::new(source), st_play)
-    })
-    .await;
+  let stream_id = prepared.stream_id;
 
-    match result {
-      Ok(Ok(_handle)) => {
-        // State is already updated to "stopped" by engine.play() on exit.
-        tracing::info!("playback finished");
-      }
-      Ok(Err(e)) => {
-        tracing::error!(?e, "playback error");
-        if let Ok(mut st) = st_err.lock() {
-          if st.epoch == epoch {
-            st.state = TrackState::Error;
-            st.playing = false;
-          }
-        }
-      }
-      Err(_) => {
-        tracing::error!("playback task panicked");
-        if let Ok(mut st) = st_err.lock() {
-          if st.epoch == epoch {
-            st.state = TrackState::Error;
-            st.playing = false;
-          }
-        }
-      }
+  // Spawn the blocking decode loop in the background.
+  let eng = engine.clone();
+  tokio::spawn(async move {
+    if let Err(e) = eng.run_stream(stream_id) {
+      tracing::error!(?e, "playback error");
     }
   });
 
   let mut resp = IpcResponse::ok();
-  resp.track_id = Some(1);
-  resp.state = Some(TrackState::Buffering);
+  resp.stream_id = Some(stream_id);
+  resp.track_id = Some(stream_id);
+  resp.track = Some(TrackInfo {
+    id: stream_id,
+    path,
+    format: prepared.codec_name,
+    duration_ms: prepared.duration_ms.unwrap_or(0),
+  });
+  resp.seekable = Some(prepared.seekable);
   resp
 }
 
-pub(crate) fn handle_pause(engine: &Arc<Engine>, state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
-  let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-  if !st.playing {
-    return IpcResponse::error(ErrorCode::NoTrack, "no active playback to pause");
+pub(crate) fn handle_pause(engine: &Arc<Engine>, stream_id: Option<u64>) -> IpcResponse {
+  match resolve_stream_id(engine, stream_id) {
+    Ok(sid) => {
+      engine.pause_stream(sid);
+      let mut resp = IpcResponse::ok();
+      if let Some(ss) = engine.stream_state(sid) {
+        resp.position_ms = Some(ss.position_ms.load(std::sync::atomic::Ordering::SeqCst));
+      }
+      resp
+    }
+    Err(resp) => resp,
   }
-  engine.pause();
-  st.state = TrackState::Paused;
-  let mut resp = IpcResponse::ok();
-  resp.state = Some(TrackState::Paused);
-  resp.position_ms = Some(st.position_ms);
-  resp
 }
 
-pub(crate) fn handle_resume(
-  engine: &Arc<Engine>,
-  state: &Arc<Mutex<PlaybackState>>,
-) -> IpcResponse {
-  let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-  if !st.playing {
-    return IpcResponse::error(ErrorCode::NoTrack, "no active playback to resume");
+pub(crate) fn handle_resume(engine: &Arc<Engine>, stream_id: Option<u64>) -> IpcResponse {
+  match resolve_stream_id(engine, stream_id) {
+    Ok(sid) => {
+      engine.resume_stream(sid);
+      let mut resp = IpcResponse::ok();
+      if let Some(ss) = engine.stream_state(sid) {
+        resp.position_ms = Some(ss.position_ms.load(std::sync::atomic::Ordering::SeqCst));
+      }
+      resp
+    }
+    Err(resp) => resp,
   }
-  engine.resume();
-  st.state = TrackState::Playing;
-  let mut resp = IpcResponse::ok();
-  resp.state = Some(TrackState::Playing);
-  resp.position_ms = Some(st.position_ms);
-  resp
 }
 
 pub(crate) fn handle_seek(
   engine: &Arc<Engine>,
-  state: &Arc<Mutex<PlaybackState>>,
   position_ms: u64,
+  stream_id: Option<u64>,
 ) -> IpcResponse {
-  let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-  if !st.playing {
-    return IpcResponse::error(ErrorCode::NoTrack, "no active playback to seek");
-  }
-  if !st.seekable {
-    return IpcResponse::error(
-      ErrorCode::NotSupported,
-      "current source does not support seeking",
-    );
-  }
+  let sid = match resolve_stream_id(engine, stream_id) {
+    Ok(id) => id,
+    Err(resp) => return resp,
+  };
 
-  if let Some(dur) = st.duration_ms {
-    if position_ms > dur {
-      return IpcResponse::error(
-        ErrorCode::InvalidPosition,
-        "seek position exceeds track duration",
-      );
+  match engine.seek_stream(sid, position_ms) {
+    Ok(pos) => {
+      let mut resp = IpcResponse::ok();
+      resp.position_ms = Some(pos);
+      resp
+    }
+    Err(e) => {
+      let (code, msg) = match e {
+        crate::pipeline::SeekError::StreamNotFound => (ErrorCode::NoTrack, "stream not found"),
+        crate::pipeline::SeekError::NotSeekable => (
+          ErrorCode::NotSupported,
+          "current source does not support seeking",
+        ),
+        crate::pipeline::SeekError::StreamEnded => (
+          ErrorCode::InvalidPosition,
+          "seek position exceeds track duration or stream ended",
+        ),
+      };
+      IpcResponse::error(code, msg)
     }
   }
-
-  engine.seek(position_ms);
-  st.position_ms = position_ms;
-  st.state = TrackState::Buffering;
-  let mut resp = IpcResponse::ok();
-  resp.position_ms = Some(position_ms);
-  resp
 }
 
-pub(crate) fn handle_stop(engine: &Arc<Engine>, state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
-  engine.stop();
-  let mut st = state.lock().expect("state lock poisoned");
-  st.playing = false;
-  st.state = TrackState::Stopped;
-  let mut resp = IpcResponse::ok();
-  resp.state = Some(TrackState::Stopped);
-  resp.position_ms = Some(st.position_ms);
-  resp
-}
-
-pub(crate) fn handle_status(state: &Arc<Mutex<PlaybackState>>) -> IpcResponse {
-  let st = state.lock().expect("state lock poisoned");
-  let mut resp = IpcResponse::ok();
-  resp.state = Some(st.state);
-  resp.position_ms = Some(st.position_ms);
-  resp.track_id = Some(1);
-
-  if let Some(ref path) = st.track_path {
-    resp.track = Some(TrackInfo {
-      id: 1,
-      path: path.clone(),
-      format: st.format_name.clone().unwrap_or_else(|| "unknown".into()),
-      duration_ms: st.duration_ms.unwrap_or(0),
-    });
+pub(crate) fn handle_stop(engine: &Arc<Engine>, stream_id: Option<u64>) -> IpcResponse {
+  match stream_id {
+    Some(sid) => {
+      engine.stop_stream(Some(sid));
+      IpcResponse::ok()
+    }
+    None => {
+      engine.stop();
+      IpcResponse::ok()
+    }
   }
-  resp.device_lost = Some(st.device_lost);
+}
+
+pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> IpcResponse {
+  let mut resp = IpcResponse::ok();
+
+  match stream_id {
+    Some(sid) => {
+      // Single-stream status
+      if let Some(ss) = engine.stream_state(sid) {
+        resp.state = Some(ss.status());
+        resp.position_ms = Some(ss.position_ms.load(std::sync::atomic::Ordering::SeqCst));
+        resp.stream_id = Some(sid);
+        resp.device_lost = Some(ss.device_lost.load(std::sync::atomic::Ordering::SeqCst));
+        let path = engine.stream_source_path(sid);
+        let codec = engine.stream_codec_name(sid);
+        let duration = engine.stream_duration_ms(sid);
+        let s = engine.stream_seekable(sid);
+        resp.seekable = s;
+        if let Some(p) = path {
+          resp.track = Some(TrackInfo {
+            id: sid,
+            path: p,
+            format: codec.unwrap_or_else(|| "unknown".into()),
+            duration_ms: duration.unwrap_or(0),
+          });
+        }
+      } else {
+        return IpcResponse::error(ErrorCode::NoTrack, "stream not found");
+      }
+    }
+    None => {
+      // All-streams status
+      let ids = engine.stream_ids();
+      let mut streams: Vec<StreamStatus> = Vec::new();
+      for &id in &ids {
+        if let Some(ss) = engine.stream_state(id) {
+          let seekable = engine.stream_seekable(id).unwrap_or(false);
+          let path = engine.stream_source_path(id);
+          let codec = engine.stream_codec_name(id);
+          let duration = engine.stream_duration_ms(id);
+          streams.push(StreamStatus {
+            stream_id: id,
+            status: ss.status(),
+            position_ms: ss.position_ms.load(std::sync::atomic::Ordering::SeqCst),
+            seekable,
+            device_lost: ss.device_lost.load(std::sync::atomic::Ordering::SeqCst),
+            track: path.map(|p| TrackInfo {
+              id,
+              path: p,
+              format: codec.unwrap_or_else(|| "unknown".into()),
+              duration_ms: duration.unwrap_or(0),
+            }),
+          });
+        }
+      }
+      resp.streams = Some(streams);
+
+      // Backward compat: populate legacy flat fields from sole stream.
+      if let Some(sole) = engine.sole_stream_id() {
+        if let Some(ss) = engine.stream_state(sole) {
+          resp.state = Some(ss.status());
+          resp.position_ms = Some(ss.position_ms.load(std::sync::atomic::Ordering::SeqCst));
+          resp.stream_id = Some(sole);
+          resp.device_lost = Some(ss.device_lost.load(std::sync::atomic::Ordering::SeqCst));
+          resp.seekable = engine.stream_seekable(sole);
+          let path = engine.stream_source_path(sole);
+          let codec = engine.stream_codec_name(sole);
+          let duration = engine.stream_duration_ms(sole);
+          if let Some(p) = path {
+            resp.track = Some(TrackInfo {
+              id: sole,
+              path: p,
+              format: codec.unwrap_or_else(|| "unknown".into()),
+              duration_ms: duration.unwrap_or(0),
+            });
+          }
+        }
+      }
+    }
+  }
 
   resp
 }

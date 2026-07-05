@@ -4,12 +4,12 @@
 //! independent state via all-Atomic `StreamState` and `CancellationToken`.
 
 use crate::filter_chain::FilterChain;
-use crate::ipc::types::{PlaybackState, TrackState};
 use crate::output::create_output;
 use around_core::codec::{init_codec, CodecDyn, CodecRegister, DynCodecRef, StreamInfo};
 use around_core::state::PlaybackStatus;
 use around_core::{AroundError, SampleSpec, Source, SourceCapabilities};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use crossbeam::channel;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -77,11 +77,66 @@ impl Default for StreamState {
 // Stream handle (stored in Engine)
 // ---------------------------------------------------------------------------
 
+/// Wrapper for an opaque codec stream pointer that is Send + Sync.
+/// The pointer is only accessed through the codec vtable dispatch,
+/// which is thread-safe per stabby's design.
+#[derive(Clone, Copy)]
+struct StreamPtr(*mut c_void);
+unsafe impl Send for StreamPtr {}
+unsafe impl Sync for StreamPtr {}
+
 struct ActiveStream {
   id: StreamId,
   state: Arc<StreamState>,
   cancel: CancellationToken,
+  stream_ptr: Option<StreamPtr>,
+  codec_handle: Option<CodecHandle>,
+  sample_rate: u64,
+  channels: u8,
+  total_frames: u64,
+  source_path: String,
+  codec_name: String,
+  duration_ms: Option<u64>,
+  seekable: bool,
+  output_format: SampleSpec,
+  seek_tx: Option<channel::Sender<u64>>,
+  seek_rx: Option<channel::Receiver<u64>>,
 }
+
+// ---------------------------------------------------------------------------
+// PreparedStream — returned by Engine::prepare()
+// ---------------------------------------------------------------------------
+
+pub struct PreparedStream {
+  pub stream_id: StreamId,
+  pub codec_name: String,
+  pub duration_ms: Option<u64>,
+  pub seekable: bool,
+  pub output_format: SampleSpec,
+}
+
+// ---------------------------------------------------------------------------
+// SeekError — returned by Engine::seek_stream()
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeekError {
+  StreamNotFound,
+  NotSeekable,
+  StreamEnded,
+}
+
+impl std::fmt::Display for SeekError {
+  fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    match self {
+      SeekError::StreamNotFound => write!(f, "stream not found"),
+      SeekError::NotSeekable => write!(f, "stream is not seekable"),
+      SeekError::StreamEnded => write!(f, "stream has ended"),
+    }
+  }
+}
+
+impl std::error::Error for SeekError {}
 
 // ---------------------------------------------------------------------------
 // Engine
@@ -97,6 +152,9 @@ pub struct Engine {
 pub struct PlaybackHandle {
   pub output_format: SampleSpec,
   pub stream_id: StreamId,
+  pub codec_name: String,
+  pub duration_ms: Option<u64>,
+  pub seekable: bool,
 }
 
 impl PlaybackHandle {
@@ -140,6 +198,12 @@ struct CodecHandle {
   codec_data: *mut (),
 }
 
+// SAFETY: CodecHandle references a codec from the global registry (process
+// lifetime). The vtable is never mutated; the codec_data is accessed only
+// through the vtable's dispatch, which is thread-safe per stabby design.
+unsafe impl Send for CodecHandle {}
+unsafe impl Sync for CodecHandle {}
+
 impl CodecHandle {
   /// Call `Codec::read` through the vtable.
   unsafe fn read(&self, stream: *mut c_void, buf: *mut f32, buf_len: usize) -> i32 {
@@ -170,6 +234,16 @@ impl CodecHandle {
     unsafe { name_fn(self.codec_data as *const ()) }
   }
 
+  /// Call `Codec::seek` through the vtable.
+  /// `frame` is the 0-based frame index. Returns new position or negative on error.
+  unsafe fn seek(&self, stream: *mut c_void, frame: u64) -> i64 {
+    // seek is the 5th method (after probe, name, open, read).
+    type SeekMethod = unsafe extern "C" fn(*const (), *mut c_void, u64) -> i64;
+    let vtable = self.vtable as *const SeekMethod;
+    let seek_fn = unsafe { *vtable.add(4) };
+    unsafe { seek_fn(self.codec_data as *const (), stream, frame) }
+  }
+
   /// Create a non-owning DynCodecRef view for calling trait methods
   /// through the CodecDyn trait (probe, open).
   fn as_ref(&self) -> ManuallyDrop<DynCodecRef> {
@@ -192,13 +266,9 @@ impl Engine {
     }
   }
 
-  /// Play a source. Blocks until playback completes or stop is signaled.
-  /// Handles pause/resume internally. Returns stream_id.
-  pub fn play(
-    &self,
-    source: Box<dyn Source>,
-    state: Arc<std::sync::Mutex<PlaybackState>>,
-  ) -> Result<PlaybackHandle, AroundError> {
+  /// Prepare a source for playback. Opens the codec, creates a stream,
+  /// and returns metadata without starting the decode loop.
+  pub fn prepare(&self, source: Box<dyn Source>) -> Result<PreparedStream, AroundError> {
     let seekable = source.capabilities().contains(SourceCapabilities::SEEKABLE);
     let (stream_ptr, info, codec_handle) = Self::open_codec(source.as_ref(), seekable)?;
     let codec_name = unsafe {
@@ -218,16 +288,15 @@ impl Engine {
     let channels = info.channels;
     let total_frames = info.total_frames;
 
-    let output_format = SampleSpec::interleaved(sample_rate as u32, channels, 16).map_err(|e| {
-      AroundError::DecodeError {
-        message: format!("invalid stream spec: {}", e),
+    let output_format = match SampleSpec::interleaved(sample_rate as u32, channels, 16) {
+      Ok(fmt) => fmt,
+      Err(e) => {
+        unsafe { codec_handle.destroy(stream_ptr) };
+        return Err(AroundError::DecodeError {
+          message: format!("invalid stream spec: {}", e),
+        });
       }
-    })?;
-
-    // Build filter chain (empty = passthrough; filters added per user config).
-    let decode_spec =
-      SampleSpec::interleaved(sample_rate as u32, channels, 16).unwrap_or(output_format);
-    let mut filter_chain = FilterChain::build(decode_spec, vec![], output_format);
+    };
 
     let duration_ms = if total_frames > 0 {
       Some((total_frames as u128 * 1000 / sample_rate as u128) as u64)
@@ -236,34 +305,101 @@ impl Engine {
     };
 
     let stream_id = next_stream_id();
+    let source_path = source.identifier();
     let stream_state = Arc::new(StreamState::new());
     stream_state.set_status(PlaybackStatus::Buffering);
     stream_state.active.store(true, Ordering::SeqCst);
     stream_state.position_ms.store(0, Ordering::SeqCst);
 
     let cancel = self.shutdown_token.child_token();
+    let (seek_tx, seek_rx) = channel::unbounded();
 
-    // Store the stream.
     let active = ActiveStream {
       id: stream_id,
       state: Arc::clone(&stream_state),
       cancel: cancel.clone(),
+      stream_ptr: Some(StreamPtr(stream_ptr)),
+      codec_handle: Some(codec_handle),
+      sample_rate,
+      channels,
+      total_frames,
+      source_path,
+      codec_name: codec_name.clone(),
+      duration_ms,
+      seekable,
+      output_format,
+      seek_tx: Some(seek_tx),
+      seek_rx: Some(seek_rx),
     };
     self.streams.write().insert(stream_id, active);
 
-    // Update shared IPC state.
-    let epoch = {
-      let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-      st.playing = true;
-      st.position_ms = 0;
-      st.output_format = Some(output_format);
-      st.format_name = Some(codec_name.clone());
-      st.seekable = seekable;
-      st.duration_ms = duration_ms;
-      st.state = TrackState::Buffering;
-      st.epoch += 1;
-      st.epoch
+    Ok(PreparedStream {
+      stream_id,
+      codec_name,
+      duration_ms,
+      seekable,
+      output_format,
+    })
+  }
+
+  /// Run the decode loop for a prepared stream. Blocks until playback
+  /// completes, is stopped, or hits a fatal error.
+  /// On exit: sets status Stopped, active false, removes stream from map.
+  pub fn run_stream(&self, id: StreamId) -> Result<(), AroundError> {
+    // Take ownership of decode resources from the stream map.
+    let (
+      stream_ptr,
+      codec_handle,
+      seek_rx,
+      sample_rate,
+      channels,
+      _total_frames,
+      output_format,
+      _source_path,
+      codec_name,
+      _duration_ms,
+      _seekable,
+      stream_state,
+      cancel,
+    ) = {
+      let mut streams = self.streams.write();
+      let s = streams.get_mut(&id).ok_or_else(|| AroundError::Internal {
+        message: format!("run_stream: stream {} not found", id),
+      })?;
+      let StreamPtr(stream_ptr) = s.stream_ptr.take().ok_or_else(|| AroundError::Internal {
+        message: format!("run_stream: stream {} resources already consumed", id),
+      })?;
+      let codec_handle = s.codec_handle.take().ok_or_else(|| AroundError::Internal {
+        message: format!("run_stream: stream {} codec already consumed", id),
+      })?;
+      let seek_rx = s.seek_rx.take();
+      let _source_path = s.source_path.clone();
+      let codec_name = s.codec_name.clone();
+      let _duration_ms = s.duration_ms;
+      let _seekable = s.seekable;
+      let stream_state = s.state.clone();
+      let cancel = s.cancel.clone();
+      (
+        stream_ptr,
+        codec_handle,
+        seek_rx,
+        s.sample_rate,
+        s.channels,
+        s.total_frames,
+        s.output_format,
+        _source_path,
+        codec_name,
+        _duration_ms,
+        _seekable,
+        stream_state,
+        cancel,
+      )
     };
+
+    // Build filter chain (empty = passthrough; filters added per user config).
+    let decode_spec =
+      SampleSpec::interleaved(sample_rate as u32, channels, 16).unwrap_or(output_format);
+    let mut filter_chain = FilterChain::build(decode_spec, vec![], output_format);
 
     // --- Audio output setup (ringbuf) ---
     let (mut producer, consumer) = create_output(16384);
@@ -309,37 +445,29 @@ impl Engine {
     cpal_stream.play().map_err(|e| AroundError::Internal {
       message: format!("failed to start audio output stream: {}", e),
     })?;
-    // --- Decode loop (blocking) ---
-    let _span = tracing::info_span!("playback", stream_id).entered();
-    tracing::info!(stream_id, codec = codec_name, "starting playback");
 
-    {
-      let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-      st.state = TrackState::Playing;
-    }
+    // --- Decode loop (blocking) ---
+    let _span = tracing::info_span!("playback", id).entered();
+    tracing::info!(id, codec = codec_name, "starting playback");
+    stream_state.set_status(PlaybackStatus::Playing);
 
     let max_ch = output_format.channels.max(1) as usize;
     let mut buf = vec![0.0f32; 4096 * max_ch];
-    let mut total_frames: u64 = 0;
+    let mut total_frames_decoded: u64 = 0;
     let mut consecutive_errors = 0u32;
-
-    stream_state.set_status(PlaybackStatus::Playing);
+    let mut decode_error: Option<AroundError> = None;
 
     loop {
       // Check cancellation.
       if cancel.is_cancelled() {
-        tracing::debug!(stream_id, "stream cancelled");
+        tracing::debug!(id, "stream cancelled");
         break;
       }
 
       if self.device_lost.load(Ordering::SeqCst) {
-        tracing::warn!(stream_id, "audio device lost");
+        tracing::warn!(id, "audio device lost");
         stream_state.set_status(PlaybackStatus::Error);
         stream_state.device_lost.store(true, Ordering::SeqCst);
-        {
-          let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-          st.device_lost = true;
-        }
         if self.config.output_auto_reconnect {
           self.device_lost.store(false, Ordering::SeqCst);
           continue;
@@ -354,61 +482,97 @@ impl Engine {
         continue;
       }
 
+      // Check for seek commands received via crossbeam channel.
+      if let Some(rx) = &seek_rx {
+        while let Ok(position_ms) = rx.try_recv() {
+          let frame = (position_ms as u128 * sample_rate as u128 / 1000) as u64;
+          match unsafe { codec_handle.seek(stream_ptr, frame) } {
+            new_pos if new_pos >= 0 => {
+              total_frames_decoded = new_pos as u64;
+              let pos = total_frames_decoded * 1000 / sample_rate;
+              stream_state.position_ms.store(pos, Ordering::Relaxed);
+              stream_state.set_status(PlaybackStatus::Playing);
+              tracing::debug!(id, position_ms, "seek completed");
+            }
+            _ => {
+              tracing::warn!(id, position_ms, "seek returned error");
+            }
+          }
+        }
+      }
+
       let n = unsafe { codec_handle.read(stream_ptr, buf.as_mut_ptr(), buf.len()) };
       if n > 0 {
         let sample_count = n as usize;
-        // Run through filter chain (currently passthrough; filters added per user config).
         let processed = filter_chain.process(&mut buf[..sample_count], channels);
         producer.push_slice(&buf[..processed]);
-        total_frames += (n as u64) / channels as u64;
+        total_frames_decoded += (n as u64) / channels as u64;
         consecutive_errors = 0;
-        let pos = total_frames * 1000 / sample_rate;
-        stream_state.position_ms.store(pos, Ordering::SeqCst);
-        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-        st.position_ms = pos;
+        let pos = total_frames_decoded * 1000 / sample_rate;
+        stream_state.position_ms.store(pos, Ordering::Relaxed);
       } else if n == 0 {
         break; // EOF
       } else {
         consecutive_errors += 1;
-        tracing::warn!(stream_id, n, consecutive_errors, "decode error");
+        tracing::warn!(id, n, consecutive_errors, "decode error");
         if consecutive_errors >= 3 {
           stream_state.set_status(PlaybackStatus::Error);
-          {
-            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-            if st.epoch == epoch {
-              st.state = TrackState::Error;
-              st.playing = false;
-            }
-          }
-          unsafe { codec_handle.destroy(stream_ptr) };
-          return Err(AroundError::DecodeError {
+          decode_error = Some(AroundError::DecodeError {
             message: format!("decode error: code {}", n),
           });
+          break; // fall through to common cleanup
         }
       }
     }
 
-    tracing::info!(stream_id, total_frames, "playback complete");
-    stream_state.set_status(PlaybackStatus::Stopped);
+    tracing::info!(id, total_frames = total_frames_decoded, "playback complete");
+    // Only overwrite Error status with Stopped if we exited normally
+    // (EOF, cancel, device-lost) — not on decode error.
+    if decode_error.is_none() {
+      stream_state.set_status(PlaybackStatus::Stopped);
+    }
     stream_state.active.store(false, Ordering::SeqCst);
     unsafe { codec_handle.destroy(stream_ptr) };
 
-    {
-      let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-      if st.epoch == epoch {
-        st.state = TrackState::Stopped;
-        st.playing = false;
-        st.position_ms = total_frames * 1000 / sample_rate;
+    // Cleanup stream from engine.
+    self.streams.write().remove(&id);
+
+    if let Some(err) = decode_error {
+      Err(err)
+    } else {
+      Ok(())
+    }
+  }
+
+  /// Seek a running stream to an absolute position in milliseconds.
+  /// Returns the requested position on success, or a SeekError.
+  ///
+  /// The seek is applied asynchronously via a channel to the decode loop.
+  /// The returned Ok acknowledges the request was queued; the actual seek
+  /// may complete one decode iteration later (best-effort).
+  pub fn seek_stream(&self, id: StreamId, position_ms: u64) -> Result<u64, SeekError> {
+    let streams = self.streams.read();
+    let s = streams.get(&id).ok_or(SeekError::StreamNotFound)?;
+    if !s.seekable {
+      return Err(SeekError::NotSeekable);
+    }
+    // Validate position against known duration if available.
+    if let Some(dur) = s.duration_ms {
+      if position_ms > dur {
+        return Err(SeekError::StreamEnded);
       }
     }
-
-    // Cleanup stream from engine.
-    self.streams.write().remove(&stream_id);
-
-    Ok(PlaybackHandle {
-      output_format,
-      stream_id,
-    })
+    let st = s.state.status();
+    if st == PlaybackStatus::Stopped || st == PlaybackStatus::Error {
+      return Err(SeekError::StreamEnded);
+    }
+    if let Some(tx) = &s.seek_tx {
+      tx.send(position_ms).map_err(|_| SeekError::StreamEnded)?;
+      s.state.set_status(PlaybackStatus::Buffering);
+      Ok(position_ms)
+    } else {
+      Err(SeekError::StreamEnded)
+    }
   }
 
   /// Stop a specific stream by ID, or all streams if id is None.
@@ -453,6 +617,26 @@ impl Engine {
   /// List all stream IDs.
   pub fn stream_ids(&self) -> Vec<StreamId> {
     self.streams.read().keys().copied().collect()
+  }
+
+  /// Get the source path for a stream.
+  pub fn stream_source_path(&self, id: StreamId) -> Option<String> {
+    self.streams.read().get(&id).map(|s| s.source_path.clone())
+  }
+
+  /// Get the codec name for a stream.
+  pub fn stream_codec_name(&self, id: StreamId) -> Option<String> {
+    self.streams.read().get(&id).map(|s| s.codec_name.clone())
+  }
+
+  /// Get the duration in milliseconds for a stream.
+  pub fn stream_duration_ms(&self, id: StreamId) -> Option<u64> {
+    self.streams.read().get(&id).and_then(|s| s.duration_ms)
+  }
+
+  /// Get the seekable flag for a stream.
+  pub fn stream_seekable(&self, id: StreamId) -> Option<bool> {
+    self.streams.read().get(&id).map(|s| s.seekable)
   }
 
   /// Returns the sole active stream ID, or None.

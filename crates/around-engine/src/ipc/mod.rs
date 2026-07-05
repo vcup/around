@@ -9,10 +9,9 @@ pub(crate) mod codec_proto;
 pub(crate) mod config;
 pub(crate) mod connection;
 pub(crate) mod handlers;
-pub(crate) mod transport_manager;
+pub mod transport_manager;
 pub(crate) mod transport_udp;
-#[cfg(unix)]
-pub(crate) mod transport_unix;
+pub mod transport_unix;
 #[cfg(windows)]
 pub(crate) mod transport_win;
 
@@ -29,26 +28,25 @@ pub mod types;
 
 pub use self::config::IpcConfig;
 
-use self::types::{IpcCommand, IpcResponse, PlaybackState};
+use self::types::{IpcCommand, IpcResponse};
 use crate::pipeline::Engine;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 // ---------------------------------------------------------------------------
 // Command dispatch
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn handle_command(
-  cmd: IpcCommand,
-  engine: &Arc<Engine>,
-  state: &Arc<Mutex<PlaybackState>>,
-) -> IpcResponse {
+pub(crate) async fn handle_command(cmd: IpcCommand, engine: &Arc<Engine>) -> IpcResponse {
   use self::handlers::*;
   match cmd {
-    IpcCommand::Play { path } => handle_play(engine, state, path),
-    IpcCommand::Pause => handle_pause(engine, state),
-    IpcCommand::Resume => handle_resume(engine, state),
-    IpcCommand::Seek { position_ms } => handle_seek(engine, state, position_ms),
-    IpcCommand::Stop => handle_stop(engine, state),
-    IpcCommand::Status => handle_status(state),
+    IpcCommand::Play { path, stream_id } => handle_play(engine, path, stream_id),
+    IpcCommand::Pause { stream_id } => handle_pause(engine, stream_id),
+    IpcCommand::Resume { stream_id } => handle_resume(engine, stream_id),
+    IpcCommand::Seek {
+      position_ms,
+      stream_id,
+    } => handle_seek(engine, position_ms, stream_id),
+    IpcCommand::Stop { stream_id } => handle_stop(engine, stream_id),
+    IpcCommand::Status { stream_id } => handle_status(engine, stream_id),
     IpcCommand::ListCodecs => handle_list_codecs(),
     IpcCommand::LoadCodec { path } => handle_load_codec(&path),
     IpcCommand::LoadCodecBytes { data } => handle_load_codec_bytes(data),
@@ -63,7 +61,6 @@ pub(crate) async fn handle_command(
 pub async fn run_ipc_server(
   config: IpcConfig,
   engine: Arc<Engine>,
-  state: Arc<Mutex<PlaybackState>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   // Remove stale temp files from crashed previous instances before binding.
   for path in handlers::scan_and_remove_stale_temp_files() {
@@ -71,7 +68,7 @@ pub async fn run_ipc_server(
   }
   let mut manager = transport_manager::TransportManager::new(config);
   manager.check_running_instance().await?;
-  manager.start(engine, state).await?;
+  manager.start(engine).await?;
   manager.join().await;
   Ok(())
 }

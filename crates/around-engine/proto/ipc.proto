@@ -6,10 +6,10 @@ enum Status {
   STATUS_ERROR = 1;
 }
 
-enum TrackState {
-  STOPPED = 0;
-  PLAYING = 1;
-  PAUSED = 2;
+enum PlaybackStatus {
+  PLAYING = 0;
+  PAUSED = 1;
+  STOPPED = 2;
   BUFFERING = 3;
   ERROR = 4;
 }
@@ -39,21 +39,30 @@ message IpcCommand {
   }
 }
 
-message PlayCommand { string path = 1; }
-message PauseCommand {}
-message ResumeCommand {}
-message SeekCommand { uint64 position_ms = 1; }
-message StopCommand {}
-message StatusCommand {}
+message PlayCommand { string path = 1; optional uint64 stream_id = 12; }
+message PauseCommand { optional uint64 stream_id = 12; }
+message ResumeCommand { optional uint64 stream_id = 12; }
+message SeekCommand { uint64 position_ms = 1; optional uint64 stream_id = 12; }
+message StopCommand { optional uint64 stream_id = 12; }
+message StatusCommand { optional uint64 stream_id = 12; }
 message ListCodecsCommand {}
 message LoadCodecCommand { string path = 1; }
 message ShutdownCommand {}
 message LoadCodecBytesCommand { bytes data = 1; string name = 2; }
 message CleanupCommand {}
 
+message StreamStatus {
+  uint64 stream_id = 1;
+  PlaybackStatus status = 2;
+  uint64 position_ms = 3;
+  bool seekable = 4;
+  bool device_lost = 5;
+  optional TrackInfo track = 6;
+}
+
 message IpcResponse {
   Status status = 1;
-  optional TrackState state = 2;
+  optional PlaybackStatus state = 2;
   optional uint64 position_ms = 3;
   optional string code = 4;    // error code when status="error"
   optional string message = 5;
@@ -62,6 +71,9 @@ message IpcResponse {
   repeated CodecDescriptor codecs = 8;
   optional bool device_lost = 9;
   repeated string removed_files = 10;
+  optional uint64 stream_id = 11;
+  optional bool seekable = 12;
+  repeated StreamStatus streams = 13;
 }
 
 message TrackInfo {

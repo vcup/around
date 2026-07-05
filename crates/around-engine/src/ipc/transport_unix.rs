@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use tokio::net::UnixListener;
 
 /// Resolve the best available socket path.
-pub(crate) fn resolve_socket_dir() -> (PathBuf, Option<PathBuf>) {
+pub fn resolve_socket_dir() -> (PathBuf, Option<PathBuf>) {
   if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
     let parent = PathBuf::from(&dir).join("around");
     return (parent.join("around.sock"), Some(parent));

@@ -10,9 +10,7 @@ use tokio::io::BufReader;
 use tokio::net::UdpSocket;
 
 use crate::ipc::codec::IpcCodec;
-use crate::ipc::types::PlaybackState;
 use crate::Engine;
-
 /// Max UDP payload: 65507 = 65535 (IP) - 8 (UDP header) - 20 (IP header)
 const MAX_DATAGRAM: usize = 65507;
 /// Soft limit — datagrams above this trigger a warning (non-fragmented delivery not guaranteed)
@@ -32,14 +30,15 @@ impl DatagramReader {
 
 impl tokio::io::AsyncRead for DatagramReader {
   fn poll_read(
-    mut self: std::pin::Pin<&mut Self>,
+    self: std::pin::Pin<&mut Self>,
     _cx: &mut std::task::Context<'_>,
     buf: &mut tokio::io::ReadBuf<'_>,
   ) -> std::task::Poll<std::io::Result<()>> {
-    let remaining = &self.data[self.pos..];
-    let to_copy = remaining.len().min(buf.remaining());
-    buf.put_slice(&remaining[..to_copy]);
-    self.pos += to_copy;
+    let this = self.get_mut();
+    let remaining = this.data.len() - this.pos;
+    let to_read = std::cmp::min(remaining, buf.remaining());
+    buf.put_slice(&this.data[this.pos..this.pos + to_read]);
+    this.pos += to_read;
     std::task::Poll::Ready(Ok(()))
   }
 }
@@ -49,25 +48,25 @@ struct VecWriter<'a>(&'a mut Vec<u8>);
 
 impl<'a> tokio::io::AsyncWrite for VecWriter<'a> {
   fn poll_write(
-    mut self: std::pin::Pin<&mut Self>,
+    self: std::pin::Pin<&mut Self>,
     _cx: &mut std::task::Context<'_>,
     buf: &[u8],
-  ) -> std::task::Poll<std::io::Result<usize>> {
-    self.0.extend_from_slice(buf);
+  ) -> std::task::Poll<Result<usize, std::io::Error>> {
+    self.get_mut().0.extend_from_slice(buf);
     std::task::Poll::Ready(Ok(buf.len()))
   }
 
   fn poll_flush(
     self: std::pin::Pin<&mut Self>,
     _cx: &mut std::task::Context<'_>,
-  ) -> std::task::Poll<std::io::Result<()>> {
+  ) -> std::task::Poll<Result<(), std::io::Error>> {
     std::task::Poll::Ready(Ok(()))
   }
 
   fn poll_shutdown(
     self: std::pin::Pin<&mut Self>,
     _cx: &mut std::task::Context<'_>,
-  ) -> std::task::Poll<std::io::Result<()>> {
+  ) -> std::task::Poll<Result<(), std::io::Error>> {
     std::task::Poll::Ready(Ok(()))
   }
 }
@@ -76,7 +75,6 @@ impl<'a> tokio::io::AsyncWrite for VecWriter<'a> {
 /// Responses are sent to the sender's address.
 pub(crate) async fn serve_udp<C: IpcCodec + Clone>(
   engine: Arc<Engine>,
-  state: Arc<std::sync::Mutex<PlaybackState>>,
   socket: Arc<UdpSocket>,
   codec: C,
 ) {
@@ -115,7 +113,7 @@ pub(crate) async fn serve_udp<C: IpcCodec + Clone>(
       }
     };
 
-    let resp = crate::ipc::handle_command(cmd, &engine, &state).await;
+    let resp = crate::ipc::handle_command(cmd, &engine).await;
 
     let mut response_buf = Vec::new();
     {

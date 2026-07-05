@@ -8,8 +8,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use super::codec::IpcCodec;
 use super::proto;
-use crate::ipc::types::{self, IpcResponse};
-use crate::ipc::types::{ErrorCode, ResponseStatus, TrackState};
+use crate::ipc::types::{self, ErrorCode, IpcResponse, ResponseStatus};
 
 // ---------------------------------------------------------------------------
 // Conversion helpers — map between proto-generated types and hand-written types
@@ -18,14 +17,18 @@ use crate::ipc::types::{ErrorCode, ResponseStatus, TrackState};
 fn proto_command_to_ipc(c: proto::ipc_command::Command) -> std::io::Result<types::IpcCommand> {
   use proto::ipc_command::Command;
   match c {
-    Command::Play(p) => Ok(types::IpcCommand::Play { path: p.path }),
-    Command::Pause(_) => Ok(types::IpcCommand::Pause),
-    Command::Resume(_) => Ok(types::IpcCommand::Resume),
+    Command::Play(p) => Ok(types::IpcCommand::Play {
+      path: p.path,
+      stream_id: None,
+    }),
+    Command::Pause(_) => Ok(types::IpcCommand::Pause { stream_id: None }),
+    Command::Resume(_) => Ok(types::IpcCommand::Resume { stream_id: None }),
     Command::Seek(s) => Ok(types::IpcCommand::Seek {
       position_ms: s.position_ms,
+      stream_id: None,
     }),
-    Command::Stop(_) => Ok(types::IpcCommand::Stop),
-    Command::Status(_) => Ok(types::IpcCommand::Status),
+    Command::Stop(_) => Ok(types::IpcCommand::Stop { stream_id: None }),
+    Command::Status(_) => Ok(types::IpcCommand::Status { stream_id: None }),
     Command::ListCodecs(_) => Ok(types::IpcCommand::ListCodecs),
     Command::LoadCodec(d) => Ok(types::IpcCommand::LoadCodec { path: d.path }),
     Command::LoadCodecBytes(d) => Ok(types::IpcCommand::LoadCodecBytes { data: d.data }),
@@ -34,14 +37,28 @@ fn proto_command_to_ipc(c: proto::ipc_command::Command) -> std::io::Result<types
   }
 }
 
-fn track_state_to_proto(s: TrackState) -> i32 {
+fn playback_status_to_proto(s: types::PlaybackStatus) -> i32 {
   match s {
-    // proto TrackState enum values
-    TrackState::Stopped => 0,
-    TrackState::Playing => 1,
-    TrackState::Paused => 2,
-    TrackState::Buffering => 3,
-    TrackState::Error => 4,
+    types::PlaybackStatus::Playing => 0,
+    types::PlaybackStatus::Paused => 1,
+    types::PlaybackStatus::Stopped => 2,
+    types::PlaybackStatus::Buffering => 3,
+    types::PlaybackStatus::Error => 4,
+  }
+}
+
+#[allow(dead_code)]
+fn proto_playback_status_from_i32(v: i32) -> std::io::Result<types::PlaybackStatus> {
+  match v {
+    0 => Ok(types::PlaybackStatus::Playing),
+    1 => Ok(types::PlaybackStatus::Paused),
+    2 => Ok(types::PlaybackStatus::Stopped),
+    3 => Ok(types::PlaybackStatus::Buffering),
+    4 => Ok(types::PlaybackStatus::Error),
+    _ => Err(std::io::Error::new(
+      std::io::ErrorKind::InvalidData,
+      format!("unknown PlaybackStatus: {}", v),
+    )),
   }
 }
 
@@ -69,7 +86,7 @@ fn ipc_response_to_proto(resp: &IpcResponse) -> proto::IpcResponse {
       ResponseStatus::Ok => proto::Status::Ok,
       ResponseStatus::Error => proto::Status::Error,
     } as i32,
-    state: resp.state.map(track_state_to_proto),
+    state: resp.state.map(playback_status_to_proto),
     position_ms: resp.position_ms,
     code: resp.code.map(error_code_to_proto),
     message: resp.message.clone(),
@@ -96,6 +113,29 @@ fn ipc_response_to_proto(resp: &IpcResponse) -> proto::IpcResponse {
       .unwrap_or_default(),
     device_lost: resp.device_lost,
     removed_files: resp.removed_files.clone().unwrap_or_default(),
+    stream_id: resp.stream_id,
+    seekable: resp.seekable,
+    streams: resp
+      .streams
+      .as_ref()
+      .map(|ss| {
+        ss.iter()
+          .map(|s| proto::StreamStatus {
+            stream_id: s.stream_id,
+            status: playback_status_to_proto(s.status),
+            position_ms: s.position_ms,
+            seekable: s.seekable,
+            device_lost: s.device_lost,
+            track: s.track.as_ref().map(|t| proto::TrackInfo {
+              id: t.id,
+              path: t.path.clone(),
+              format: t.format.clone(),
+              duration_ms: t.duration_ms,
+            }),
+          })
+          .collect()
+      })
+      .unwrap_or_default(),
   }
 }
 

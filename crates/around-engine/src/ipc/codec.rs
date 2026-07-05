@@ -168,7 +168,7 @@ mod tests {
     let codec = JsonLineCodec;
     let mut reader = make_reader(b"{\"command\":\"status\"}\n");
     let cmd = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd, IpcCommand::Status));
+    assert!(matches!(cmd, IpcCommand::Status { .. }));
   }
 
   #[tokio::test]
@@ -176,7 +176,7 @@ mod tests {
     let codec = JsonLineCodec;
     let mut reader = make_reader(b"\n\n{\"command\":\"pause\"}\n");
     let cmd = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd, IpcCommand::Pause));
+    assert!(matches!(cmd, IpcCommand::Pause { .. }));
   }
 
   #[tokio::test]
@@ -184,7 +184,7 @@ mod tests {
     let codec = JsonLineCodec;
     let mut reader = make_reader(b"   \n{\"command\":\"resume\"}\n");
     let cmd = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd, IpcCommand::Resume));
+    assert!(matches!(cmd, IpcCommand::Resume { .. }));
   }
 
   #[tokio::test]
@@ -208,7 +208,7 @@ mod tests {
     let codec = JsonLineCodec;
     let mut reader = make_reader(b"{\"command\":\"status\"}");
     let cmd = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd, IpcCommand::Status));
+    assert!(matches!(cmd, IpcCommand::Status { .. }));
   }
 
   #[tokio::test]
@@ -232,7 +232,7 @@ mod tests {
     let codec = JsonLineCodec;
     let mut reader = make_reader(b"  {\"command\":\"stop\"}  \n");
     let cmd = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd, IpcCommand::Stop));
+    assert!(matches!(cmd, IpcCommand::Stop { .. }));
   }
 
   #[tokio::test]
@@ -240,7 +240,7 @@ mod tests {
     let codec = JsonLineCodec;
     let mut reader = make_reader(b"\t{\"command\":\"pause\"}\t\n");
     let cmd = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd, IpcCommand::Pause));
+    assert!(matches!(cmd, IpcCommand::Pause { .. }));
   }
 
   #[tokio::test]
@@ -249,10 +249,10 @@ mod tests {
     let mut reader = make_reader(b"{\"command\":\"stop\"}\n\n\n{\"command\":\"pause\"}\n");
 
     let cmd1 = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd1, IpcCommand::Stop));
+    assert!(matches!(cmd1, IpcCommand::Stop { .. }));
 
     let cmd2 = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd2, IpcCommand::Pause));
+    assert!(matches!(cmd2, IpcCommand::Pause { .. }));
   }
 
   #[tokio::test]
@@ -272,7 +272,7 @@ mod tests {
     data.extend_from_slice(b"{\"command\":\"stop\"}\n");
     let mut reader = make_reader(&data);
     let cmd = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd, IpcCommand::Stop));
+    assert!(matches!(cmd, IpcCommand::Stop { .. }));
   }
 
   #[tokio::test]
@@ -305,7 +305,7 @@ mod tests {
     let mut reader = make_reader(b"{\"command\":\"play\",\"path\":\"/tmp/test.wav\"}\n");
     let cmd = codec.read_command(&mut reader).await.unwrap();
     match cmd {
-      IpcCommand::Play { path } => assert_eq!(path, "/tmp/test.wav"),
+      IpcCommand::Play { path, .. } => assert_eq!(path, "/tmp/test.wav"),
       _ => panic!("expected Play"),
     }
   }
@@ -316,7 +316,7 @@ mod tests {
     let mut reader = make_reader(b"{\"command\":\"seek\",\"position_ms\":5000}\n");
     let cmd = codec.read_command(&mut reader).await.unwrap();
     match cmd {
-      IpcCommand::Seek { position_ms } => assert_eq!(position_ms, 5000),
+      IpcCommand::Seek { position_ms, .. } => assert_eq!(position_ms, 5000),
       _ => panic!("expected Seek"),
     }
   }
@@ -341,13 +341,13 @@ mod tests {
       make_reader(b"{\"command\":\"status\"}\n{\"command\":\"status\"}\n{\"command\":\"pause\"}\n");
 
     let cmd1 = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd1, IpcCommand::Status));
+    assert!(matches!(cmd1, IpcCommand::Status { .. }));
 
     let cmd2 = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd2, IpcCommand::Status));
+    assert!(matches!(cmd2, IpcCommand::Status { .. }));
 
     let cmd3 = codec.read_command(&mut reader).await.unwrap();
-    assert!(matches!(cmd3, IpcCommand::Pause));
+    assert!(matches!(cmd3, IpcCommand::Pause { .. }));
   }
 
   #[tokio::test]
