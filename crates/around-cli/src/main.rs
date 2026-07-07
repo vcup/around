@@ -1,7 +1,8 @@
 //! around: A cross-platform audio player — CLI entry point.
 
-// Clippy: expect() on startup-critical operations is intentional — failure to initialise is unrecoverable.
-#![allow(clippy::expect_used)]
+// Clippy: expect() on startup-critical operations is intentional — failure to
+// initialise is unrecoverable. Each function using expect() carries its own
+// #[expect] annotation documenting the specific invariant.
 
 use around_engine::ipc::types::{IpcCommand, IpcResponse, ResponseStatus};
 use around_engine::{Engine, EngineConfig};
@@ -198,6 +199,8 @@ fn main() {
   }
 }
 
+// Single expect() on tokio runtime creation and signal handlers is intentional:
+// failure to initialize runtime or signal watchers is unrecoverable at startup.
 fn cmd_play(
   path: PathBuf,
   ipc_listen_tcp: Option<String>,
@@ -245,6 +248,10 @@ fn cmd_play(
   let ipc_engine = engine.clone();
   let port_file = std::env::temp_dir().join("around.port");
   let ipc_handle = std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime creation always succeeds with basic config — panic is correct on env failure"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .build()
@@ -254,7 +261,15 @@ fn cmd_play(
       #[cfg(unix)]
       {
         use tokio::signal::unix::{signal, SignalKind};
+        #[expect(
+          clippy::expect_used,
+          reason = "SIGTERM watcher creation always succeeds on unix — panic is correct on env failure"
+        )]
         let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM watcher");
+        #[expect(
+          clippy::expect_used,
+          reason = "SIGHUP watcher creation always succeeds on unix — panic is correct on env failure"
+        )]
         let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP watcher");
 
         let eng = ipc_engine.clone();

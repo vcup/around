@@ -123,3 +123,145 @@ impl From<&str> for AroundError {
     }
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn error_display_file_not_found() {
+    let err = AroundError::FileNotFound {
+      path: "/tmp/x.wav".into(),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("file not found"));
+    assert!(msg.contains("/tmp/x.wav"));
+  }
+
+  #[test]
+  fn error_display_unsupported_format() {
+    let err = AroundError::UnsupportedFormat {
+      format: Some("flac".into()),
+      reason: "no codec available".into(),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("unsupported format"));
+  }
+
+  #[test]
+  fn error_display_decode_error() {
+    let err = AroundError::DecodeError {
+      message: "corrupt frame".into(),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("decode error"));
+  }
+
+  #[test]
+  fn error_display_source_incompatible() {
+    let err = AroundError::SourceIncompatible {
+      source: "http://example.com/stream".into(),
+      required: "seekable".into(),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("incompatible"));
+  }
+
+  #[test]
+  fn error_display_no_track() {
+    let err = AroundError::NoTrack;
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("no track"));
+  }
+
+  #[test]
+  fn error_display_codec_load_failed() {
+    let err = AroundError::CodecLoadFailed {
+      path: Some("libfoo.so".into()),
+      reason: "symbol not found".into(),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("codec load failed"));
+  }
+
+  #[test]
+  fn error_display_internal() {
+    let err = AroundError::Internal {
+      message: "unexpected null".into(),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("internal error"));
+  }
+
+  #[test]
+  fn error_display_source_already_consumed() {
+    let err = AroundError::SourceAlreadyConsumed {
+      source: "file".into(),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("already consumed"));
+  }
+
+  #[test]
+  fn error_display_invalid_position() {
+    let err = AroundError::InvalidPosition {
+      position_ms: 5000,
+      duration_ms: Some(3000),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("invalid position"));
+  }
+
+  #[test]
+  fn error_display_codec_not_supported() {
+    let err = AroundError::CodecNotSupported {
+      codec: "aac".into(),
+      reason: "license required".into(),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("not supported"));
+  }
+
+  #[test]
+  fn error_display_unsupported_format_no_name() {
+    let err = AroundError::UnsupportedFormat {
+      format: None,
+      reason: "unknown container".into(),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("unsupported format"));
+  }
+
+  #[test]
+  fn error_display_codec_load_failed_no_path() {
+    let err = AroundError::CodecLoadFailed {
+      path: None,
+      reason: "no suitable decoder".into(),
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("codec load failed"));
+  }
+
+  #[test]
+  fn error_display_invalid_position_no_duration() {
+    let err = AroundError::InvalidPosition {
+      position_ms: 9999,
+      duration_ms: None,
+    };
+    let msg = err.to_string();
+    assert!(!msg.is_empty());
+    assert!(msg.contains("invalid position"));
+  }
+}

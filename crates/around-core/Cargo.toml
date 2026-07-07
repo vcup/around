@@ -9,11 +9,11 @@ rust-version.workspace = true
 
 [lints]
 workspace = true
+
 [dependencies]
 bitflags = "2"
-stabby = { workspace = true }
-stabby-abi = { workspace = true, features = ["std", "test"] }
-parking_lot = { workspace = true }
-around-extensions = { workspace = true }
-around-extensions-macros = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+parking_lot = { workspace = true, optional = true }
+
+[features]
+test-utils = ["dep:parking_lot"]

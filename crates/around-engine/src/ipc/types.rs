@@ -114,28 +114,10 @@ fn deser_base64_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>,
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-  let input = input.trim_end_matches('=');
-  let mut out = Vec::with_capacity(input.len() * 3 / 4);
-  let mut buf: u32 = 0;
-  let mut bits = 0u8;
-  for c in input.chars() {
-    let val = match c {
-      'A'..='Z' => c as u8 - b'A',
-      'a'..='z' => c as u8 - b'a' + 26,
-      '0'..='9' => c as u8 - b'0' + 52,
-      '+' => 62,
-      '/' => 63,
-      _ => return Err(format!("invalid base64 character: {}", c)),
-    } as u32;
-    buf = (buf << 6) | val;
-    bits += 6;
-    if bits >= 8 {
-      bits -= 8;
-      out.push((buf >> bits) as u8);
-      buf &= (1 << bits) - 1;
-    }
-  }
-  Ok(out)
+  use base64::Engine;
+  base64::engine::general_purpose::STANDARD
+    .decode(input)
+    .map_err(|e| e.to_string())
 }
 
 /// Outgoing IPC response; all fields optional except `status`.

@@ -15,6 +15,69 @@
 use around_core::SampleSpec;
 
 // ---------------------------------------------------------------------------
+// Format scoring (ADR-0006 §2.1)
+// ---------------------------------------------------------------------------
+
+/// Penalty per kHz of downsampling (higher sample rate → lower).
+const PENALTY_DOWNSAMPLE_PER_KHZ: u32 = 100;
+/// Penalty per channel removed (more channels → fewer).
+const PENALTY_DOWNMIX_PER_CH: u32 = 80;
+/// Penalty per kHz of upsampling (lower sample rate → higher).
+const PENALTY_UPSAMPLE_PER_KHZ: u32 = 10;
+/// Penalty per channel added (fewer channels → more).
+const PENALTY_UPMIX_PER_CH: u32 = 5;
+/// Penalty for changing interleave mode (planar ↔ interleaved).
+const PENALTY_INTERLEAVE_CHANGE: u32 = 1;
+
+/// Score the penalty of converting from `input` to `output` format.
+///
+/// Returns a penalty score in arbitrary units. Lower is better.
+/// The penalty table (ADR-0006 §2.1):
+///
+/// | Conversion | Penalty |
+/// |---|---|
+/// | Downsampling | 100 / kHz of rate difference |
+/// | Downmixing | 80 / channel removed |
+/// | Upsampling | 10 / kHz of rate difference |
+/// | Upmixing | 5 / channel added |
+/// | Planar ↔ Interleaved | 1 |
+///
+/// # Tiebreaker
+///
+/// When comparing multiple candidate output formats, the format with the
+/// highest sample rate wins if scores are equal (prefer higher quality).
+pub fn score_format_pair(input: &SampleSpec, output: &SampleSpec) -> u32 {
+  let mut score = 0u32;
+
+  // Sample rate conversion.
+  if input.sample_rate > output.sample_rate {
+    // Downsampling: 100 per kHz of difference.
+    let diff_khz = (input.sample_rate - output.sample_rate) as f32 / 1000.0;
+    score += (diff_khz * PENALTY_DOWNSAMPLE_PER_KHZ as f32) as u32;
+  } else if output.sample_rate > input.sample_rate {
+    // Upsampling: 10 per kHz of difference.
+    let diff_khz = (output.sample_rate - input.sample_rate) as f32 / 1000.0;
+    score += (diff_khz * PENALTY_UPSAMPLE_PER_KHZ as f32) as u32;
+  }
+
+  // Channel conversion.
+  if input.channels > output.channels {
+    // Downmixing: 80 per channel removed.
+    score += (input.channels - output.channels) as u32 * PENALTY_DOWNMIX_PER_CH;
+  } else if output.channels > input.channels {
+    // Upmixing: 5 per channel added.
+    score += (output.channels - input.channels) as u32 * PENALTY_UPMIX_PER_CH;
+  }
+
+  // Interleave conversion.
+  if input.interleave != output.interleave {
+    score += PENALTY_INTERLEAVE_CHANGE;
+  }
+
+  score
+}
+
+// ---------------------------------------------------------------------------
 // Filter trait
 // ---------------------------------------------------------------------------
 
@@ -58,7 +121,6 @@ pub struct FilterInfo {
 // ---------------------------------------------------------------------------
 
 /// Ordered list of audio filters with format negotiation.
-#[allow(dead_code)]
 pub struct FilterChain {
   filters: Vec<Box<dyn Filter>>,
   /// Decoded format from the codec.
@@ -71,8 +133,9 @@ impl FilterChain {
   /// Build a filter chain from user-selected filters.
   ///
   /// Automatically inserts resampling filters when input/output formats
-  /// differ at any boundary. For now, applies a simplified penalty model:
-  /// prefers fewer conversions.
+  /// differ at any boundary. Uses [`score_format_pair`] to assess the
+  /// penalty of format conversion and inserts the cheapest conversion
+  /// chain.
   pub fn build(
     decode_spec: SampleSpec,
     filters: Vec<Box<dyn Filter>>,
@@ -84,19 +147,22 @@ impl FilterChain {
       output_spec,
     };
 
-    // Auto-insert resample if decode format ≠ output format and chain is empty.
-    if chain.filters.is_empty() && decode_spec.sample_rate != output_spec.sample_rate {
-      chain.filters.push(Box::new(Resample::new(
-        decode_spec.sample_rate,
-        output_spec.sample_rate,
-        decode_spec.channels,
-      )));
-    }
+    // Score the format difference between decode and output.
+    let score = score_format_pair(&chain.decode_spec, &chain.output_spec);
 
-    // For each adjacent pair, check format compatibility.
-    // In a full implementation (Phase 6+), this would negotiate
-    // interleave mode and insert Deinterleave/Interleave filters.
-    // For now, we assume interleaved throughout.
+    if score > 0 && chain.filters.is_empty() {
+      // Auto-insert Resample if sample rates differ.
+      if chain.decode_spec.sample_rate != chain.output_spec.sample_rate {
+        chain.filters.push(Box::new(Resample::new(
+          chain.decode_spec.sample_rate,
+          chain.output_spec.sample_rate,
+          chain.decode_spec.channels,
+        )));
+      }
+      // Note: Deinterleave/Interleave auto-insertion is deferred until
+      // the Filter chain supports these conversions (Phase 6+).
+      // The scoring function is in place for when those filters exist.
+    }
 
     chain
   }
@@ -309,5 +375,62 @@ mod tests {
     let mut buf = vec![1.0f32; 20];
     chain.process(&mut buf, 2);
     assert!((buf[0] - 0.5).abs() < 0.001);
+  }
+
+  // ── Format scoring tests ──────────────────────────────────────────────
+
+  #[test]
+  fn score_identical_formats_is_zero() {
+    let spec = SampleSpec::interleaved(44100, 2, 16).unwrap();
+    assert_eq!(score_format_pair(&spec, &spec), 0);
+  }
+
+  #[test]
+  fn score_downsample_penalty() {
+    let input = SampleSpec::interleaved(48000, 2, 16).unwrap();
+    let output = SampleSpec::interleaved(44100, 2, 16).unwrap();
+    let score = score_format_pair(&input, &output);
+    // 48→44.1: diff = 3.9 kHz, penalty = ceil(3.9 * 100) = 390
+    assert!(score >= 300 && score <= 500, "score = {}", score);
+  }
+
+  #[test]
+  fn score_upsample_penalty() {
+    let input = SampleSpec::interleaved(44100, 2, 16).unwrap();
+    let output = SampleSpec::interleaved(48000, 2, 16).unwrap();
+    let score = score_format_pair(&input, &output);
+    // 44.1→48: diff = 3.9 kHz, penalty = ceil(3.9 * 10) = 39
+    assert!(score >= 30 && score <= 50, "score = {}", score);
+  }
+
+  #[test]
+  fn score_downsample_cheaper_than_upsample() {
+    let a = SampleSpec::interleaved(48000, 2, 16).unwrap();
+    let b = SampleSpec::interleaved(44100, 2, 16).unwrap();
+    let down_score = score_format_pair(&a, &b); // 48→44.1: downsampling
+    let up_score = score_format_pair(&b, &a); // 44.1→48: upsampling
+    assert!(down_score > up_score, "down={} up={}", down_score, up_score);
+  }
+
+  #[test]
+  fn score_downmix_penalty() {
+    let input = SampleSpec::interleaved(44100, 6, 16).unwrap();
+    let output = SampleSpec::interleaved(44100, 2, 16).unwrap();
+    assert_eq!(score_format_pair(&input, &output), 4 * 80);
+  }
+
+  #[test]
+  fn score_upmix_penalty() {
+    let input = SampleSpec::interleaved(44100, 2, 16).unwrap();
+    let output = SampleSpec::interleaved(44100, 6, 16).unwrap();
+    assert_eq!(score_format_pair(&input, &output), 4 * 5);
+  }
+
+  #[test]
+  fn score_interleave_change_penalty() {
+    use around_core::Interleave;
+    let input = SampleSpec::new(44100, 2, 16, Interleave::Interleaved).unwrap();
+    let output = SampleSpec::new(44100, 2, 16, Interleave::Planar).unwrap();
+    assert_eq!(score_format_pair(&input, &output), 1);
   }
 }

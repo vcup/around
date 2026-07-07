@@ -163,6 +163,10 @@ mod tests {
     BufReader::new(Cursor::new(data.to_vec()))
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "in-memory Cursor with valid JSON always produces Ok for read_command"
+  )]
   #[tokio::test]
   async fn parse_valid_json_command() {
     let codec = JsonLineCodec;
@@ -171,6 +175,10 @@ mod tests {
     assert!(matches!(cmd, IpcCommand::Status { .. }));
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "known valid JSON after empty lines in controlled Cursor input"
+  )]
   #[tokio::test]
   async fn skip_empty_lines() {
     let codec = JsonLineCodec;
@@ -179,6 +187,10 @@ mod tests {
     assert!(matches!(cmd, IpcCommand::Pause { .. }));
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "whitespace-only lines do not prevent parsing subsequent valid JSON in Cursor"
+  )]
   #[tokio::test]
   async fn skip_whitespace_only_lines() {
     let codec = JsonLineCodec;
@@ -187,6 +199,10 @@ mod tests {
     assert!(matches!(cmd, IpcCommand::Resume { .. }));
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "deliberately invalid JSON must produce Err from in-memory Cursor"
+  )]
   #[tokio::test]
   async fn invalid_json_returns_error() {
     let codec = JsonLineCodec;
@@ -195,6 +211,10 @@ mod tests {
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "empty Cursor by design produces UnexpectedEof from read_command"
+  )]
   #[tokio::test]
   async fn eof_returns_unexpected_eof() {
     let codec = JsonLineCodec;
@@ -203,6 +223,10 @@ mod tests {
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "valid JSON without trailing newline in Cursor is still parseable"
+  )]
   #[tokio::test]
   async fn valid_json_without_trailing_newline() {
     let codec = JsonLineCodec;
@@ -211,6 +235,10 @@ mod tests {
     assert!(matches!(cmd, IpcCommand::Status { .. }));
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "only blank lines then EOF produces UnexpectedEof by design"
+  )]
   #[tokio::test]
   async fn only_empty_lines_then_eof_returns_error() {
     let codec = JsonLineCodec;
@@ -219,6 +247,10 @@ mod tests {
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "only whitespace lines then EOF produces UnexpectedEof by design"
+  )]
   #[tokio::test]
   async fn only_whitespace_lines_then_eof() {
     let codec = JsonLineCodec;
@@ -227,6 +259,10 @@ mod tests {
     assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "valid JSON with surrounding whitespace in Cursor still parses correctly"
+  )]
   #[tokio::test]
   async fn json_with_leading_trailing_whitespace() {
     let codec = JsonLineCodec;
@@ -235,6 +271,10 @@ mod tests {
     assert!(matches!(cmd, IpcCommand::Stop { .. }));
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "valid JSON with tabs around it in Cursor still parses correctly"
+  )]
   #[tokio::test]
   async fn json_with_tabs_and_newlines_around() {
     let codec = JsonLineCodec;
@@ -243,6 +283,10 @@ mod tests {
     assert!(matches!(cmd, IpcCommand::Pause { .. }));
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "two valid JSON commands separated by blank lines in Cursor both parse"
+  )]
   #[tokio::test]
   async fn command_followed_by_empty_lines_read_on_next_call() {
     let codec = JsonLineCodec;
@@ -255,6 +299,10 @@ mod tests {
     assert!(matches!(cmd2, IpcCommand::Pause { .. }));
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "too many empty lines in Cursor by design produces InvalidData error"
+  )]
   #[tokio::test]
   async fn too_many_empty_lines_returns_error() {
     let codec = JsonLineCodec;
@@ -265,6 +313,10 @@ mod tests {
     assert!(err.to_string().contains("too many empty lines"));
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "valid JSON after exactly 16 empty lines is within Cursor limit"
+  )]
   #[tokio::test]
   async fn exactly_sixteen_empty_lines_then_command_succeeds() {
     let codec = JsonLineCodec;
@@ -275,6 +327,10 @@ mod tests {
     assert!(matches!(cmd, IpcCommand::Stop { .. }));
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "Vec<u8> writer never fails; JSON output is valid UTF-8 and re-parses"
+  )]
   #[tokio::test]
   async fn write_response_adds_newline() {
     let codec = JsonLineCodec;
@@ -287,6 +343,10 @@ mod tests {
     assert_eq!(parsed["status"], "ok");
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "Vec<u8> writer never fails; JSON output is valid UTF-8 and re-parses"
+  )]
   #[tokio::test]
   async fn write_response_error_during_play() {
     let codec = JsonLineCodec;
@@ -299,6 +359,10 @@ mod tests {
     assert_eq!(parsed["code"], "NO_TRACK");
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "controlled play command JSON in Cursor always produces Ok"
+  )]
   #[tokio::test]
   async fn parse_play_command_with_path() {
     let codec = JsonLineCodec;
@@ -310,6 +374,10 @@ mod tests {
     }
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "controlled seek command JSON in Cursor always produces Ok"
+  )]
   #[tokio::test]
   async fn parse_seek_command_with_position() {
     let codec = JsonLineCodec;
@@ -321,6 +389,10 @@ mod tests {
     }
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "controlled load_codec_bytes JSON in Cursor always produces Ok"
+  )]
   #[tokio::test]
   async fn parse_load_codec_bytes_command() {
     let codec = JsonLineCodec;
@@ -334,6 +406,10 @@ mod tests {
     }
   }
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "three sequentially valid JSON commands in Cursor all parse correctly"
+  )]
   #[tokio::test]
   async fn multiple_commands_in_sequence() {
     let codec = JsonLineCodec;
@@ -355,8 +431,20 @@ mod tests {
     let codec = JsonLineCodec;
     let mut buf = Vec::new();
     let resp = IpcResponse::error(ErrorCode::FileNotFound, "No such file: /tmp/missing.wav");
+    #[expect(
+      clippy::unwrap_used,
+      reason = "Vec<u8> writer never fails for write_response"
+    )]
     codec.write_response(&mut buf, &resp).await.unwrap();
+    #[expect(
+      clippy::unwrap_used,
+      reason = "write_response serializes valid UTF-8 JSON"
+    )]
     let text = String::from_utf8(buf).unwrap();
+    #[expect(
+      clippy::unwrap_used,
+      reason = "write_response output is always valid JSON and deserializes on first parse"
+    )]
     let parsed: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
     assert_eq!(parsed["status"], "error");
     assert_eq!(parsed["code"], "FILE_NOT_FOUND");

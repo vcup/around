@@ -5,8 +5,9 @@ use around_engine::{Engine, EngineConfig};
 #[cfg(target_os = "linux")]
 use cpal::traits::HostTrait;
 use serde_json::Value;
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::TcpStream;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -24,34 +25,58 @@ fn audio_device_available() -> bool {
 }
 
 fn fixture_path(name: &str) -> PathBuf {
-  let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-  p.push("tests");
-  p.push("fixtures");
-  p.push(name);
-  p
+  // Fixtures live in the workspace examples/ directory (shared with source_contract.rs).
+  PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("../../examples")
+    .join(name)
 }
 
 fn send_command(port_file: &str, cmd: &Value) -> Value {
+  #[expect(
+    clippy::expect_used,
+    reason = "port file must exist — server wrote it before test proceeds; absence means server failed"
+  )]
   let port_str = std::fs::read_to_string(port_file).expect("read port file");
+  #[expect(
+    clippy::expect_used,
+    reason = "port file content must be valid u16 since server just wrote it; parse failure indicates corruption"
+  )]
   let port: u16 = port_str.trim().parse().expect("parse port");
-  let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
+  #[expect(
+    clippy::expect_used,
+    reason = "server must be listening on port from port file; connection refused means server died"
+  )]
+  let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
 
-  let mut reader = BufReader::new(&stream);
-  let mut writer = BufWriter::new(&stream);
-
+  // JsonLineCodec protocol: newline-delimited JSON (no length prefix)
+  #[expect(
+    clippy::expect_used,
+    reason = "static json value is always serializable; failure indicates serde bug"
+  )]
   let json = serde_json::to_vec(cmd).expect("serialize");
-  writer
-    .write_all(&(json.len() as u64).to_le_bytes())
-    .expect("write len");
-  writer.write_all(&json).expect("write json");
-  writer.flush().expect("flush");
+  #[expect(
+    clippy::expect_used,
+    reason = "stream is connected; write to known-good connection must succeed"
+  )]
+  stream.write_all(&json).expect("write json");
+  #[expect(clippy::expect_used, reason = "same connected stream, write newline")]
+  stream.write_all(b"\n").expect("write newline");
+  #[expect(clippy::expect_used, reason = "connected stream flush must succeed")]
+  stream.flush().expect("flush");
 
-  let mut len_buf = [0u8; 8];
-  reader.read_exact(&mut len_buf).expect("read len");
-  let resp_len = u64::from_le_bytes(len_buf) as usize;
-  let mut resp_buf = vec![0u8; resp_len];
-  reader.read_exact(&mut resp_buf).expect("read resp");
-  serde_json::from_slice(&resp_buf).expect("parse resp")
+  // Read response: server writes JSON + \n
+  let mut resp = String::new();
+  let mut reader = BufReader::new(&stream);
+  #[expect(
+    clippy::expect_used,
+    reason = "server must have sent a response line; readline blocking on connected stream is safe"
+  )]
+  reader.read_line(&mut resp).expect("read response line");
+  #[expect(
+    clippy::expect_used,
+    reason = "server response is well-formed JSON; parse failure indicates protocol mismatch"
+  )]
+  serde_json::from_str(resp.trim()).expect("parse resp")
 }
 
 /// Open a throwaway TCP connection to wake the server's accept loop
@@ -62,6 +87,26 @@ fn poke_server(port_file: &str) {
     if let Ok(port) = s.trim().parse::<u16>() {
       let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
     }
+  }
+}
+
+/// Ensures engine shutdown + server unblock on panic (avoids thread leak).
+struct ServerGuard {
+  engine: Arc<Engine>,
+  port_file: String,
+}
+
+impl Drop for ServerGuard {
+  fn drop(&mut self) {
+    self.engine.shutdown();
+    poke_server(&self.port_file);
+  }
+}
+
+impl Deref for ServerGuard {
+  type Target = Engine;
+  fn deref(&self) -> &Engine {
+    &self.engine
   }
 }
 
@@ -138,21 +183,32 @@ fn ipc_server_creates_port_file_on_play() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
+  let _server_guard = ServerGuard {
+    engine: engine.clone(),
+    port_file: port_file.clone(),
+  };
+
   // Start IPC server on a background thread.
   let ipc_engine = engine.clone();
   let pf = port_file.clone();
   let _ipc_server = std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime builder with standard config must succeed"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .enable_time()
       .build()
       .expect("tokio runtime");
-    let mut ipc_config = around_engine::ipc::IpcConfig::default();
-    ipc_config.enable_platform_native = false;
-    ipc_config.check_running_instance = false;
-    ipc_config.force_json = true;
-    ipc_config.port_file_path = Some(std::path::PathBuf::from(pf));
-    rt.block_on(around_engine::run_ipc_server(ipc_config, ipc_engine))
+    let ipc_config = around_engine::ipc::IpcConfig {
+      enable_platform_native: false,
+      check_running_instance: false,
+      force_json: true,
+      port_file_path: Some(std::path::PathBuf::from(pf)),
+      ..Default::default()
+    };
+    let _ = rt.block_on(around_engine::run_ipc_server(ipc_config, ipc_engine));
   });
   // Give server time to bind.
   // Wait for server to bind (poll for port file).
@@ -171,13 +227,16 @@ fn ipc_server_creates_port_file_on_play() {
     std::path::Path::new(&port_file).exists(),
     "port file must exist after server starts"
   );
-
-  // Verify it contains a valid port number.
-  let port: u16 = std::fs::read_to_string(&port_file)
-    .expect("read port file")
-    .trim()
-    .parse()
-    .expect("valid port");
+  #[expect(
+    clippy::expect_used,
+    reason = "port file must exist — poll loop confirmed creation; absence means server failed"
+  )]
+  let port_str = std::fs::read_to_string(&port_file).expect("read port file");
+  #[expect(
+    clippy::expect_used,
+    reason = "port file content is valid u16 — server wrote it; parse failure indicates corruption"
+  )]
+  let port: u16 = port_str.trim().parse().expect("valid port");
   assert!(port > 0, "port must be > 0");
 
   // Once the port file exists, send a status command and check the response.
@@ -218,14 +277,24 @@ fn signal_cleanup_deletes_port_file() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let mut ipc_config = around_engine::ipc::IpcConfig::default();
-  ipc_config.enable_platform_native = false;
-  ipc_config.check_running_instance = false;
-  ipc_config.force_json = true;
-  ipc_config.port_file_path = Some(std::path::PathBuf::from(&port_file));
+  let _server_guard = ServerGuard {
+    engine: engine.clone(),
+    port_file: port_file.clone(),
+  };
+  let ipc_config = around_engine::ipc::IpcConfig {
+    enable_platform_native: false,
+    check_running_instance: false,
+    force_json: true,
+    port_file_path: Some(std::path::PathBuf::from(&port_file)),
+    ..Default::default()
+  };
 
   let ipc_engine = engine.clone();
   let server_thread = std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .enable_time()
@@ -290,14 +359,25 @@ fn port_file_created_on_bind() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let mut ipc_config = around_engine::ipc::IpcConfig::default();
-  ipc_config.enable_platform_native = false;
-  ipc_config.check_running_instance = false;
-  ipc_config.force_json = true;
-  ipc_config.port_file_path = Some(std::path::PathBuf::from(&port_file));
+  let _server_guard = ServerGuard {
+    engine: engine.clone(),
+    port_file: port_file.clone(),
+  };
+
+  let ipc_config = around_engine::ipc::IpcConfig {
+    enable_platform_native: false,
+    check_running_instance: false,
+    force_json: true,
+    port_file_path: Some(std::path::PathBuf::from(&port_file)),
+    ..Default::default()
+  };
 
   let ipc_engine = engine.clone();
   let _server_thread = std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .enable_time()
@@ -316,7 +396,15 @@ fn port_file_created_on_bind() {
   }
   assert!(std::path::Path::new(&port_file).exists());
   // Verify port file contents are a valid number.
+  #[expect(
+    clippy::expect_used,
+    reason = "port file verified existing and was written by server; read failure is racy test env"
+  )]
   let port_str = std::fs::read_to_string(&port_file).expect("read port file");
+  #[expect(
+    clippy::expect_used,
+    reason = "port file content validated by server write; parse failure indicates corruption"
+  )]
   let port: u16 = port_str.trim().parse().expect("parse port");
   assert!(port > 0);
 
@@ -348,15 +436,25 @@ fn command_round_trip() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let mut ipc_config = around_engine::ipc::IpcConfig::default();
-  ipc_config.enable_platform_native = false;
-  ipc_config.check_running_instance = false;
-  ipc_config.force_json = true;
-  ipc_config.port_file_path = Some(std::path::PathBuf::from(&port_file));
+  let _server_guard = ServerGuard {
+    engine: engine.clone(),
+    port_file: port_file.clone(),
+  };
 
+  let ipc_config = around_engine::ipc::IpcConfig {
+    enable_platform_native: false,
+    check_running_instance: false,
+    force_json: true,
+    port_file_path: Some(std::path::PathBuf::from(&port_file)),
+    ..Default::default()
+  };
   // Start IPC server on a background thread.
   let ipc_engine = engine.clone();
   let _ipc_server = std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .enable_time()
@@ -420,16 +518,30 @@ fn stale_port_file_handled() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let mut ipc_config = around_engine::ipc::IpcConfig::default();
-  ipc_config.enable_platform_native = false;
-  ipc_config.check_running_instance = false;
-  ipc_config.force_json = true;
-  ipc_config.port_file_path = Some(std::path::PathBuf::from(&port_file));
-  // Set a specific port so we don't trigger auto port file creation.
-  ipc_config.tcp_bind = Some("127.0.0.1:0".parse().unwrap());
+  let _server_guard = ServerGuard {
+    engine: engine.clone(),
+    port_file: port_file.clone(),
+  };
+  let ipc_config = around_engine::ipc::IpcConfig {
+    enable_platform_native: false,
+    check_running_instance: false,
+    force_json: true,
+    port_file_path: Some(std::path::PathBuf::from(&port_file)),
+    // Set a specific port so we don't trigger auto port file creation.
+    #[expect(
+      clippy::unwrap_used,
+      reason = "\"127.0.0.1:0\" is a valid socket address literal; parse always succeeds"
+    )]
+    tcp_bind: Some("127.0.0.1:0".parse().unwrap()),
+    ..Default::default()
+  };
 
   let ipc_engine = engine.clone();
   let _server_thread = std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .enable_time()
@@ -464,15 +576,26 @@ fn running_instance_rejection() {
   // Start first instance.
   let config = EngineConfig::load();
   let engine_a = Arc::new(Engine::new(config.clone()));
-  let mut ipc_config_a = around_engine::ipc::IpcConfig::default();
-  ipc_config_a.enable_platform_native = false;
-  ipc_config_a.check_running_instance = false;
-  ipc_config_a.force_json = true;
-  ipc_config_a.port_file_path = Some(std::path::PathBuf::from(&port_file));
+
+  let _server_guard = ServerGuard {
+    engine: engine_a.clone(),
+    port_file: port_file.clone(),
+  };
+  let ipc_config_a = around_engine::ipc::IpcConfig {
+    enable_platform_native: false,
+    check_running_instance: false,
+    force_json: true,
+    port_file_path: Some(std::path::PathBuf::from(&port_file)),
+    ..Default::default()
+  };
 
   let ipc_engine_a = engine_a.clone();
   let pf_a = port_file.clone();
   let _server_a = std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .enable_time()
@@ -525,15 +648,25 @@ fn port_file_cleanup_after_stop() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let mut ipc_config = around_engine::ipc::IpcConfig::default();
-  ipc_config.enable_platform_native = false;
-  ipc_config.check_running_instance = false;
-  ipc_config.force_json = true;
-  ipc_config.port_file_path = Some(std::path::PathBuf::from(&port_file));
+  let _server_guard = ServerGuard {
+    engine: engine.clone(),
+    port_file: port_file.clone(),
+  };
+  let ipc_config = around_engine::ipc::IpcConfig {
+    enable_platform_native: false,
+    check_running_instance: false,
+    force_json: true,
+    port_file_path: Some(std::path::PathBuf::from(&port_file)),
+    ..Default::default()
+  };
 
   let ipc_engine = engine.clone();
   let _pf = port_file.clone();
   let _server = std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .enable_time()
@@ -588,15 +721,25 @@ fn port_file_cleanup_after_signal() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let mut ipc_config = around_engine::ipc::IpcConfig::default();
-  ipc_config.enable_platform_native = false;
-  ipc_config.check_running_instance = false;
-  ipc_config.force_json = true;
-  ipc_config.port_file_path = Some(std::path::PathBuf::from(&port_file));
+  let _server_guard = ServerGuard {
+    engine: engine.clone(),
+    port_file: port_file.clone(),
+  };
 
+  let ipc_config = around_engine::ipc::IpcConfig {
+    enable_platform_native: false,
+    check_running_instance: false,
+    force_json: true,
+    port_file_path: Some(std::path::PathBuf::from(&port_file)),
+    ..Default::default()
+  };
   let _epf = port_file.clone();
   let srv_engine = engine.clone();
   let _server = std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .enable_time()
@@ -632,8 +775,8 @@ fn port_file_cleanup_after_signal() {
 
 // =============================================================================
 
-/// Helper: spawn an IPC server on a unique port file, return (port_file, engine).
-fn spawn_ipc_server(suffix: &str) -> (String, Arc<Engine>) {
+/// Helper: spawn an IPC server on a unique port file, return (guard, port_file).
+fn spawn_ipc_server(suffix: &str) -> (ServerGuard, String) {
   let port_file = std::env::temp_dir()
     .join(format!("around-{}-{}.port", std::process::id(), suffix))
     .to_string_lossy()
@@ -643,14 +786,19 @@ fn spawn_ipc_server(suffix: &str) -> (String, Arc<Engine>) {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let mut ipc_config = around_engine::ipc::IpcConfig::default();
-  ipc_config.enable_platform_native = false;
-  ipc_config.check_running_instance = false;
-  ipc_config.force_json = true;
-  ipc_config.port_file_path = Some(std::path::PathBuf::from(&port_file));
-
+  let ipc_config = around_engine::ipc::IpcConfig {
+    enable_platform_native: false,
+    check_running_instance: false,
+    force_json: true,
+    port_file_path: Some(std::path::PathBuf::from(&port_file)),
+    ..Default::default()
+  };
   let ipc_engine = engine.clone();
   std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .enable_time()
@@ -668,19 +816,20 @@ fn spawn_ipc_server(suffix: &str) -> (String, Arc<Engine>) {
     std::thread::sleep(std::time::Duration::from_millis(50));
   }
 
-  (port_file, engine)
+  let guard = ServerGuard {
+    engine: engine.clone(),
+    port_file: port_file.clone(),
+  };
+  (guard, port_file)
 }
 
 #[test]
 fn runtime_idle_pause_returns_no_track() {
-  let (port_file, engine) = spawn_ipc_server("idle_pause");
+  let (_guard, port_file) = spawn_ipc_server("idle_pause");
 
   let resp = send_command(&port_file, &serde_json::json!({"command": "pause"}));
   assert_eq!(resp["status"], "error");
   assert_eq!(resp["code"], "NO_TRACK");
-
-  engine.shutdown();
-  poke_server(&port_file);
 }
 
 // ---------------------------------------------------------------------------
@@ -689,7 +838,7 @@ fn runtime_idle_pause_returns_no_track() {
 
 #[test]
 fn shutdown_command_terminates_engine() {
-  let (port_file, _engine) = spawn_ipc_server("shutdown_test");
+  let (_guard, port_file) = spawn_ipc_server("shutdown_test");
 
   let resp = send_command(&port_file, &serde_json::json!({"command": "shutdown"}));
   assert_eq!(resp["status"], "ok");
@@ -708,71 +857,58 @@ fn shutdown_command_terminates_engine() {
 
 #[test]
 fn runtime_idle_resume_returns_no_track() {
-  let (port_file, engine) = spawn_ipc_server("idle_resume");
+  let (_guard, port_file) = spawn_ipc_server("idle_resume");
 
   let resp = send_command(&port_file, &serde_json::json!({"command": "resume"}));
   assert_eq!(resp["status"], "error");
-
-  engine.shutdown();
-  poke_server(&port_file);
 }
 
 #[test]
 fn runtime_idle_seek_returns_no_track() {
-  let (port_file, engine) = spawn_ipc_server("idle_seek");
+  let (_guard, port_file) = spawn_ipc_server("idle_seek");
 
   let resp = send_command(
     &port_file,
     &serde_json::json!({"command": "seek", "position_ms": 5000}),
   );
   assert_eq!(resp["status"], "error");
-
-  engine.shutdown();
-  poke_server(&port_file);
 }
 
 #[test]
 fn runtime_status_returns_stopped_when_idle() {
-  let (port_file, engine) = spawn_ipc_server("idle_status");
+  let (_guard, port_file) = spawn_ipc_server("idle_status");
 
   let resp = send_command(&port_file, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok");
-
-  engine.shutdown();
-  poke_server(&port_file);
 }
 
 #[test]
 fn runtime_stop_idempotent_via_ipc() {
-  let (port_file, engine) = spawn_ipc_server("stop_idem");
+  let (_guard, port_file) = spawn_ipc_server("stop_idem");
 
   // Send stop on idle engine — should be ok (stop is idempotent).
   let resp = send_command(&port_file, &serde_json::json!({"command": "stop"}));
   assert_eq!(resp["status"], "ok");
-
-  engine.shutdown();
-  poke_server(&port_file);
 }
-
-// =============================================================================
 // Codec and cleanup command tests
 // =============================================================================
 
 #[test]
+#[expect(
+  clippy::unwrap_used,
+  reason = "test fixture server confirmed running; JSON response includes codecs array in known shape"
+)]
 fn ipc_list_codecs_returns_empty_initially() {
-  let (port_file, engine) = spawn_ipc_server("list_codecs");
+  let (_guard, port_file) = spawn_ipc_server("list_codecs");
 
   let resp = send_command(&port_file, &serde_json::json!({"command": "list_codecs"}));
   assert_eq!(resp["status"], "ok");
   assert_eq!(resp["codecs"].as_array().unwrap().len(), 0);
-
-  engine.shutdown();
-  poke_server(&port_file);
 }
 
 #[test]
 fn ipc_load_codec_nonexistent_file_errors() {
-  let (port_file, engine) = spawn_ipc_server("load_codec_err");
+  let (_guard, port_file) = spawn_ipc_server("load_codec_err");
 
   let resp = send_command(
     &port_file,
@@ -780,95 +916,107 @@ fn ipc_load_codec_nonexistent_file_errors() {
   );
   assert_eq!(resp["status"], "error");
   assert_eq!(resp["code"], "CODEC_LOAD_FAILED");
-
-  engine.shutdown();
-  poke_server(&port_file);
 }
 
 #[test]
 fn ipc_cleanup_returns_removed_files_field() {
-  let (port_file, engine) = spawn_ipc_server("cleanup");
+  let (_guard, port_file) = spawn_ipc_server("cleanup");
 
   let resp = send_command(&port_file, &serde_json::json!({"command": "cleanup"}));
   assert_eq!(resp["status"], "ok");
   assert!(resp.get("removed_files").is_some());
-
-  engine.shutdown();
-  poke_server(&port_file);
 }
 
 #[test]
 fn ipc_load_codec_bytes_invalid_data_errors() {
-  let (port_file, engine) = spawn_ipc_server("load_codec_bytes_err");
+  let (_guard, port_file) = spawn_ipc_server("load_codec_bytes_err");
 
   let resp = send_command(
     &port_file,
     &serde_json::json!({"command": "load_codec_bytes", "data": "aW52YWxpZA=="}),
   );
   assert_eq!(resp["status"], "error");
-
-  engine.shutdown();
-  poke_server(&port_file);
 }
 
 #[test]
 fn ipc_multiple_commands_over_one_connection() {
-  let (port_file, engine) = spawn_ipc_server("multi_cmd");
+  let (_guard, port_file) = spawn_ipc_server("multi_cmd");
 
   // Send multiple commands over the same connection.
+  #[expect(
+    clippy::expect_used,
+    reason = "test fixture server confirmed running; connection and port file are known-good"
+  )]
   let port_str = std::fs::read_to_string(&port_file).expect("read port file");
+  #[expect(
+    clippy::expect_used,
+    reason = "port file content must be valid u16 since server just wrote it"
+  )]
   let port: u16 = port_str.trim().parse().expect("parse port");
+  #[expect(
+    clippy::expect_used,
+    reason = "server must be listening on port from port file; connection refused means server died"
+  )]
   let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
 
   let mut reader = BufReader::new(&stream);
   let mut writer = BufWriter::new(&stream);
 
+  // JsonLineCodec protocol: newline-delimited JSON (no length prefix)
+
+  let mut line = String::new();
+
   // Status 1
-  let cmd = serde_json::json!({"command": "status"});
-  let json = serde_json::to_vec(&cmd).unwrap();
-  writer
-    .write_all(&(json.len() as u64).to_le_bytes())
-    .unwrap();
-  writer.write_all(&json).unwrap();
-  writer.flush().unwrap();
-  let mut len_buf = [0u8; 8];
-  reader.read_exact(&mut len_buf).unwrap();
-  let resp_len = u64::from_le_bytes(len_buf) as usize;
-  let mut resp_buf = vec![0u8; resp_len];
-  reader.read_exact(&mut resp_buf).unwrap();
-  let resp: Value = serde_json::from_slice(&resp_buf).unwrap();
-  assert_eq!(resp["status"], "ok");
+  #[expect(
+    clippy::unwrap_used,
+    reason = "local TCP stream to our server; serialization of JSON literal always succeeds"
+  )]
+  {
+    let cmd = serde_json::json!({"command": "status"});
+    let json = serde_json::to_vec(&cmd).unwrap();
+    writer.write_all(&json).unwrap();
+    writer.write_all(b"\n").unwrap();
+    writer.flush().unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let resp: Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(resp["status"], "ok");
+  }
 
   // List codecs
-  let cmd = serde_json::json!({"command": "list_codecs"});
-  let json = serde_json::to_vec(&cmd).unwrap();
-  writer
-    .write_all(&(json.len() as u64).to_le_bytes())
-    .unwrap();
-  writer.write_all(&json).unwrap();
-  writer.flush().unwrap();
-  reader.read_exact(&mut len_buf).unwrap();
-  let resp_len = u64::from_le_bytes(len_buf) as usize;
-  let mut resp_buf = vec![0u8; resp_len];
-  reader.read_exact(&mut resp_buf).unwrap();
-  let resp: Value = serde_json::from_slice(&resp_buf).unwrap();
-  assert_eq!(resp["status"], "ok");
+  #[expect(
+    clippy::unwrap_used,
+    reason = "local TCP stream to our server; serialization/parse of known-good JSON"
+  )]
+  {
+    line.clear();
+    let cmd = serde_json::json!({"command": "list_codecs"});
+    let json = serde_json::to_vec(&cmd).unwrap();
+    writer.write_all(&json).unwrap();
+    writer.write_all(b"\n").unwrap();
+    writer.flush().unwrap();
+    reader.read_line(&mut line).unwrap();
+    let resp: Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(resp["status"], "ok");
+  }
 
   // Cleanup
-  let cmd = serde_json::json!({"command": "cleanup"});
-  let json = serde_json::to_vec(&cmd).unwrap();
-  writer
-    .write_all(&(json.len() as u64).to_le_bytes())
-    .unwrap();
-  writer.write_all(&json).unwrap();
-  writer.flush().unwrap();
-  reader.read_exact(&mut len_buf).unwrap();
-  let resp_len = u64::from_le_bytes(len_buf) as usize;
-  let mut resp_buf = vec![0u8; resp_len];
-  reader.read_exact(&mut resp_buf).unwrap();
-  let resp: Value = serde_json::from_slice(&resp_buf).unwrap();
-  assert_eq!(resp["status"], "ok");
-  engine.shutdown();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "local TCP stream to our server; serialization/parse of known-good JSON"
+  )]
+  {
+    line.clear();
+    let cmd = serde_json::json!({"command": "cleanup"});
+    let json = serde_json::to_vec(&cmd).unwrap();
+    writer.write_all(&json).unwrap();
+    writer.write_all(b"\n").unwrap();
+    writer.flush().unwrap();
+    reader.read_line(&mut line).unwrap();
+    let resp: Value = serde_json::from_str(line.trim()).unwrap();
+    assert_eq!(resp["status"], "ok");
+  }
+
   // Drop writer before stream to avoid borrow conflict.
   drop(writer);
   drop(reader);
@@ -878,7 +1026,7 @@ fn ipc_multiple_commands_over_one_connection() {
 
 #[test]
 fn ipc_cleanup_removes_matching_temp_files() {
-  let (port_file, engine) = spawn_ipc_server("cleanup_tmp");
+  let (_guard, port_file) = spawn_ipc_server("cleanup_tmp");
 
   // Create a stale temp file that should be cleaned up.
   let tmp_dir = std::env::temp_dir();
@@ -898,14 +1046,10 @@ fn ipc_cleanup_removes_matching_temp_files() {
 
   // Clean up our stale file if cleanup didn't.
   let _ = std::fs::remove_file(&stale_path);
-
-  engine.shutdown();
-  poke_server(&port_file);
 }
-
 #[test]
 fn ipc_play_nonexistent_file_returns_file_not_found() {
-  let (port_file, engine) = spawn_ipc_server("play_not_found");
+  let (_guard, port_file) = spawn_ipc_server("play_not_found");
 
   let resp = send_command(
     &port_file,
@@ -913,7 +1057,4 @@ fn ipc_play_nonexistent_file_returns_file_not_found() {
   );
   assert_eq!(resp["status"], "error");
   assert_eq!(resp["code"], "FILE_NOT_FOUND");
-
-  engine.shutdown();
-  poke_server(&port_file);
 }

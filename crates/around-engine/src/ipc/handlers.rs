@@ -1,5 +1,3 @@
-// Clippy: Mutex poisoning panics are intentional — they indicate unrecoverable bugs.
-#![allow(clippy::expect_used)]
 use crate::ipc::types::{CodecDescriptor, ErrorCode, IpcResponse, StreamStatus, TrackInfo};
 use crate::pipeline::Engine;
 use std::path::PathBuf;
@@ -7,6 +5,13 @@ use std::sync::Arc;
 
 /// Resolve an optional stream_id to a concrete stream ID.
 /// If None, uses the sole active stream. Returns an error response if no stream found.
+// IpcResponse is intentionally large (carries all response fields in one type).
+// Boxing fields would add indirection without benefit. Expected removal: when
+// response types are split per-command (Post-ADR-0003 IPC rationalization).
+#[expect(
+  clippy::result_large_err,
+  reason = "IpcResponse is a unified wire type; boxing adds indirection until responses split per command"
+)]
 fn resolve_stream_id(engine: &Arc<Engine>, stream_id: Option<u64>) -> Result<u64, IpcResponse> {
   match stream_id {
     Some(id) => Ok(id),
@@ -36,9 +41,15 @@ pub(crate) fn handle_play(
   };
 
   let stream_id = prepared.stream_id;
-
-  // Spawn the blocking decode loop in the background.
+  // Spawn the decode loop.
   let eng = engine.clone();
+  #[cfg(feature = "async-decode")]
+  tokio::spawn(async move {
+    if let Err(e) = eng.run_stream_spawn(stream_id) {
+      tracing::error!(?e, "async playback error");
+    }
+  });
+  #[cfg(not(feature = "async-decode"))]
   tokio::spawn(async move {
     if let Err(e) = eng.run_stream(stream_id) {
       tracing::error!(?e, "playback error");

@@ -1,0 +1,21 @@
+[package]
+name = "around-audio-sdk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license-file.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+around-extensions = { workspace = true }          # Framework::instance().attach_register()
+around-extensions-macros = { workspace = true }   # #[slot] proc-macro
+stabby = { workspace = true }                     # #[stabby::stabby], stabby::boxed::Box
+stabby-abi = { workspace = true, features = ["std", "test"] }  # REGISTER_VTABLE, IConstConstructor
+parking_lot = { workspace = true }                # generated CodecRegister::Mutex
+
+[features]
+test-utils = []  # reserved for future test utilities in the SDK crate

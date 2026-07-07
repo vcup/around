@@ -9,6 +9,7 @@ members = [
     "crates/around-extensions-test-plugin",
     "crates/around-extensions",
     "crates/around-extensions-macros",
+    "crates/around-audio-sdk",
 ]
 resolver = "2"
 
@@ -28,6 +29,7 @@ around-codec-wav = { path = "crates/around-codec-wav" }
 around-codec-test-pcm = { path = "crates/around-codec-test-pcm" }
 around-extensions = { path = "crates/around-extensions" }
 around-extensions-macros = { path = "crates/around-extensions-macros" }
+around-audio-sdk = { path = "crates/around-audio-sdk" }
 
 bitflags = "2"
 clap = { version = "4", features = ["derive"] }
@@ -36,22 +38,18 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 ctrlc = "3"
-symphonia = { version = "0.5", default-features = false }
 kdl = "6"
 cpal = "0.15"
 libloading = "0.8"
 serde = "1"
 base64 = "0.22"
-criterion = { version = "0.5", features = ["html_reports"] }
 crossbeam = "0.8"
 prost = "0.14"
 prost-build = "0.14"
 stabby = "72"
 stabby-abi = "72"
 ringbuf = "0.4"
-rubato = "0.15"
 tokio-util = { version = "0.7", features = ["rt"] }
-atomic = "0.6"
 parking_lot = "0.12"
 
 [workspace.lints.clippy]

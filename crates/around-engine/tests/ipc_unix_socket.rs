@@ -5,31 +5,35 @@
 #![cfg(unix)]
 
 use around_engine::{Engine, EngineConfig};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Write};
+use std::ops::Deref;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 fn test_socket_path(suffix: &str) -> std::path::PathBuf {
   std::env::temp_dir().join(format!("around-test-{}.sock", suffix))
 }
 
+#[expect(
+  clippy::expect_used,
+  reason = "every expect in send_unix_command is safe: socket exists (server created it before poll completed); commands are static json; connected socket accepts writes; response is well-formed json"
+)]
 fn send_unix_command(socket: &std::path::Path, cmd: &serde_json::Value) -> serde_json::Value {
   let mut stream = UnixStream::connect(socket).expect("connect unix socket");
 
+  // JsonLineCodec protocol: newline-delimited JSON (no length prefix)
   let json = serde_json::to_vec(cmd).expect("serialize");
-  stream
-    .write_all(&(json.len() as u64).to_le_bytes())
-    .expect("write len");
   stream.write_all(&json).expect("write json");
+  stream.write_all(b"\n").expect("write newline");
   stream.flush().expect("flush");
 
-  let mut len_buf = [0u8; 8];
-  stream.read_exact(&mut len_buf).expect("read len");
-  let resp_len = u64::from_le_bytes(len_buf) as usize;
-  let mut resp_buf = vec![0u8; resp_len];
-  stream.read_exact(&mut resp_buf).expect("read resp");
-  serde_json::from_slice(&resp_buf).expect("parse resp")
+  // Read response: server writes JSON + \n
+  let mut resp = String::new();
+  let mut reader = BufReader::new(&stream);
+  reader.read_line(&mut resp).expect("read response line");
+  serde_json::from_str(resp.trim()).expect("parse resp")
 }
 
 struct SocketGuard(std::path::PathBuf);
@@ -39,27 +43,59 @@ impl Drop for SocketGuard {
   }
 }
 
-fn spawn_server(
+/// Ensures engine shutdown and server thread unblock on panic (avoids thread leak).
+struct ServerGuard {
   engine: Arc<Engine>,
-  socket_path: std::path::PathBuf,
-) -> std::thread::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+  socket_path: PathBuf,
+}
+
+impl Drop for ServerGuard {
+  fn drop(&mut self) {
+    self.engine.shutdown();
+    let _ = UnixStream::connect(&self.socket_path);
+  }
+}
+
+impl Deref for ServerGuard {
+  type Target = Engine;
+  fn deref(&self) -> &Engine {
+    &self.engine
+  }
+}
+
+fn spawn_server(engine: Arc<Engine>, socket_path: PathBuf) -> ServerGuard {
+  let guard_engine = engine.clone();
+  let guard_socket = socket_path.clone();
   std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime builder with standard config must succeed"
+    )]
     let rt = tokio::runtime::Builder::new_current_thread()
       .enable_io()
       .enable_time()
       .build()
       .expect("tokio runtime");
-    let mut ipc_config = around_engine::ipc::IpcConfig::default();
-    ipc_config.enable_platform_native = false;
-    ipc_config.check_running_instance = false;
-    ipc_config.force_json = true;
-    ipc_config.unix_socket_path = Some(socket_path.clone());
-    // Set a TCP bind address to avoid colliding with the default port file.
-    ipc_config.tcp_bind = Some("127.0.0.1:0".parse().unwrap());
-    rt.block_on(around_engine::run_ipc_server(ipc_config, engine))
-      .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e })?;
-    Ok(())
-  })
+    #[expect(
+      clippy::unwrap_used,
+      reason = "static addr string 127.0.0.1:0 is a valid SocketAddr"
+    )]
+    let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+    let ipc_config = around_engine::ipc::IpcConfig {
+      enable_platform_native: true,
+      check_running_instance: false,
+      force_json: true,
+      unix_socket_path: Some(socket_path),
+      tcp_bind: Some(addr),
+      ..Default::default()
+    };
+    let _ = rt.block_on(around_engine::run_ipc_server(ipc_config, engine));
+  });
+  ServerGuard {
+    engine: guard_engine,
+    socket_path: guard_socket,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -69,13 +105,11 @@ fn spawn_server(
 #[test]
 fn unix_socket_created_with_correct_permissions() {
   let sp = test_socket_path(&format!("perm-{}", std::process::id()));
-  let _guard = SocketGuard(sp.clone());
+  let _socket_guard = SocketGuard(sp.clone());
   let _ = std::fs::remove_file(&sp);
 
   let config = EngineConfig::load();
-  let engine = Arc::new(Engine::new(config));
-
-  let server = spawn_server(engine.clone(), sp.clone());
+  let _guard = spawn_server(Arc::new(Engine::new(config)), sp.clone());
 
   // Wait for socket to be created.
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -87,14 +121,20 @@ fn unix_socket_created_with_correct_permissions() {
   }
 
   assert!(sp.exists(), "socket should exist");
-  assert_eq!(sp.metadata().unwrap().permissions().mode() & 0o777, 0o600);
-
-  engine.shutdown();
-  let _ = server.join();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "socket path exists (poll loop confirmed creation); metadata must be readable"
+  )]
+  let meta = sp.metadata().unwrap();
+  assert_eq!(meta.permissions().mode() & 0o777, 0o600);
 }
 
 #[test]
 fn resolve_socket_dir_falls_back_to_tmpdir() {
+  if std::env::var("XDG_RUNTIME_DIR").is_ok() {
+    eprintln!("skipping: XDG_RUNTIME_DIR is set, socket dir will use it instead of tmpdir");
+    return;
+  }
   let (sp, _) = around_engine::ipc::transport_unix::resolve_socket_dir();
   assert!(
     sp.to_string_lossy().contains("tmp") || sp.to_string_lossy().contains("TMP"),
@@ -110,9 +150,7 @@ fn unix_socket_status_command_round_trip() {
   let _ = std::fs::remove_file(&sp);
 
   let config = EngineConfig::load();
-  let engine = Arc::new(Engine::new(config));
-
-  let server = spawn_server(engine.clone(), sp.clone());
+  let _ipc_guard = spawn_server(Arc::new(Engine::new(config)), sp.clone());
 
   // Wait for socket to be created.
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -125,9 +163,6 @@ fn unix_socket_status_command_round_trip() {
 
   let resp = send_unix_command(&sp, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok", "status should succeed");
-
-  engine.shutdown();
-  let _ = server.join();
 }
 
 #[test]
@@ -135,13 +170,9 @@ fn duplicate_instance_rejected_via_unix_socket() {
   let sp = test_socket_path(&format!("dup-{}", std::process::id()));
   let _guard = SocketGuard(sp.clone());
   let _ = std::fs::remove_file(&sp);
-
   let config = EngineConfig::load();
-
   // Start first instance.
-  let engine1 = Arc::new(Engine::new(config.clone()));
-  let server1 = spawn_server(engine1.clone(), sp.clone());
-
+  let _guard1 = spawn_server(Arc::new(Engine::new(config.clone())), sp.clone());
   // Wait for socket to be created.
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
   while !sp.exists() {
@@ -150,13 +181,9 @@ fn duplicate_instance_rejected_via_unix_socket() {
     }
     std::thread::sleep(std::time::Duration::from_millis(50));
   }
-
   // Verify first instance is running by sending a command.
   let resp = send_unix_command(&sp, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok", "first instance should respond");
-
-  engine1.shutdown();
-  let _ = server1.join();
 }
 
 #[test]
@@ -166,13 +193,15 @@ fn stale_unix_socket_detected_and_replaced() {
   let _ = std::fs::remove_file(&sp);
 
   // Create a stale socket file.
+  #[expect(
+    clippy::expect_used,
+    reason = "temp dir is writable; writing to known temp path must succeed"
+  )]
   std::fs::write(&sp, b"stale").expect("write stale socket");
   assert!(sp.exists(), "stale socket should exist");
 
   let config = EngineConfig::load();
-  let engine = Arc::new(Engine::new(config));
-
-  let server = spawn_server(engine.clone(), sp.clone());
+  let _ipc_guard = spawn_server(Arc::new(Engine::new(config)), sp.clone());
 
   // Wait for server to start and replace the socket.
   std::thread::sleep(std::time::Duration::from_millis(500));
@@ -181,7 +210,4 @@ fn stale_unix_socket_detected_and_replaced() {
   // Verify by sending a command.
   let resp = send_unix_command(&sp, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok");
-
-  engine.shutdown();
-  let _ = server.join();
 }

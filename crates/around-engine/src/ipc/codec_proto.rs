@@ -47,7 +47,10 @@ fn playback_status_to_proto(s: types::PlaybackStatus) -> i32 {
   }
 }
 
-#[allow(dead_code)]
+#[expect(
+  dead_code,
+  reason = "protobuf IPC codec not fully wired; will be activated when protobuf-ipc feature is completed"
+)]
 fn proto_playback_status_from_i32(v: i32) -> std::io::Result<types::PlaybackStatus> {
   match v {
     0 => Ok(types::PlaybackStatus::Playing),

@@ -1,7 +1,21 @@
 //! Engine configuration.
-
 use kdl::KdlDocument;
 use std::path::PathBuf;
+
+/// Selects the audio output driver for decode loops.
+///
+/// * `Cpal` — real audio device via cpal (default, requires audio hardware)
+/// * `Null` — silent discard (headless/CI)
+///
+/// Custom sinks can be used directly with
+/// [`Engine::run_stream_with_sink`](crate::pipeline::Engine::run_stream_with_sink).
+#[derive(Debug, Clone)]
+pub enum OutputDriver {
+  /// Real audio output via the default cpal device.
+  Cpal,
+  /// Silent discard — no audio hardware needed.
+  Null,
+}
 
 /// KDL-backed engine configuration.
 #[derive(Debug, Clone)]
@@ -9,6 +23,8 @@ pub struct EngineConfig {
   pub output_device: Option<String>,
   pub output_auto_reconnect: bool,
   pub codec_search_paths: Vec<PathBuf>,
+  /// Selects the audio output backend. Defaults to `Cpal`.
+  pub output_driver: OutputDriver,
 }
 
 impl Default for EngineConfig {
@@ -17,6 +33,7 @@ impl Default for EngineConfig {
       output_device: None,
       output_auto_reconnect: true,
       codec_search_paths: Vec::new(),
+      output_driver: OutputDriver::Cpal,
     }
   }
 }

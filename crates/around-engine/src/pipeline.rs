@@ -3,18 +3,17 @@
 //! Single `Engine` manages 0..N concurrent `Stream`s. Each stream has
 //! independent state via all-Atomic `StreamState` and `CancellationToken`.
 
+use crate::config::OutputDriver;
 use crate::filter_chain::FilterChain;
-use crate::output::create_output;
-use around_core::codec::{init_codec, CodecDyn, CodecRegister, DynCodecRef, StreamInfo};
+use around_audio_sdk::codec::{debug_track_stream, init_codec, SafeCodecRef, StreamInfo};
+use around_core::audio_sink::AudioSink;
 use around_core::state::PlaybackStatus;
 use around_core::{AroundError, SampleSpec, Source, SourceCapabilities};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam::channel;
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::io::Read;
-use std::mem::ManuallyDrop;
+use std::io::{Read, Seek};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -34,36 +33,56 @@ fn next_stream_id() -> StreamId {
 // StreamState — all-Atomic per-stream state
 // ---------------------------------------------------------------------------
 
+/// Atomic wrapper around `PlaybackStatus` for lock-free status transitions.
+///
+/// Satisfies ADR-0005: the public API uses `PlaybackStatus` directly
+/// instead of raw `u8` conversions.
+struct AtomicPlaybackStatus(AtomicU8);
+
+impl AtomicPlaybackStatus {
+  const fn new(s: PlaybackStatus) -> Self {
+    Self(AtomicU8::new(s as u8))
+  }
+
+  fn load(&self, order: Ordering) -> PlaybackStatus {
+    match self.0.load(order) {
+      0 => PlaybackStatus::Playing,
+      1 => PlaybackStatus::Paused,
+      2 => PlaybackStatus::Stopped,
+      3 => PlaybackStatus::Buffering,
+      4 => PlaybackStatus::Error,
+      _ => PlaybackStatus::Stopped,
+    }
+  }
+
+  fn store(&self, s: PlaybackStatus, order: Ordering) {
+    self.0.store(s as u8, order);
+  }
+}
+
 pub struct StreamState {
-  status: AtomicU8,
-  pub position_ms: AtomicU64,
-  pub device_lost: AtomicBool,
   pub active: AtomicBool,
+  pub position_ms: AtomicU64,
+  status: AtomicPlaybackStatus,
+  pub device_lost: AtomicBool,
 }
 
 impl StreamState {
   pub fn new() -> Self {
     Self {
-      status: AtomicU8::new(PlaybackStatus::Stopped as u8),
-      position_ms: AtomicU64::new(0),
-      device_lost: AtomicBool::new(false),
       active: AtomicBool::new(false),
+      position_ms: AtomicU64::new(0),
+      status: AtomicPlaybackStatus::new(PlaybackStatus::Stopped),
+      device_lost: AtomicBool::new(false),
     }
   }
 
   pub fn status(&self) -> PlaybackStatus {
-    let raw = self.status.load(Ordering::SeqCst);
-    match raw {
-      0 => PlaybackStatus::Playing,
-      1 => PlaybackStatus::Paused,
-      2 => PlaybackStatus::Stopped,
-      3 => PlaybackStatus::Buffering,
-      _ => PlaybackStatus::Error,
-    }
+    self.status.load(Ordering::SeqCst)
   }
 
   pub fn set_status(&self, s: PlaybackStatus) {
-    self.status.store(s as u8, Ordering::SeqCst);
+    self.status.store(s, Ordering::SeqCst);
   }
 }
 
@@ -82,7 +101,9 @@ impl Default for StreamState {
 /// which is thread-safe per stabby's design.
 #[derive(Clone, Copy)]
 struct StreamPtr(*mut c_void);
+// SAFETY: StreamPtr wraps *mut c_void which is neither Send nor Sync by default. The engine ensures that StreamPtr values are only accessed from the stream's owning thread or under appropriate synchronization. The raw pointer is never dereferenced concurrently without synchronization.
 unsafe impl Send for StreamPtr {}
+// SAFETY: See Send impl above. Same invariant — the engine ensures no concurrent mutable access through different threads.
 unsafe impl Sync for StreamPtr {}
 
 struct ActiveStream {
@@ -90,7 +111,7 @@ struct ActiveStream {
   state: Arc<StreamState>,
   cancel: CancellationToken,
   stream_ptr: Option<StreamPtr>,
-  codec_handle: Option<CodecHandle>,
+  codec_ref: Option<SafeCodecRef<'static>>,
   sample_rate: u64,
   channels: u8,
   total_frames: u64,
@@ -101,6 +122,26 @@ struct ActiveStream {
   output_format: SampleSpec,
   seek_tx: Option<channel::Sender<u64>>,
   seek_rx: Option<channel::Receiver<u64>>,
+  /// Source for async I/O. Used by run_stream_async() to read raw bytes
+  /// on the main tokio runtime, keeping only CPU work in spawn_blocking.
+  /// When the codec API gains a decode-from-bytes method, this replaces
+  /// the codec's internal reader bridge (Phase 2+).
+  source: Option<tokio::sync::Mutex<Box<dyn Source>>>,
+}
+
+impl Drop for ActiveStream {
+  fn drop(&mut self) {
+    // If the stream was never consumed by run_stream(), clean up the
+    // per-stream codec state to prevent resource leaks (HIGH-4).
+    if let (Some(StreamPtr(stream_ptr)), Some(codec_ref)) =
+      (self.stream_ptr.take(), self.codec_ref.take())
+    {
+      codec_ref.drop(stream_ptr);
+      debug_track_stream(false);
+    }
+    // If run_stream() already consumed the resources, stream_ptr and
+    // codec_ref are None, and this is a no-op.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +172,7 @@ impl std::fmt::Display for SeekError {
     match self {
       SeekError::StreamNotFound => write!(f, "stream not found"),
       SeekError::NotSeekable => write!(f, "stream is not seekable"),
-      SeekError::StreamEnded => write!(f, "stream has ended"),
+      SeekError::StreamEnded => write!(f, "stream has ended or been stopped"),
     }
   }
 }
@@ -150,104 +191,45 @@ pub struct Engine {
 }
 
 pub struct PlaybackHandle {
-  pub output_format: SampleSpec,
   pub stream_id: StreamId,
-  pub codec_name: String,
-  pub duration_ms: Option<u64>,
-  pub seekable: bool,
 }
 
-impl PlaybackHandle {
-  pub fn stream_id(&self) -> StreamId {
-    self.stream_id
-  }
-}
+trait ReadSeekSend: Read + Seek + Send + Sync {}
+impl<T: Read + Seek + Send + Sync> ReadSeekSend for T {}
 
-// ---------------------------------------------------------------------------
-// Reader callback helpers
-// ---------------------------------------------------------------------------
-
-trait ReadSend: Read + Send {}
-impl<T: Read + Send> ReadSend for T {}
-
-struct ReaderBridge<R: Read + Send> {
+struct ReaderBridge<R: Read + Seek + Send> {
   reader: R,
 }
 
+// SAFETY: read_cb is called only from within a codec's open() method. The buf and len parameters are provided by the engine per the ReaderBridge contract. The callback lifetime is scoped to the open() call.
 unsafe extern "C" fn read_cb(ctx: *mut c_void, buf: *mut u8, len: usize) -> i64 {
-  let bridge = &mut *(ctx as *mut ReaderBridge<Box<dyn ReadSend>>);
-  let buf_slice = unsafe { std::slice::from_raw_parts_mut(buf, len) };
-  match bridge.reader.read(buf_slice) {
+  if ctx.is_null() {
+    return -1;
+  }
+  let bridge = &mut *(ctx as *mut ReaderBridge<Box<dyn ReadSeekSend>>);
+  let slice = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+  match bridge.reader.read(slice) {
     Ok(n) => n as i64,
     Err(_) => -1,
   }
 }
 
-unsafe extern "C" fn seek_cb(_ctx: *mut c_void, _pos: i64, _whence: i32) -> i64 {
-  -1
-}
-
-// ---------------------------------------------------------------------------
-// CodecHandle — dynamic dispatch through CodecRegister
-// ---------------------------------------------------------------------------
-
-/// Handle to a registered codec. Holds raw vtable + codec data pointers.
-/// Methods dispatch through the vtable directly, avoiding ownership issues.
-struct CodecHandle {
-  vtable: *const (),
-  codec_data: *mut (),
-}
-
-// SAFETY: CodecHandle references a codec from the global registry (process
-// lifetime). The vtable is never mutated; the codec_data is accessed only
-// through the vtable's dispatch, which is thread-safe per stabby design.
-unsafe impl Send for CodecHandle {}
-unsafe impl Sync for CodecHandle {}
-
-impl CodecHandle {
-  /// Call `Codec::read` through the vtable.
-  unsafe fn read(&self, stream: *mut c_void, buf: *mut f32, buf_len: usize) -> i32 {
-    // VTable layout (stabby #[repr(C)]): methods in declaration order.
-    // read is the 4th method (after probe, name, open).
-    type ReadMethod = unsafe extern "C" fn(*const (), *mut c_void, *mut f32, usize) -> i32;
-    let vtable = self.vtable as *const ReadMethod;
-    let read_fn = unsafe { *vtable.add(3) };
-    unsafe { read_fn(self.codec_data as *const (), stream, buf, buf_len) }
+// SAFETY: seek_cb is called only from within a codec's open() method. Parameters are provided by the engine per the ReaderBridge contract. The callback lifetime is scoped to the open() call.
+unsafe extern "C" fn seek_cb(ctx: *mut c_void, pos: i64, whence: i32) -> i64 {
+  if ctx.is_null() {
+    return -1;
   }
-
-  /// Call `Codec::drop` through the vtable. Named `destroy` to avoid conflict
-  /// with `Drop::drop`.
-  unsafe fn destroy(&self, stream: *mut c_void) {
-    // drop is the 6th method (after probe, name, open, read, seek).
-    type DropMethod = unsafe extern "C" fn(*const (), *mut c_void);
-    let vtable = self.vtable as *const DropMethod;
-    let drop_fn = unsafe { *vtable.add(5) };
-    unsafe { drop_fn(self.codec_data as *const (), stream) };
-  }
-
-  /// Call `Codec::name` through the vtable.
-  unsafe fn name(&self) -> *const u8 {
-    // name is the 2nd method (after probe).
-    type NameMethod = unsafe extern "C" fn(*const ()) -> *const u8;
-    let vtable = self.vtable as *const NameMethod;
-    let name_fn = unsafe { *vtable.add(1) };
-    unsafe { name_fn(self.codec_data as *const ()) }
-  }
-
-  /// Call `Codec::seek` through the vtable.
-  /// `frame` is the 0-based frame index. Returns new position or negative on error.
-  unsafe fn seek(&self, stream: *mut c_void, frame: u64) -> i64 {
-    // seek is the 5th method (after probe, name, open, read).
-    type SeekMethod = unsafe extern "C" fn(*const (), *mut c_void, u64) -> i64;
-    let vtable = self.vtable as *const SeekMethod;
-    let seek_fn = unsafe { *vtable.add(4) };
-    unsafe { seek_fn(self.codec_data as *const (), stream, frame) }
-  }
-
-  /// Create a non-owning DynCodecRef view for calling trait methods
-  /// through the CodecDyn trait (probe, open).
-  fn as_ref(&self) -> ManuallyDrop<DynCodecRef> {
-    unsafe { ManuallyDrop::new(CodecRegister::from_raw(self.vtable, self.codec_data)) }
+  let bridge = &mut *(ctx as *mut ReaderBridge<Box<dyn ReadSeekSend>>);
+  use std::io::SeekFrom;
+  let from = match whence {
+    0 => SeekFrom::Start(pos as u64),
+    1 => SeekFrom::Current(pos),
+    2 => SeekFrom::End(pos),
+    _ => return -1,
+  };
+  match bridge.reader.seek(from) {
+    Ok(n) => n as i64,
+    Err(_) => -1,
   }
 }
 
@@ -270,17 +252,20 @@ impl Engine {
   /// and returns metadata without starting the decode loop.
   pub fn prepare(&self, source: Box<dyn Source>) -> Result<PreparedStream, AroundError> {
     let seekable = source.capabilities().contains(SourceCapabilities::SEEKABLE);
-    let (stream_ptr, info, codec_handle) = Self::open_codec(source.as_ref(), seekable)?;
-    let codec_name = unsafe {
-      let p = codec_handle.name();
-      std::ffi::CStr::from_ptr(p as *const i8)
-        .to_string_lossy()
-        .into_owned()
+    let (stream_ptr, info, codec_ref) = Self::open_codec(source.as_ref(), seekable)?;
+    let codec_name = {
+      let p = codec_ref.name();
+      // SAFETY: name() returns a valid null-terminated C string pointer.
+      unsafe {
+        std::ffi::CStr::from_ptr(p as *const i8)
+          .to_string_lossy()
+          .into_owned()
+      }
     };
 
     let sample_rate = info.sample_rate as u64;
     if sample_rate == 0 {
-      unsafe { codec_handle.destroy(stream_ptr) };
+      codec_ref.drop(stream_ptr);
       return Err(AroundError::DecodeError {
         message: "codec returned sample_rate=0".into(),
       });
@@ -291,7 +276,7 @@ impl Engine {
     let output_format = match SampleSpec::interleaved(sample_rate as u32, channels, 16) {
       Ok(fmt) => fmt,
       Err(e) => {
-        unsafe { codec_handle.destroy(stream_ptr) };
+        codec_ref.drop(stream_ptr);
         return Err(AroundError::DecodeError {
           message: format!("invalid stream spec: {}", e),
         });
@@ -319,7 +304,7 @@ impl Engine {
       state: Arc::clone(&stream_state),
       cancel: cancel.clone(),
       stream_ptr: Some(StreamPtr(stream_ptr)),
-      codec_handle: Some(codec_handle),
+      codec_ref: Some(codec_ref),
       sample_rate,
       channels,
       total_frames,
@@ -329,9 +314,11 @@ impl Engine {
       seekable,
       output_format,
       seek_tx: Some(seek_tx),
+      source: Some(tokio::sync::Mutex::new(source)),
       seek_rx: Some(seek_rx),
     };
     self.streams.write().insert(stream_id, active);
+    debug_track_stream(true);
 
     Ok(PreparedStream {
       stream_id,
@@ -342,14 +329,54 @@ impl Engine {
     })
   }
 
-  /// Run the decode loop for a prepared stream. Blocks until playback
-  /// completes, is stopped, or hits a fatal error.
-  /// On exit: sets status Stopped, active false, removes stream from map.
+  /// Run the decode loop for a prepared stream using the configured output driver.
+  ///
+  /// This is a thin wrapper around [`run_stream_with_sink`] that creates the
+  /// default sink based on [`EngineConfig::output_driver`]:
+  ///
+  /// * `OutputDriver::Cpal` — creates a [`CpalSink`]
+  /// * `OutputDriver::Null` — creates a [`NullSink`]
+  ///
+  /// This method preserves backward compatibility with existing callers
+  /// (CLI, IPC handlers). For custom sinks, call [`run_stream_with_sink`] directly.
   pub fn run_stream(&self, id: StreamId) -> Result<(), AroundError> {
+    let (sample_rate, channels) = {
+      let streams = self.streams.read();
+      let s = streams.get(&id).ok_or_else(|| AroundError::Internal {
+        message: format!("run_stream: stream {} not found", id),
+      })?;
+      (s.sample_rate, s.channels)
+    };
+    let sink: Box<dyn AudioSink> = match &self.config.output_driver {
+      OutputDriver::Cpal => Box::new(crate::cpal_sink::CpalSink::new(
+        sample_rate as u32,
+        channels,
+      )?),
+      OutputDriver::Null => Box::new(around_core::audio_sink::NullSink::new(
+        sample_rate as u32,
+        channels,
+      )),
+    };
+
+    self.run_stream_with_sink(id, sink)
+  }
+
+  /// Run the decode loop for a prepared stream, sending output to the given sink.
+  ///
+  /// This is the core decode loop. The caller provides an [`AudioSink`] — either
+  /// [`CpalSink`] for real audio, [`NullSink`] for silent discard, or
+  /// [`RingBufSink`] for test capture.
+  ///
+  /// On exit: sets status Stopped, active false, removes stream from map.
+  pub fn run_stream_with_sink(
+    &self,
+    id: StreamId,
+    mut sink: Box<dyn AudioSink>,
+  ) -> Result<(), AroundError> {
     // Take ownership of decode resources from the stream map.
     let (
       stream_ptr,
-      codec_handle,
+      codec_ref,
       seek_rx,
       sample_rate,
       channels,
@@ -369,7 +396,7 @@ impl Engine {
       let StreamPtr(stream_ptr) = s.stream_ptr.take().ok_or_else(|| AroundError::Internal {
         message: format!("run_stream: stream {} resources already consumed", id),
       })?;
-      let codec_handle = s.codec_handle.take().ok_or_else(|| AroundError::Internal {
+      let codec_ref = s.codec_ref.take().ok_or_else(|| AroundError::Internal {
         message: format!("run_stream: stream {} codec already consumed", id),
       })?;
       let seek_rx = s.seek_rx.take();
@@ -381,7 +408,7 @@ impl Engine {
       let cancel = s.cancel.clone();
       (
         stream_ptr,
-        codec_handle,
+        codec_ref,
         seek_rx,
         s.sample_rate,
         s.channels,
@@ -401,57 +428,12 @@ impl Engine {
       SampleSpec::interleaved(sample_rate as u32, channels, 16).unwrap_or(output_format);
     let mut filter_chain = FilterChain::build(decode_spec, vec![], output_format);
 
-    // --- Audio output setup (ringbuf) ---
-    let (mut producer, consumer) = create_output(16384);
-    let consumer = Arc::new(std::sync::Mutex::new(consumer));
-
-    let host = cpal::default_host();
-    let device = host
-      .default_output_device()
-      .ok_or_else(|| AroundError::Internal {
-        message: "no audio output device found".into(),
-      })?;
-    let config = device
-      .default_output_config()
-      .map_err(|e| AroundError::Internal {
-        message: format!("audio device error: {}", e),
-      })?;
-
-    let consumer_clone = Arc::clone(&consumer);
-    let device_lost_flag = Arc::clone(&self.device_lost);
-    let cpal_stream = device
-      .build_output_stream(
-        &config.into(),
-        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-          if let Ok(mut cons) = consumer_clone.lock() {
-            let popped = cons.pop_slice(data);
-            if popped < data.len() {
-              data[popped..].fill(0.0);
-            }
-          } else {
-            data.fill(0.0);
-          }
-        },
-        move |err| {
-          tracing::error!(?err, "cpal stream error");
-          device_lost_flag.store(true, Ordering::SeqCst);
-        },
-        None,
-      )
-      .map_err(|e| AroundError::Internal {
-        message: format!("failed to build audio output stream: {}", e),
-      })?;
-
-    cpal_stream.play().map_err(|e| AroundError::Internal {
-      message: format!("failed to start audio output stream: {}", e),
-    })?;
-
     // --- Decode loop (blocking) ---
     let _span = tracing::info_span!("playback", id).entered();
     tracing::info!(id, codec = codec_name, "starting playback");
     stream_state.set_status(PlaybackStatus::Playing);
 
-    let max_ch = output_format.channels.max(1) as usize;
+    let max_ch = channels.max(1) as usize;
     let mut buf = vec![0.0f32; 4096 * max_ch];
     let mut total_frames_decoded: u64 = 0;
     let mut consecutive_errors = 0u32;
@@ -486,7 +468,7 @@ impl Engine {
       if let Some(rx) = &seek_rx {
         while let Ok(position_ms) = rx.try_recv() {
           let frame = (position_ms as u128 * sample_rate as u128 / 1000) as u64;
-          match unsafe { codec_handle.seek(stream_ptr, frame) } {
+          match codec_ref.seek(stream_ptr, frame) {
             new_pos if new_pos >= 0 => {
               total_frames_decoded = new_pos as u64;
               let pos = total_frames_decoded * 1000 / sample_rate;
@@ -501,11 +483,16 @@ impl Engine {
         }
       }
 
-      let n = unsafe { codec_handle.read(stream_ptr, buf.as_mut_ptr(), buf.len()) };
+      let n = codec_ref.read(stream_ptr, buf.as_mut_ptr(), buf.len());
       if n > 0 {
         let sample_count = n as usize;
         let processed = filter_chain.process(&mut buf[..sample_count], channels);
-        producer.push_slice(&buf[..processed]);
+        if let Err(e) = sink.write(&buf[..processed]) {
+          tracing::error!(id, error = ?e, "sink write error");
+          stream_state.set_status(PlaybackStatus::Error);
+          decode_error = Some(e);
+          break;
+        }
         total_frames_decoded += (n as u64) / channels as u64;
         consecutive_errors = 0;
         let pos = total_frames_decoded * 1000 / sample_rate;
@@ -532,7 +519,8 @@ impl Engine {
       stream_state.set_status(PlaybackStatus::Stopped);
     }
     stream_state.active.store(false, Ordering::SeqCst);
-    unsafe { codec_handle.destroy(stream_ptr) };
+    codec_ref.drop(stream_ptr);
+    debug_track_stream(false);
 
     // Cleanup stream from engine.
     self.streams.write().remove(&id);
@@ -544,6 +532,266 @@ impl Engine {
     }
   }
 
+  #[cfg(feature = "async-decode")]
+  /// Run the decode loop for a prepared stream using async I/O.
+  ///
+  /// Async version of [`run_stream_with_sink`] that:
+  /// 1. Uses async pause (non-blocking sleep)
+  /// 2. Reads raw bytes from [`Source::read`] on the main tokio runtime (Phase 2)
+  /// 3. Offloads decode + filter + ring_push (CPU work) to `tokio::task::spawn_blocking`
+  ///
+  /// # Async I/O architecture
+  ///
+  /// The decode loop splits I/O from CPU work:
+  /// - **Main runtime (async):** `source.read(&mut raw_buf).await` — reads raw
+  ///   encoded bytes from the source without blocking the runtime.
+  /// - **Blocking pool:** `codec_ref.read()` decodes PCM samples, filters
+  ///   process, and sink write — all CPU-bound or blocking C FFI.
+  ///
+  /// Phase 2 (Gen 7) added the `source.read()` on the main runtime. The
+  /// codec still uses its own reader bridge (opened during `prepare()`) for
+  /// the actual decode. Future work (codec API refactoring) will wire the
+  /// async-provided raw bytes directly into the codec, eliminating the
+  /// codec's internal I/O.
+  ///
+  /// # Cleanup
+  ///
+  /// On exit (EOF, cancel, error, device loss): sets status Stopped (unless
+  /// already Error), active false, drops codec stream, removes stream from map.
+  pub async fn run_stream_async(
+    &self,
+    id: StreamId,
+    mut sink: Box<dyn AudioSink>,
+  ) -> Result<(), AroundError> {
+    let (
+      stream_ptr,
+      codec_ref,
+      seek_rx,
+      sample_rate,
+      channels,
+      _total_frames,
+      output_format,
+      _source_path,
+      codec_name,
+      _duration_ms,
+      _seekable,
+      stream_state,
+      cancel,
+      source,
+    ) = {
+      let mut streams = self.streams.write();
+      let s = streams.get_mut(&id).ok_or_else(|| AroundError::Internal {
+        message: format!("run_stream_async: stream {} not found", id),
+      })?;
+      let stream_ptr = s.stream_ptr.take().ok_or_else(|| AroundError::Internal {
+        message: format!("run_stream_async: stream {} resources already consumed", id),
+      })?;
+      let codec_ref = s.codec_ref.take().ok_or_else(|| AroundError::Internal {
+        message: format!("run_stream_async: stream {} codec already consumed", id),
+      })?;
+      let seek_rx = s.seek_rx.take();
+      let _source_path = s.source_path.clone();
+      let codec_name = s.codec_name.clone();
+      let _duration_ms = s.duration_ms;
+      let _seekable = s.seekable;
+      let stream_state = s.state.clone();
+      let cancel = s.cancel.clone();
+      let source = s.source.take().ok_or_else(|| AroundError::Internal {
+        message: format!("run_stream_async: stream {} source already consumed", id),
+      })?;
+      (
+        stream_ptr,
+        codec_ref,
+        seek_rx,
+        s.sample_rate,
+        s.channels,
+        s.total_frames,
+        s.output_format,
+        _source_path,
+        codec_name,
+        _duration_ms,
+        _seekable,
+        stream_state,
+        cancel,
+        source,
+      )
+    };
+
+    // Build filter chain (empty = passthrough; filters added per user config).
+    let decode_spec =
+      SampleSpec::interleaved(sample_rate as u32, channels, 16).unwrap_or(output_format);
+    let mut filter_chain = FilterChain::build(decode_spec, vec![], output_format);
+
+    // --- Async decode loop ---
+    let _span = tracing::info_span!("playback", id);
+    tracing::info!(id, codec = codec_name, "starting async playback");
+    stream_state.set_status(PlaybackStatus::Playing);
+
+    let max_ch = channels.max(1) as usize;
+    let mut pcm_buf = vec![0.0f32; 4096 * max_ch];
+    let mut total_frames_decoded: u64 = 0;
+    let mut consecutive_errors = 0u32;
+    let mut decode_error: Option<AroundError> = None;
+    let mut raw_buf = vec![0u8; 65536]; // raw bytes from source (Phase 2 I/O)
+
+    loop {
+      // Check cancellation (fast path — no select! cost for common case).
+      if cancel.is_cancelled() {
+        tracing::debug!(id, "stream cancelled");
+        break;
+      }
+
+      // Check device loss.
+      if self.device_lost.load(Ordering::SeqCst) {
+        tracing::warn!(id, "audio device lost");
+        stream_state.set_status(PlaybackStatus::Error);
+        stream_state.device_lost.store(true, Ordering::SeqCst);
+        if self.config.output_auto_reconnect {
+          self.device_lost.store(false, Ordering::SeqCst);
+          continue;
+        } else {
+          break;
+        }
+      }
+
+      // Check pause (async sleep — does not block the runtime).
+      if stream_state.status() == PlaybackStatus::Paused {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        continue;
+      }
+
+      // Check for seek commands received via crossbeam channel.
+      if let Some(rx) = &seek_rx {
+        while let Ok(position_ms) = rx.try_recv() {
+          let frame = (position_ms as u128 * sample_rate as u128 / 1000) as u64;
+          match codec_ref.seek(stream_ptr.0, frame) {
+            new_pos if new_pos >= 0 => {
+              total_frames_decoded = new_pos as u64;
+              let pos = total_frames_decoded * 1000 / sample_rate;
+              stream_state.position_ms.store(pos, Ordering::Relaxed);
+              stream_state.set_status(PlaybackStatus::Playing);
+              tracing::debug!(id, position_ms, "seek completed");
+            }
+            _ => {
+              tracing::warn!(id, position_ms, "seek returned error");
+            }
+          }
+        }
+      }
+
+      // Phase 2: read raw bytes from source on the main async runtime.
+      // The codec still uses its own internal reader bridge (opened during
+      // prepare()) for decode. When the codec API gains a decode-from-bytes
+      // method, these raw bytes will feed the codec directly, eliminating
+      // the codec's internal I/O.
+      let _n_bytes = source.lock().await.read(&mut raw_buf).await?;
+      // raw_buf now contains raw encoded bytes; not yet wired to the codec.
+
+      // Offload decode + filter + ring_push (CPU work) to the blocking pool.
+      // The codec reads PCM data from its own reader bridge (opened during
+      // prepare()), independent of the raw_buf read above.
+      let local_buf = std::mem::take(&mut pcm_buf);
+      let (n, returned_buf) = tokio::task::spawn_blocking(move || {
+        // Helper fn forces parameter types to be checked for Send;
+        // the move || closure captures StreamPtr (Send) and Vec<f32> (Send).
+        fn decode_inner(
+          codec_ref: SafeCodecRef<'static>,
+          stream_ptr: StreamPtr,
+          mut buf: Vec<f32>,
+        ) -> (i32, Vec<f32>) {
+          let n = codec_ref.read(stream_ptr.0, buf.as_mut_ptr(), buf.len());
+          (n, buf)
+        }
+        decode_inner(codec_ref, stream_ptr, local_buf)
+      })
+      .await
+      .map_err(|join| AroundError::Internal {
+        message: format!("decode thread panicked: {}", join),
+      })?;
+      pcm_buf = returned_buf;
+      if n > 0 {
+        let sample_count = n as usize;
+        let processed = filter_chain.process(&mut pcm_buf[..sample_count], channels);
+        if let Err(e) = sink.write(&pcm_buf[..processed]) {
+          tracing::error!(id, error = ?e, "sink write error");
+          stream_state.set_status(PlaybackStatus::Error);
+          decode_error = Some(e);
+          break;
+        }
+        total_frames_decoded += (n as u64) / channels as u64;
+        consecutive_errors = 0;
+        let pos = total_frames_decoded * 1000 / sample_rate;
+        stream_state.position_ms.store(pos, Ordering::Relaxed);
+      } else if n == 0 {
+        break; // EOF
+      } else {
+        consecutive_errors += 1;
+        tracing::warn!(id, n, consecutive_errors, "decode error");
+        if consecutive_errors >= 3 {
+          stream_state.set_status(PlaybackStatus::Error);
+          decode_error = Some(AroundError::DecodeError {
+            message: format!("decode error: code {}", n),
+          });
+          break;
+        }
+      }
+    }
+
+    tracing::info!(id, total_frames = total_frames_decoded, "playback complete");
+    // Only overwrite Error status with Stopped if we exited normally
+    // (EOF, cancel, device-lost) — not on decode error.
+    if decode_error.is_none() {
+      stream_state.set_status(PlaybackStatus::Stopped);
+    }
+    stream_state.active.store(false, Ordering::SeqCst);
+    codec_ref.drop(stream_ptr.0);
+    debug_track_stream(false);
+
+    // Cleanup stream from engine.
+    self.streams.write().remove(&id);
+
+    if let Some(err) = decode_error {
+      Err(err)
+    } else {
+      Ok(())
+    }
+  }
+
+  #[cfg(feature = "async-decode")]
+  /// Spawn the async decode loop on the tokio runtime.
+  ///
+  /// Creates the default sink and spawns `run_stream_async` as a tokio task.
+  /// This is the bridge method for callers that hold `Arc<Engine>` and need
+  /// a sync entry point (e.g. IPC handlers, CLI).
+  ///
+  /// When the `async-decode` feature is disabled, falls back to the sync
+  /// `run_stream_with_sink` via [`run_stream`].
+  pub fn run_stream_spawn(self: &Arc<Self>, id: StreamId) -> Result<(), AroundError> {
+    let (sample_rate, channels) = {
+      let streams = self.streams.read();
+      let s = streams.get(&id).ok_or_else(|| AroundError::Internal {
+        message: format!("run_stream_spawn: stream {} not found", id),
+      })?;
+      (s.sample_rate, s.channels)
+    };
+    let sink: Box<dyn AudioSink> = match &self.config.output_driver {
+      crate::config::OutputDriver::Cpal => Box::new(crate::cpal_sink::CpalSink::new(
+        sample_rate as u32,
+        channels,
+      )?),
+      crate::config::OutputDriver::Null => Box::new(around_core::audio_sink::NullSink::new(
+        sample_rate as u32,
+        channels,
+      )),
+    };
+    let this = self.clone();
+    tokio::spawn(async move {
+      if let Err(e) = this.run_stream_async(id, sink).await {
+        tracing::error!(?e, "async playback error");
+      }
+    });
+    Ok(())
+  }
   /// Seek a running stream to an absolute position in milliseconds.
   /// Returns the requested position on success, or a SeekError.
   ///
@@ -718,22 +966,22 @@ impl Engine {
   fn open_codec(
     source: &dyn Source,
     _seekable: bool,
-  ) -> Result<(*mut c_void, StreamInfo, CodecHandle), AroundError> {
+  ) -> Result<(*mut c_void, StreamInfo, SafeCodecRef<'static>), AroundError> {
     let register = init_codec();
 
     // --- Phase 1: Read header bytes for probing (separate reader) ---
     let header_buf = {
       let probe_reader = source.open_seekable()?;
-      let probe_reader: Box<dyn ReadSend> = Box::new(probe_reader);
       let probe_ctx = Box::into_raw(Box::new(ReaderBridge {
         reader: probe_reader,
       })) as *mut c_void;
       let mut buf = [0u8; 8192];
+      // SAFETY: probe_ctx was allocated via Box::into_raw(Box::new(probe_ctx)) on the preceding line. probe_buf is a valid stack-allocated buffer. These are scoped to the probe() call.
       let n = unsafe { read_cb(probe_ctx, buf.as_mut_ptr(), buf.len()) };
       if !probe_ctx.is_null() {
         unsafe {
           drop(Box::from_raw(
-            probe_ctx as *mut ReaderBridge<Box<dyn ReadSend>>,
+            probe_ctx as *mut ReaderBridge<Box<dyn ReadSeekSend>>,
           ));
         }
       }
@@ -744,18 +992,12 @@ impl Engine {
     let header = &header_buf[..];
     let filename = b"";
 
-    // --- Phase 2: Probe through CodecRegister ---
+    // --- Phase 2: Probe through safe codec entries ---
     let mut best_conf = 0u8;
-    let mut best_vtable: *const () = std::ptr::null();
-    let mut best_codec_data: *mut () = std::ptr::null_mut();
+    let mut best_codec: Option<SafeCodecRef<'static>> = None;
 
-    register.for_each_entry(|vtable_ptr, entry_ptr| {
-      // SAFETY: for_each_entry yields (vtable, entry) pairs from the register.
-      // The entry is a heap-allocated DynCodecRef. At offset 0 is the codec data
-      // pointer (the Box<()> containing the codec instance).
-      let codec_data = unsafe { *(entry_ptr as *mut *mut ()) };
-      let probe_ref = unsafe { ManuallyDrop::new(CodecRegister::from_raw(vtable_ptr, codec_data)) };
-      let conf = probe_ref.probe(
+    register.for_each_codec(|codec: SafeCodecRef<'_>| {
+      let conf = codec.probe(
         header.as_ptr(),
         header.len(),
         filename.as_ptr(),
@@ -763,63 +1005,50 @@ impl Engine {
       );
       if conf >= 50 && conf > best_conf {
         best_conf = conf;
-        best_vtable = vtable_ptr;
-        best_codec_data = codec_data;
+        // SAFETY: This codec entry will not be removed during the
+        // engine's lifetime.  The engine holds no concurrent remove_by_meta
+        // call, and Framework::unload() only runs after engine shutdown.
+        // This is the same contract as the existing design prelude Decision 2.
+        best_codec = Some(unsafe { codec.assume_static() });
       }
     });
 
     // --- Phase 3: Choose codec and open with a fresh reader ---
-    let chosen_handle = if !best_vtable.is_null() {
-      CodecHandle {
-        vtable: best_vtable,
-        codec_data: best_codec_data,
-      }
-    } else {
-      // Built-in fallback: create temporary DynCodecRef for WavCodec
-      let temp: ManuallyDrop<DynCodecRef> = ManuallyDrop::new(DynCodecRef::from(
-        stabby::boxed::Box::new(around_codec_wav::WavCodec),
-      ));
-      // SAFETY: ManuallyDrop<DynCodecRef> is repr(transparent); reading offset 0
-      // gives the inner codec data pointer, offset size_of::<*mut ()>() gives the vtable.
-      let temp_inner: &DynCodecRef = &temp;
-      let cd = unsafe { *(temp_inner as *const DynCodecRef as *const *mut ()) };
-      let vt = unsafe {
-        *((temp_inner as *const DynCodecRef as *const u8).add(std::mem::size_of::<*mut ()>())
-          as *const *const ())
-      };
-      // temp is dropped here — ManuallyDrop prevents double-free
-      CodecHandle {
-        vtable: vt,
-        codec_data: cd,
-      }
-    };
+    let chosen: SafeCodecRef<'static> = best_codec.unwrap_or_else(|| {
+      // Built-in fallback: leak a WavCodec DynCodecRef
+      SafeCodecRef::from_owned(around_codec_wav::WavCodec)
+    });
 
     let reader = source.open_seekable()?;
-    let reader: Box<dyn ReadSend> = Box::new(reader);
     let reader_ctx = Box::into_raw(Box::new(ReaderBridge { reader })) as *mut c_void;
 
     let mut stream: *mut c_void = std::ptr::null_mut();
+    // SAFETY: StreamInfo is a repr(C) struct of primitive fields. All-zero is a valid bit pattern — the codec's open() method will overwrite the fields with actual metadata before returning.
     let mut info: StreamInfo = unsafe { std::mem::zeroed() };
-    let rc = {
-      let codec_ref = chosen_handle.as_ref();
-      codec_ref.open(reader_ctx, read_cb, seek_cb, &mut stream, &mut info)
-    };
+    let rc = chosen.open(reader_ctx, read_cb, seek_cb, &mut stream, &mut info);
 
     if !reader_ctx.is_null() {
+      // SAFETY: reader_ctx was allocated via Box::into_raw(Box::new(...)) on the line above. This is the only drop call for this allocation.
       unsafe {
         drop(Box::from_raw(
-          reader_ctx as *mut ReaderBridge<Box<dyn ReadSend>>,
+          reader_ctx as *mut ReaderBridge<Box<dyn ReadSeekSend>>,
         ));
       }
     }
 
     if rc == 0 && !stream.is_null() {
-      Ok((stream, info, chosen_handle))
+      Ok((stream, info, chosen))
     } else {
       Err(AroundError::UnsupportedFormat {
         format: Some("unknown".into()),
         reason: "no codec could open the source".into(),
       })
     }
+  }
+}
+
+impl Drop for Engine {
+  fn drop(&mut self) {
+    self.shutdown();
   }
 }

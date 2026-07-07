@@ -14,7 +14,7 @@ workspace = true
 crate-type = ["lib", "cdylib"]
 
 [dependencies]
-around-core = { workspace = true }
+around-audio-sdk = { workspace = true }
 around-extensions = { workspace = true }
 tracing = { workspace = true }
 stabby = { workspace = true }

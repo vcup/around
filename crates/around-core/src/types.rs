@@ -119,12 +119,7 @@ impl SampleSpec {
     channels: ChannelLayout,
     bit_depth: BitDepth,
   ) -> Result<Self, &'static str> {
-    Self::new(
-      sample_rate,
-      channels,
-      bit_depth,
-      Interleave::Interleaved,
-    )
+    Self::new(sample_rate, channels, bit_depth, Interleave::Interleaved)
   }
 }
 
@@ -139,3 +134,121 @@ pub const SOURCE_RUNTIME: ExtensionSource = 3;
 pub const SOURCE_BYTES: ExtensionSource = 4;
 pub const SOURCE_CONFIG: ExtensionSource = 5;
 pub const SOURCE_DISCOVERED: ExtensionSource = 6;
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // --- SampleSpec validation ---
+
+  #[test]
+  fn interleaved_accepts_standard_params() {
+    let spec = SampleSpec::interleaved(44100, 2, 16);
+    assert!(spec.is_ok());
+    let spec = spec.unwrap();
+    assert_eq!(spec.sample_rate, 44100);
+    assert_eq!(spec.channels, 2);
+    assert_eq!(spec.bit_depth, 16);
+    assert_eq!(spec.interleave, Interleave::Interleaved);
+  }
+
+  #[test]
+  fn planar_accepts_standard_params() {
+    let spec = SampleSpec::new(44100, 2, 24, Interleave::Planar);
+    assert!(spec.is_ok());
+    let spec = spec.unwrap();
+    assert_eq!(spec.interleave, Interleave::Planar);
+  }
+
+  #[test]
+  fn sample_spec_rejects_zero_sample_rate() {
+    let err = SampleSpec::interleaved(0, 2, 16).unwrap_err();
+    assert!(!err.is_empty());
+  }
+
+  #[test]
+  fn sample_spec_rejects_zero_channels() {
+    let err = SampleSpec::interleaved(44100, 0, 16).unwrap_err();
+    assert!(!err.is_empty());
+  }
+
+  #[test]
+  fn sample_spec_rejects_channels_above_max() {
+    let err = SampleSpec::interleaved(44100, 33, 16).unwrap_err();
+    assert!(!err.is_empty());
+  }
+
+  #[test]
+  fn sample_spec_accepts_minimum_sample_rate() {
+    let spec = SampleSpec::interleaved(1, 2, 16);
+    assert!(spec.is_ok());
+  }
+
+  #[test]
+  fn sample_spec_accepts_minimum_channels() {
+    let spec = SampleSpec::interleaved(44100, 1, 16);
+    assert!(spec.is_ok());
+  }
+
+  #[test]
+  fn sample_spec_accepts_maximum_channels() {
+    let spec = SampleSpec::interleaved(44100, 32, 16);
+    assert!(spec.is_ok());
+  }
+
+  // --- ContentType Display and From ---
+
+  #[test]
+  fn content_type_display_music() {
+    let ct = ContentType::new(ContentType::MUSIC);
+    assert_eq!(ct.to_string(), "music");
+  }
+
+  #[test]
+  fn content_type_display_podcast() {
+    let ct = ContentType::new(ContentType::PODCAST);
+    assert_eq!(ct.to_string(), "podcast");
+  }
+
+  #[test]
+  fn content_type_display_audiobook() {
+    let ct = ContentType::new(ContentType::AUDIOBOOK);
+    assert_eq!(ct.to_string(), "audiobook");
+  }
+
+  #[test]
+  fn content_type_display_radio() {
+    let ct = ContentType::new(ContentType::RADIO);
+    assert_eq!(ct.to_string(), "radio");
+  }
+
+  #[test]
+  fn content_type_display_live_stream() {
+    let ct = ContentType::new(ContentType::LIVE_STREAM);
+    assert_eq!(ct.to_string(), "live_stream");
+  }
+
+  #[test]
+  fn content_type_display_ambient() {
+    let ct = ContentType::new(ContentType::AMBIENT);
+    assert_eq!(ct.to_string(), "ambient");
+  }
+
+  #[test]
+  fn content_type_from_str() {
+    let ct = ContentType::from("podcast");
+    assert_eq!(ct.0, "podcast");
+  }
+
+  #[test]
+  fn content_type_from_string() {
+    let ct = ContentType::from(String::from("radio"));
+    assert_eq!(ct.0, "radio");
+  }
+
+  #[test]
+  fn content_type_as_str() {
+    let ct = ContentType::new("music");
+    assert_eq!(ct.as_str(), "music");
+  }
+}

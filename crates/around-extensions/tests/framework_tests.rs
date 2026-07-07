@@ -42,9 +42,17 @@ const PLUGIN_EXT: &str = ".so";
 /// Uses `CARGO_MANIFEST_DIR` (set by `cargo test`) to find the workspace root,
 /// then searches `target/debug/` for files matching the expected pattern.
 fn find_test_plugin() -> PathBuf {
+  #[expect(
+    clippy::expect_used,
+    reason = "CARGO_MANIFEST_DIR is always set by cargo test runner; workspace layout is fixed"
+  )]
   let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
     .expect("CARGO_MANIFEST_DIR must be set — run under cargo test");
   let manifest = PathBuf::from(&manifest_dir);
+  #[expect(
+    clippy::expect_used,
+    reason = "around-extensions lives in crates/ at workspace root; parent() on a known subdir always returns Some"
+  )]
   let workspace_root = manifest
     .parent()
     .expect("around-extensions lives in crates/")
@@ -142,6 +150,10 @@ const PLUGIN_NAME: &str = "around-extensions-test-plugin";
 // ---------------------------------------------------------------------------
 
 #[test]
+#[expect(
+  clippy::unwrap_used,
+  reason = "test plugin path has a parent dir; scan directory is valid and contains the built plugin"
+)]
 fn scan_discovers_extension() {
   let _guard = test_setup();
   let fw = Framework::instance();
@@ -160,15 +172,31 @@ fn scan_discovers_extension() {
 fn scan_extension_meta_correct() {
   let _guard = test_setup();
   let fw = Framework::instance();
-
   let plugin_path = find_test_plugin();
-  fw.scan(&[plugin_path.parent().unwrap().to_path_buf()])
-    .unwrap();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin path is a file; parent() on a file path returns Some(dir)"
+  )]
+  let dir = plugin_path.parent().unwrap().to_path_buf();
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "scan directory contains the built test plugin; scan() must succeed"
+  )]
+  fw.scan(&[dir]).unwrap();
+
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was discovered by scan; load() must succeed"
+  )]
   let lib = fw.load(PLUGIN_NAME).unwrap();
 
   // Read `AROUND_META` from the loaded library and verify its fields.
   unsafe {
+    #[expect(
+      clippy::expect_used,
+      reason = "test plugin exports AROUND_META as a public symbol; lib.get() must find it"
+    )]
     let meta: &ExtensionMeta = *lib
       .get::<&ExtensionMeta>(b"AROUND_META\0")
       .expect("AROUND_META symbol must exist");
@@ -179,6 +207,10 @@ fn scan_extension_meta_correct() {
   }
 
   // Cleanup so subsequent tests start with a clean state.
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was loaded; unload() must succeed"
+  )]
   fw.unload(PLUGIN_NAME).unwrap();
 }
 
@@ -186,15 +218,31 @@ fn scan_extension_meta_correct() {
 fn load_calls_around_init() {
   let _guard = test_setup();
   let fw = Framework::instance();
-
   let plugin_path = find_test_plugin();
-  fw.scan(&[plugin_path.parent().unwrap().to_path_buf()])
-    .unwrap();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin path is a file; parent() on a file path returns Some(dir)"
+  )]
+  let dir = plugin_path.parent().unwrap().to_path_buf();
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "scan directory contains the built test plugin; scan() must succeed"
+  )]
+  fw.scan(&[dir]).unwrap();
+
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was discovered by scan; load() must succeed"
+  )]
   let lib = fw.load(PLUGIN_NAME).unwrap();
 
   // After load the framework has called `around_init` — verify the flag.
   unsafe {
+    #[expect(
+      clippy::expect_used,
+      reason = "test plugin exports test_plugin_init_called as a public symbol"
+    )]
     let init_called: libloading::Symbol<extern "C" fn() -> i32> = lib
       .get(b"test_plugin_init_called\0")
       .expect("test_plugin_init_called symbol must exist");
@@ -206,11 +254,19 @@ fn load_calls_around_init() {
   }
 
   // Unload — internally calls `around_deinit`.
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was loaded; unload() must succeed"
+  )]
   fw.unload(PLUGIN_NAME).unwrap();
 
   // We still hold our Arc<Library>, so the library is still mapped and
   // we can verify the deinit flag.
   unsafe {
+    #[expect(
+      clippy::expect_used,
+      reason = "test plugin exports test_plugin_deinit_called; library is still mapped"
+    )]
     let deinit_called: libloading::Symbol<extern "C" fn() -> i32> = lib
       .get(b"test_plugin_deinit_called\0")
       .expect("test_plugin_deinit_called symbol must exist");
@@ -224,20 +280,30 @@ fn load_calls_around_init() {
   // Drop our reference so the library is fully closed.
   drop(lib);
 }
-
 #[test]
 fn unload_calls_remove_by_meta() {
   let _guard = test_setup();
   reset_test_records();
   let fw = Framework::instance();
-
   let plugin_path = find_test_plugin();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin path is a file; parent() on a file path returns Some(dir)"
+  )]
   let dir = plugin_path.parent().unwrap().to_path_buf();
 
   // Register a test slot before loading.
   fw.attach_register("TestSlot", &TEST_VTABLE, std::ptr::null_mut());
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "scan directory contains the built test plugin; scan() must succeed"
+  )]
   fw.scan(&[dir]).unwrap();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was discovered by scan; load() must succeed"
+  )]
   let lib = fw.load(PLUGIN_NAME).unwrap();
 
   // The framework polls `TestSlot_create(index)` for each registered slot.
@@ -253,6 +319,10 @@ fn unload_calls_remove_by_meta() {
   }
 
   // Unload — for every registered slot, `remove_by_meta` is called.
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was loaded; unload() must succeed"
+  )]
   fw.unload(PLUGIN_NAME).unwrap();
 
   {
@@ -271,13 +341,24 @@ fn unload_calls_remove_by_meta() {
 fn duplicate_scan_ignored() {
   let _guard = test_setup();
   let fw = Framework::instance();
-
   let plugin_path = find_test_plugin();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin path is a file; parent() on a file path returns Some(dir)"
+  )]
   let dir = plugin_path.parent().unwrap().to_path_buf();
 
-  fw.scan(&[dir.clone()]).unwrap();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "scan directory contains the built test plugin; scan() must succeed"
+  )]
+  fw.scan(std::slice::from_ref(&dir)).unwrap();
   let after_first = fw.index_len();
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "duplicate scan of same directory is idempotent; scan() must succeed"
+  )]
   fw.scan(&[dir]).unwrap();
   let after_second = fw.index_len();
 
@@ -309,12 +390,24 @@ fn attach_register_and_load() {
   let fw = Framework::instance();
 
   let plugin_path = find_test_plugin();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin path is a file; parent() on a file path returns Some(dir)"
+  )]
   let dir = plugin_path.parent().unwrap().to_path_buf();
 
   // Register the test slot BEFORE loading.
   fw.attach_register("TestSlot", &TEST_VTABLE, std::ptr::null_mut());
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "scan directory contains the built test plugin; scan() must succeed"
+  )]
   fw.scan(&[dir]).unwrap();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was discovered by scan; load() must succeed"
+  )]
   let lib = fw.load(PLUGIN_NAME).unwrap();
 
   // The framework must poll `TestSlot_create` for each registered slot.
@@ -332,6 +425,10 @@ fn attach_register_and_load() {
 
   // Verify that unload still triggers remove_by_meta.
   reset_test_records();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was loaded; unload() must succeed"
+  )]
   fw.unload(PLUGIN_NAME).unwrap();
   {
     let r = TEST_RECORDS.lock();
@@ -351,14 +448,30 @@ fn is_loaded_after_load() {
   let fw = Framework::instance();
 
   let plugin_path = find_test_plugin();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin path is a file; parent() returns Some(dir)"
+  )]
   let dir = plugin_path.parent().unwrap().to_path_buf();
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "scan directory contains the built test plugin; scan() must succeed"
+  )]
   fw.scan(&[dir]).unwrap();
   assert!(!fw.is_loaded(PLUGIN_NAME));
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was discovered by scan; load() must succeed"
+  )]
   let lib = fw.load(PLUGIN_NAME).unwrap();
   assert!(fw.is_loaded(PLUGIN_NAME));
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was loaded; unload() must succeed"
+  )]
   fw.unload(PLUGIN_NAME).unwrap();
   assert!(!fw.is_loaded(PLUGIN_NAME));
 
@@ -369,16 +482,30 @@ fn is_loaded_after_load() {
 fn loaded_len_tracks_active_extensions() {
   let _guard = test_setup();
   let fw = Framework::instance();
-
   let plugin_path = find_test_plugin();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin path is a file; parent() returns Some(dir)"
+  )]
   let dir = plugin_path.parent().unwrap().to_path_buf();
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "scan directory contains the built test plugin; scan() must succeed"
+  )]
   fw.scan(&[dir]).unwrap();
   assert_eq!(fw.loaded_len(), 0, "nothing loaded yet");
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was discovered by scan; load() must succeed"
+  )]
   let lib = fw.load(PLUGIN_NAME).unwrap();
   assert_eq!(fw.loaded_len(), 1, "one extension should be loaded");
-
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was loaded; unload() must succeed"
+  )]
   fw.unload(PLUGIN_NAME).unwrap();
   assert_eq!(fw.loaded_len(), 0, "no extensions after unload");
 
@@ -395,14 +522,30 @@ fn load_is_idempotent() {
   let fw = Framework::instance();
 
   let plugin_path = find_test_plugin();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin path is a file; parent() returns Some(dir)"
+  )]
   let dir = plugin_path.parent().unwrap().to_path_buf();
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "scan directory contains the built test plugin; scan() must succeed"
+  )]
   fw.scan(&[dir]).unwrap();
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was discovered by scan; load() must succeed"
+  )]
   let lib1 = fw.load(PLUGIN_NAME).unwrap();
   assert_eq!(fw.loaded_len(), 1);
 
   // Second load must return immediately without re-init or re-push.
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin is already loaded; idempotent load() must succeed"
+  )]
   let lib2 = fw.load(PLUGIN_NAME).unwrap();
   assert_eq!(
     fw.loaded_len(),
@@ -414,6 +557,10 @@ fn load_is_idempotent() {
     "idempotent load must return the same Arc<Library>"
   );
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was loaded; unload() must succeed"
+  )]
   fw.unload(PLUGIN_NAME).unwrap();
   drop(lib1);
   drop(lib2);
@@ -423,28 +570,51 @@ fn load_is_idempotent() {
 fn load_after_unload_round_trip() {
   let _guard = test_setup();
   let fw = Framework::instance();
-
   let plugin_path = find_test_plugin();
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin path is a file; parent() returns Some(dir)"
+  )]
   let dir = plugin_path.parent().unwrap().to_path_buf();
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "scan directory contains the built test plugin; scan() must succeed"
+  )]
   fw.scan(&[dir]).unwrap();
 
   // First load.
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was discovered by scan; load() must succeed"
+  )]
   let lib = fw.load(PLUGIN_NAME).unwrap();
   assert!(fw.is_loaded(PLUGIN_NAME));
   assert_eq!(fw.loaded_len(), 1);
   drop(lib);
 
   // Unload.
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was loaded; unload() must succeed"
+  )]
   fw.unload(PLUGIN_NAME).unwrap();
   assert!(!fw.is_loaded(PLUGIN_NAME));
   assert_eq!(fw.loaded_len(), 0);
 
   // Re-load — must be a fresh load, not a stale cache hit.
+  #[expect(
+    clippy::unwrap_used,
+    reason = "test plugin was unloaded but still indexed; re-load() must succeed"
+  )]
   let lib2 = fw.load(PLUGIN_NAME).unwrap();
   assert!(fw.is_loaded(PLUGIN_NAME));
   assert_eq!(fw.loaded_len(), 1);
 
+  #[expect(
+    clippy::unwrap_used,
+    reason = "re-loaded plugin can be unloaded a second time"
+  )]
   fw.unload(PLUGIN_NAME).unwrap();
   drop(lib2);
 }

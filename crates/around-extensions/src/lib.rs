@@ -12,12 +12,20 @@
 //! - [`Framework`] — global singleton managing scanned index, loaded libraries, and active slots.
 
 #![deny(unsafe_op_in_unsafe_fn)]
+use crash_guard::{crash_guard_unsafe, CrashError};
 use libloading::{Library, Symbol};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
+mod cabi;
+pub mod crash_guard;
+mod lifecycle;
+mod trust;
+use lifecycle::LifecycleRegister;
+use trust::TrustCounter;
+
 pub const CURRENT_API_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -32,7 +40,7 @@ const SHARED_LIB_EXTENSIONS: &[&str] = &["dylib", "so"];
 #[cfg(target_os = "windows")]
 const SHARED_LIB_EXTENSIONS: &[&str] = &["dll"];
 
-/// Open a shared library with RTLD_NOW | RTLD_GLOBAL on Unix.
+/// Open a shared library with RTLD_NOW | RTLD_LOCAL on Unix.
 ///
 /// # Safety
 /// Same as `Library::new` — the caller must ensure the path points to a
@@ -40,8 +48,8 @@ const SHARED_LIB_EXTENSIONS: &[&str] = &["dll"];
 /// are performed through the returned handle.
 #[cfg(unix)]
 unsafe fn open_library(path: &std::path::Path) -> Result<Library, libloading::Error> {
-  // SAFETY: caller guarantees path is valid; flags use libloading's platform-correct constants.
-  let flags = libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_GLOBAL;
+  // RTLD_LOCAL: per ADR-0004 §11, extensions must not export symbols to the global table.
+  let flags = libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_LOCAL;
   unsafe { libloading::os::unix::Library::open(Some(path), flags) }.map(Library::from)
 }
 
@@ -344,15 +352,61 @@ unsafe impl Send for OpaquePtr {}
 unsafe impl Sync for OpaquePtr {}
 
 // ---------------------------------------------------------------------------
+// SlotDef — slot definition from AROUND_SLOTS
+// ---------------------------------------------------------------------------
+
+/// A single slot definition found in `AROUND_SLOTS` of an extension `.so`.
+///
+/// Each slot describes a typed register that the extension provides entries
+/// for (e.g. Codec, Filter). The Framework uses these to dynamically attach
+/// new register types introduced by an extension.
+#[repr(C)]
+pub(crate) struct SlotDef {
+  /// Canonical slot name, e.g. `"around_audio_sdk::codec::Codec"`.
+  pub slot_name: &'static str,
+  /// Pointer to the `RegisterVTable` for this slot.
+  pub reg_vtable: *const (),
+  /// Opaque pointer to the Register instance.
+  pub reg_instance: *mut (),
+}
+
+// SAFETY: SlotDef holds only static references and raw pointers obtained
+// from the extension's data segment. It is never mutated after creation.
+unsafe impl Send for SlotDef {}
+unsafe impl Sync for SlotDef {}
+
+// ---------------------------------------------------------------------------
+// PendingReload — opaque handle for the two-phase hot-reload protocol
+// ---------------------------------------------------------------------------
+
+/// Opaque handle returned by [`Framework::prepare_reload`] and consumed by
+/// [`Framework::commit_reload`].
+///
+/// Buffers the new extension's state (library handle, metadata, slot entries)
+/// so the old extension can continue serving requests during the prepare phase.
+pub struct PendingReload {
+  /// dlopen'd library of the new extension version.
+  lib: Arc<Library>,
+  /// Heap-allocated `ExtensionMeta` with owned backing strings.
+  meta: Box<OwnedFFIMeta>,
+  /// Slot definitions from `AROUND_SLOTS` in the new `.so`.
+  #[expect(dead_code, reason = "reserved for future use by attach_register")]
+  slot_defs: Vec<SlotDef>,
+  /// Per-slot registration entries, indexed by slot name.
+  /// Populated by polling `{slot_name}_create()` during prepare.
+  entries: HashMap<Box<str>, Vec<*mut ()>>,
+  /// Extension names that the new version depends on.
+  #[expect(dead_code, reason = "reserved for future dependency validation")]
+  depends_on: Vec<Box<str>>,
+}
+
+// ---------------------------------------------------------------------------
 // Framework — global singleton
 // ---------------------------------------------------------------------------
 
 /// Global extension framework singleton.
 ///
 /// The framework owns the scanned index (name → path + meta), the active
-/// slot registrations (slot_name → RegisterVTable), and keeps loaded
-/// libraries alive.  All methods use `&self` with interior mutability
-/// (RwLock) so callers only need a `&'static Framework`.
 pub struct Framework {
   /// slot_name → (RegisterVTable reference, opaque Register pointer).
   slot_map: RwLock<HashMap<Box<str>, (&'static RegisterVTable, OpaquePtr)>>,
@@ -364,9 +418,21 @@ pub struct Framework {
   /// Provides stable pointers for Slot register operations.
   loaded_meta: RwLock<HashMap<Box<str>, Box<OwnedFFIMeta>>>,
   /// Guard against concurrent loads of the same extension.
-  loading: parking_lot::Mutex<std::collections::HashSet<Box<str>>>,
+  loading: Mutex<std::collections::HashSet<Box<str>>>,
+  /// Lifecycle hooks registered for OnLoad event.
+  on_load: Mutex<LifecycleRegister>,
+  /// Lifecycle hooks registered for OnUnload event.
+  on_unload: Mutex<LifecycleRegister>,
+  /// Lifecycle hooks registered for OnReload event.
+  on_reload: Mutex<LifecycleRegister>,
+  /// Per-extension trust counters mapping extension name → counter.
+  loaded_trust: RwLock<HashMap<Box<str>, TrustCounter>>,
+  /// Per-Register trust counters keyed by slot name.
+  /// Initialised in [`attach_register`] and updated by
+  /// [`record_guarded_outcome`]. When a Register reaches `Trusted`,
+  /// crash guard elision is eligible for that slot's operations.
+  slot_trust: RwLock<HashMap<Box<str>, TrustCounter>>,
 }
-
 impl Framework {
   pub fn instance() -> &'static Framework {
     static FW: LazyLock<Framework> = LazyLock::new(|| Framework {
@@ -374,7 +440,12 @@ impl Framework {
       index: RwLock::new(HashMap::new()),
       loaded: RwLock::new(HashMap::new()),
       loaded_meta: RwLock::new(HashMap::new()),
-      loading: parking_lot::Mutex::new(std::collections::HashSet::new()),
+      loading: Mutex::new(std::collections::HashSet::new()),
+      on_load: Mutex::new(LifecycleRegister::new()),
+      on_unload: Mutex::new(LifecycleRegister::new()),
+      on_reload: Mutex::new(LifecycleRegister::new()),
+      loaded_trust: RwLock::new(HashMap::new()),
+      slot_trust: RwLock::new(HashMap::new()),
     });
     &FW
   }
@@ -387,7 +458,35 @@ impl Framework {
   pub fn attach_register(&self, name: &'static str, vt: &'static RegisterVTable, reg: *mut ()) {
     let mut map = self.slot_map.write();
     map.insert(Box::from(name), (vt, OpaquePtr(reg)));
+    // Initialise per-Register trust counter (default 100 successes to reach Trusted).
+    let mut slot_trust = self.slot_trust.write();
+    slot_trust
+      .entry(Box::from(name))
+      .or_insert_with(|| TrustCounter::new(100));
     tracing::debug!(slot = name, "slot registered");
+  }
+
+  /// Record a guarded operation outcome for a Register.
+  ///
+  /// `slot_name` is the canonical slot name (e.g. `"around_audio_sdk::codec::Codec"`).
+  /// `success` is `true` if the operation completed without a crash.
+  ///
+  /// When a Register accumulates `required` consecutive successes (default 100),
+  /// it graduates to `Trusted` and crash guard elision becomes eligible.
+  pub fn record_guarded_outcome(&self, slot_name: &str, success: bool) {
+    if let Some(counter) = self.slot_trust.read().get(slot_name) {
+      counter.record_guarded_outcome(success);
+    }
+  }
+
+  /// Returns `true` if the Register for `slot_name` has reached `Trusted` and
+  /// crash guard elision is eligible.
+  pub fn is_slot_trusted(&self, slot_name: &str) -> bool {
+    self
+      .slot_trust
+      .read()
+      .get(slot_name)
+      .is_some_and(|c| c.is_trusted())
   }
 
   /// Scan search paths for extensions.
@@ -465,7 +564,7 @@ impl Framework {
   ///
   /// 1. Resolve the name in the index (error if unknown).
   /// 2. Recursively load all `depends_on` extensions first.
-  /// 3. `dlopen` the library with `RTLD_NOW | RTLD_GLOBAL`.
+  /// 3. `dlopen` the library with `RTLD_NOW | RTLD_LOCAL`.
   /// 4. Call `around_init` if the symbol exists.
   /// 5. For each registered slot: poll `{slot_name}_create(0)`, `(1)`, ... until null.
   ///    Call `push_raw` for each non-null return.
@@ -475,8 +574,8 @@ impl Framework {
   ///
   /// The create symbol name for a slot is derived as:
   /// `slot_name.to_lowercase().replace("::", "_") + "_create"`.
-  /// For example, the slot `"around_core::codec::Codec"` becomes the
-  /// symbol `"around_core_codec_codec_create"`.
+  /// For example, the slot `"around_audio_sdk::codec::Codec"` becomes the
+  /// symbol `"around_audio_sdk_codec_codec_create"`.
   ///
   /// The framework polls consecutive indices starting from 0 until the
   /// exported function returns a null pointer, signalling the end of
@@ -552,7 +651,7 @@ impl Framework {
       self.load(dep)?;
     }
 
-    // dlopen with RTLD_NOW | RTLD_GLOBAL on Unix.
+    // dlopen with RTLD_NOW | RTLD_LOCAL on Unix.
     let lib = unsafe { open_library(&path) }
       .map_err(|e| FrameworkError::Load(format!("dlopen {:?}: {}", path, e)))?;
     let lib = Arc::new(lib);
@@ -562,12 +661,20 @@ impl Framework {
 
     // Call around_init if it exists.
     if let Ok(init) = unsafe { lib.get::<unsafe extern "C" fn() -> i32>(b"around_init\0") } {
-      let rc = unsafe { init() };
-      if rc != 0 {
-        return Err(FrameworkError::Init(format!(
-          "around_init returned {} for {}",
-          rc, name
-        )));
+      let result: Result<i32, FrameworkError> =
+        crash_guard_unsafe("around_init", Some(name.to_string()), || unsafe { init() })
+          .map_err(Into::into);
+      match result {
+        Ok(0) => { /* success */ }
+        Ok(rc) => {
+          return Err(FrameworkError::Init(format!(
+            "around_init returned {} for {}",
+            rc, name
+          )));
+        }
+        Err(e) => {
+          return Err(e);
+        }
       }
     }
 
@@ -582,7 +689,7 @@ impl Framework {
     };
     for (vt, opaque_reg, slot_name) in &slot_entries {
       // Derive create symbol: lowercased NAME with :: → _, then append _create.
-      // E.g. "around_core::codec::Codec" → "around_core_codec_codec_create"
+      // E.g. "around_audio_sdk::codec::Codec" → "around_audio_sdk_codec_codec_create"
       let create_sym_name = {
         let base = slot_name.to_lowercase().replace("::", "_");
         format!("{base}_create\0")
@@ -601,10 +708,18 @@ impl Framework {
         }
 
         tracing::debug!(slot = slot_name, index, "pushing entry via push_raw");
-        unsafe { (vt.push_raw)(opaque_reg.0, entry, &meta_box.meta as *const ExtensionMeta) };
+        let push_result = crash_guard_unsafe("push_raw", Some(name.to_string()), || unsafe {
+          (vt.push_raw)(opaque_reg.0, entry, &meta_box.meta as *const ExtensionMeta)
+        });
+        // Record per-Register trust outcome.
+        self.record_guarded_outcome(slot_name, push_result.is_ok());
+        push_result.map_err(FrameworkError::from)?;
         index += 1;
       }
     }
+
+    // Save meta pointer before move into loaded_meta.
+    let meta_ptr = &meta_box.meta as *const ExtensionMeta;
 
     // Store the library and heap ExtensionMeta.
     {
@@ -614,6 +729,18 @@ impl Framework {
     {
       let mut loaded_meta = self.loaded_meta.write();
       loaded_meta.insert(Box::from(name), meta_box);
+    }
+
+    // Fire OnLoad lifecycle hooks — extension is fully visible now.
+    {
+      let on_load = self.on_load.lock();
+      on_load.broadcast(lifecycle::LifecycleEvent::OnLoad, meta_ptr);
+    }
+
+    // Initialize trust counter for this extension (default 100 successes).
+    {
+      let mut loaded_trust = self.loaded_trust.write();
+      loaded_trust.insert(Box::from(name), TrustCounter::new(100));
     }
 
     // _guard dropped here → removes loading claim.
@@ -662,12 +789,35 @@ impl Framework {
         .remove(name)
         .ok_or_else(|| FrameworkError::NotFound(name.to_string()))?
     };
+    // Remove trust counter.
+    {
+      let mut loaded_trust = self.loaded_trust.write();
+      loaded_trust.remove(name);
+    }
+
+    // Fire OnUnload lifecycle hooks before around_deinit.
+    {
+      let on_unload = self.on_unload.lock();
+      on_unload.broadcast(
+        lifecycle::LifecycleEvent::OnUnload,
+        &meta_box.meta as *const ExtensionMeta,
+      );
+    }
 
     // Call around_deinit if it exists.
     // SAFETY: deinit is `unsafe extern "C" fn()`.
     if let Ok(deinit) = unsafe { lib.get::<unsafe extern "C" fn()>(b"around_deinit\0") } {
       tracing::debug!(name, "calling around_deinit");
-      unsafe { deinit() };
+      if let Err(crash) = crash_guard_unsafe("around_deinit", Some(name.to_string()), || unsafe {
+        deinit()
+      }) {
+        tracing::error!(
+          name,
+          ?crash,
+          "around_deinit panicked; continuing with unload"
+        );
+        // Do NOT abort unload — the extension is being removed anyway.
+      }
     }
     tracing::info!(name, "extension unloaded");
     // `lib` is dropped here → dlclose when last Arc reference gone.
@@ -700,6 +850,284 @@ impl Framework {
       .map(|(name, (path, _))| (name.to_string(), path.clone()))
       .collect()
   }
+
+  /// Phase 1 of the two-phase hot-reload protocol.
+  ///
+  /// Loads a new extension `.so` from `path`, reads its metadata, polls all
+  /// registered slots for entries, and returns a [`PendingReload`] handle
+  /// while the old extension continues serving requests.
+  ///
+  /// The returned `PendingReload` is consumed by
+  /// [`commit_reload`](Self::commit_reload).
+  pub fn prepare_reload(&self, path: &Path) -> Result<PendingReload, FrameworkError> {
+    // dlopen the new .so with RTLD_NOW | RTLD_LOCAL.
+    let lib = unsafe { open_library(path) }
+      .map_err(|e| FrameworkError::Load(format!("prepare_reload dlopen {:?}: {}", path, e)))?;
+    let lib = Arc::new(lib);
+
+    // Read AROUND_META and build OwnedFFIMeta with owned backing strings.
+    let meta_sym: Symbol<&'static ExtensionMeta> = unsafe {
+      lib
+        .get(b"AROUND_META\0")
+        .map_err(|_| FrameworkError::Load(format!("no AROUND_META in {:?}", path)))?
+    };
+
+    // Read AROUND_SLOTS (V0: slot definitions from the extension are
+    // deferred — extensions typically provide entries to host-registered
+    // slots rather than defining new slot types).
+    let slot_defs: Vec<SlotDef> = Vec::new();
+    let meta_box = IndexedMeta::from_ffi(*meta_sym).to_heap_ffi();
+    // Snapshot slot_map entries before iterating to avoid deadlock
+    // if a create() function calls back into attach_register() (B5).
+    let slot_entries: Vec<(Box<str>, &'static RegisterVTable, OpaquePtr)> = {
+      let slot_map = self.slot_map.read();
+      slot_map
+        .iter()
+        .map(|(name, (vt, reg))| (name.clone(), *vt, *reg))
+        .collect()
+    };
+    // Lock released — safe to call create().
+    let entries: HashMap<Box<str>, Vec<*mut ()>> = {
+      let mut all_entries = HashMap::new();
+      for (slot_name, _vt, _opaque_reg) in &slot_entries {
+        let create_sym_name = {
+          let base = slot_name.to_lowercase().replace("::", "_");
+          format!("{base}_create\0")
+        };
+        let mut slot_entries: Vec<*mut ()> = Vec::new();
+        let mut index: usize = 0;
+        loop {
+          type CreateFn = unsafe extern "C" fn(usize) -> *mut ();
+          let create: Symbol<CreateFn> = match unsafe { lib.get(create_sym_name.as_bytes()) } {
+            Ok(s) => s,
+            Err(_) => break,
+          };
+          let entry: *mut () = unsafe { create(index) };
+          if entry.is_null() {
+            break;
+          }
+          slot_entries.push(entry);
+          index += 1;
+        }
+        if !slot_entries.is_empty() {
+          all_entries.insert(slot_name.clone(), slot_entries);
+        }
+      }
+      all_entries
+    };
+
+    // Call around_init to validate it succeeds before commit phase (B4).
+    if let Ok(init) = unsafe { lib.get::<unsafe extern "C" fn() -> i32>(b"around_init\0") } {
+      let ext_name = meta_box.meta.name();
+      let result: Result<i32, FrameworkError> =
+        crash_guard_unsafe("around_init", Some(ext_name.to_string()), || unsafe {
+          init()
+        })
+        .map_err(Into::into);
+      match result {
+        Ok(0) => { /* success */ }
+        Ok(rc) => {
+          return Err(FrameworkError::Init(format!(
+            "around_init returned {} for {:?}",
+            rc, path
+          )));
+        }
+        Err(e) => {
+          return Err(e);
+        }
+      }
+    }
+
+    // Convert depends_on from the new meta into owned strings.
+    let depends_on: Vec<Box<str>> = meta_box
+      .meta
+      .depends_on()
+      .into_iter()
+      .map(Box::from)
+      .collect();
+
+    Ok(PendingReload {
+      lib,
+      meta: meta_box,
+      slot_defs,
+      entries,
+      depends_on,
+    })
+  }
+
+  /// Phase 2 of the two-phase hot-reload protocol.
+  ///
+  /// Atomically replaces the extension identified by `old_meta` with the new
+  /// extension state in `pending`. Fires [`LifecycleEvent::OnReload`] before
+  /// the swap, then [`LifecycleEvent::OnUnload`], removes old entries, calls
+  /// `around_deinit`, drops the old library, calls `around_init` on the new
+  /// extension, pushes new entries, and broadcasts [`LifecycleEvent::OnLoad`].
+  ///
+  /// # Safety
+  ///
+  /// `old_meta` must be a valid pointer to an `ExtensionMeta` of a currently
+  /// loaded extension. The pointer must remain valid for the duration of this
+  /// call. In practice, obtain `old_meta` via `Framework::loaded_meta(name)`
+  /// or from the [`reload`](Self::reload) convenience method.
+  pub fn commit_reload(
+    &self,
+    old_meta: *const ExtensionMeta,
+    pending: PendingReload,
+  ) -> Result<(), FrameworkError> {
+    // ── Find old extension name by meta pointer. ──
+    let old_name: Box<str> = {
+      let loaded_meta = self.loaded_meta.read();
+      let mut found: Option<Box<str>> = None;
+      for (name, boxed_meta) in loaded_meta.iter() {
+        if &boxed_meta.meta as *const ExtensionMeta == old_meta {
+          found = Some(name.clone());
+          break;
+        }
+      }
+      found.ok_or_else(|| {
+        FrameworkError::NotFound("meta pointer not found in loaded extensions".to_string())
+      })?
+    };
+
+    // Verify no other loaded extension depends on the old one.
+    {
+      let loaded_meta = self.loaded_meta.read();
+      for (dep_name, dep_meta) in loaded_meta.iter() {
+        if **dep_name != *old_name && dep_meta.meta.depends_on().contains(&old_name.as_ref()) {
+          return Err(FrameworkError::DependentsRemain {
+            name: old_name.to_string(),
+            dependent: dep_name.to_string(),
+          });
+        }
+      }
+    }
+
+    // ── Phase 1: Lifecycle broadcasts (no write locks held). ──
+    // Broadcast BEFORE removal so handlers can still query old state (B3).
+
+    // Broadcast OnReload — old extension still visible in loaded/loaded_meta.
+    {
+      let on_reload = self.on_reload.lock();
+      on_reload.broadcast(lifecycle::LifecycleEvent::OnReload, old_meta);
+    }
+
+    // Broadcast OnUnload — old extension still visible.
+    {
+      let on_unload = self.on_unload.lock();
+      on_unload.broadcast(lifecycle::LifecycleEvent::OnUnload, old_meta);
+    }
+
+    // ── Phase 2: Remove old extension (write locks acquired, then released). ──
+    let old_meta_box: Box<OwnedFFIMeta>;
+    let old_lib: Arc<Library>;
+    {
+      let mut loaded = self.loaded.write();
+      let mut loaded_meta = self.loaded_meta.write();
+      old_meta_box = loaded_meta.remove(&old_name).ok_or_else(|| {
+        FrameworkError::NotFound(format!("{} not found in loaded_meta", old_name))
+      })?;
+      old_lib = loaded
+        .remove(&old_name)
+        .ok_or_else(|| FrameworkError::NotFound(format!("{} not found in loaded", old_name)))?;
+    }
+    // Write locks dropped here — safe for lifecycle hooks to query state.
+
+    // Remove entries from all slot registers.
+    {
+      let slot_map = self.slot_map.read();
+      for (_slot_name, (vt, opaque_reg)) in slot_map.iter() {
+        tracing::debug!(name = &*old_name, "commit_reload: remove_by_meta");
+        // SAFETY: reg is a valid Register pointer; old_meta_box.meta is valid.
+        unsafe { (vt.remove_by_meta)(opaque_reg.0, &old_meta_box.meta as *const ExtensionMeta) };
+      }
+    }
+
+    // Call around_deinit on the old extension.
+    if let Ok(deinit) = unsafe { old_lib.get::<unsafe extern "C" fn()>(b"around_deinit\0") } {
+      tracing::debug!(
+        name = &*old_name,
+        "commit_reload: calling around_deinit (old)"
+      );
+      if let Err(crash) =
+        crash_guard_unsafe("around_deinit", Some(old_name.to_string()), || unsafe {
+          deinit()
+        })
+      {
+        tracing::error!(
+          name = &*old_name,
+          ?crash,
+          "around_deinit panicked; continuing reload"
+        );
+      }
+    }
+
+    // ── Point of no return: old extension is fully gone. ──
+    drop(old_lib);
+    drop(old_meta_box);
+
+    // around_init was already called in prepare_reload (B4) — skip here.
+
+    // ── Phase 3: Install new extension. ──
+    let new_meta_ptr = &pending.meta.meta as *const ExtensionMeta;
+
+    // Push entries for the new extension into each slot register.
+    for (slot_name, entries) in &pending.entries {
+      let slot_map = self.slot_map.read();
+      if let Some((vt, opaque_reg)) = slot_map.get(slot_name) {
+        for &entry in entries {
+          crash_guard_unsafe("push_raw", Some(old_name.to_string()), || unsafe {
+            (vt.push_raw)(opaque_reg.0, entry, new_meta_ptr)
+          })
+          .map_err(FrameworkError::from)?;
+        }
+      } else {
+        tracing::warn!(
+          slot = &**slot_name,
+          "commit_reload: slot not registered, skipping entries"
+        );
+      }
+    }
+
+    // Store new library and meta.
+    {
+      let mut loaded = self.loaded.write();
+      let mut loaded_meta = self.loaded_meta.write();
+      loaded.insert(old_name.clone(), Arc::clone(&pending.lib));
+      loaded_meta.insert(old_name.clone(), pending.meta);
+    }
+
+    // Reset trust counter for the replaced extension (starts fresh).
+    {
+      let mut loaded_trust = self.loaded_trust.write();
+      loaded_trust.insert(old_name.clone(), TrustCounter::new(100));
+    }
+
+    // Broadcast OnLoad lifecycle event.
+    {
+      let on_load = self.on_load.lock();
+      on_load.broadcast(lifecycle::LifecycleEvent::OnLoad, new_meta_ptr);
+    }
+
+    tracing::info!(name = &*old_name, "extension hot-reloaded");
+    Ok(())
+  }
+
+  /// Convenience method: prepare + commit in one call.
+  ///
+  /// Equivalent to [`prepare_reload`](Self::prepare_reload) + [`commit_reload`](Self::commit_reload).
+  pub fn reload(&self, old_name: &str, new_path: &Path) -> Result<(), FrameworkError> {
+    // Resolve the old extension's meta pointer while holding a read lock.
+    let old_meta: *const ExtensionMeta = {
+      let loaded_meta = self.loaded_meta.read();
+      let boxed = loaded_meta
+        .get(old_name)
+        .ok_or_else(|| FrameworkError::NotFound(old_name.to_string()))?;
+      &boxed.meta as *const ExtensionMeta
+    };
+
+    let pending = self.prepare_reload(new_path)?;
+    self.commit_reload(old_meta, pending)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -724,6 +1152,15 @@ pub enum FrameworkError {
   },
   SlotNotRegistered {
     slot: String,
+  },
+  /// An extension operation crashed (panicked).
+  Crashed {
+    /// Which guarded operation panicked.
+    operation: &'static str,
+    /// The extension name, if known.
+    extension: Option<String>,
+    /// The panic payload.
+    payload: Option<String>,
   },
 }
 
@@ -755,8 +1192,27 @@ impl fmt::Display for FrameworkError {
       FrameworkError::SlotNotRegistered { slot } => {
         write!(f, "required slot not registered: {}", slot)
       }
+      FrameworkError::Crashed {
+        operation,
+        extension,
+        payload,
+      } => {
+        let ext = extension.as_deref().unwrap_or("<unknown>");
+        let msg = payload.as_deref().unwrap_or("<no payload>");
+        write!(f, "{} crashed in '{}': {}", operation, ext, msg)
+      }
     }
   }
 }
 
 impl std::error::Error for FrameworkError {}
+
+impl From<CrashError> for FrameworkError {
+  fn from(err: CrashError) -> Self {
+    FrameworkError::Crashed {
+      operation: err.operation,
+      extension: err.extension,
+      payload: err.payload,
+    }
+  }
+}

@@ -1,18 +1,21 @@
 //! around-core: Shared types, traits, and error types for the around audio engine.
 //!
-//! This crate defines the foundational contracts (`Codec`, `Source`)
-//! that all other crates build upon. It has minimal dependencies.
-
-pub mod codec;
+//! This crate defines the foundational contracts (`Source`) that all other
+//! crates build upon. It has minimal dependencies.
+//!
+//! NOTE: Codec types (Codec trait, DynCodecRef, SafeCodecRef, etc.) moved to
+//! around-audio-sdk (see ADR-0004).  Import from `around_audio_sdk::codec`
+//! instead of `around_core::codec`.
+pub mod audio_sink;
 pub mod error;
 pub mod metadata;
 pub mod source;
 pub mod state;
 pub mod types;
 
-// Re-export primary types from codec (ADR-0004 stabby codec system)
-pub use codec::{init_codec, Codec, CodecRegister, DynCodecRef, ReadFn, SeekFn, StreamInfo};
 pub use error::AroundError;
+
+pub use audio_sink::{AudioSink, NullSink};
 pub use metadata::Metadata;
 pub use source::{ReadSeek, Source, SourceCapabilities};
 pub use state::PlaybackStatus;
