@@ -456,42 +456,18 @@ fn resolve_unix_socket_path() -> std::path::PathBuf {
 /// Try to send a command via the Windows named pipe.
 #[cfg(windows)]
 fn try_named_pipe_command(req: &IpcCommand) -> Result<IpcResponse, Box<dyn std::error::Error>> {
-  // Windows named pipe implementation for IPC.
   use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-  use windows::Win32::Foundation::HANDLE;
-  use windows::Win32::Storage::FileSystem::CreateFileA;
-  use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
-  use windows::Win32::Storage::FileSystem::GENERIC_READ;
-  use windows::Win32::Storage::FileSystem::GENERIC_WRITE;
-  use windows::Win32::Storage::FileSystem::OPEN_EXISTING;
+  use tokio::net::windows::named_pipe::ClientOptions;
 
-  let pipe_name = r"\\.\pipe\around\0";
-  let handle = unsafe {
-    CreateFileA(
-      pipe_name,
-      GENERIC_READ | GENERIC_WRITE,
-      windows::Win32::Storage::FileSystem::FILE_SHARE_NONE,
-      None,
-      OPEN_EXISTING,
-      FILE_FLAG_OVERLAPPED,
-      HANDLE::default(),
-    )
-  };
-
-  if handle.is_invalid() {
-    return Err("Failed to connect to named pipe".into());
-  }
-
-  // Use tokio's NamedPipeClient for async I/O.
+  let pipe_name = r"\\.\pipe\around";
   let rt = tokio::runtime::Builder::new_current_thread()
     .enable_io()
     .build()?;
   rt.block_on(async {
-    let client = tokio::net::windows::named_pipe::NamedPipeClient::new(pipe_name)?;
-    client.connect().await?;
+    let client = ClientOptions::new().open(pipe_name)?;
 
     let (reader, mut writer) = tokio::io::split(client);
-    let mut reader = BufReader::new(reader);
+    let mut reader = tokio::io::BufReader::new(reader);
 
     let json = serde_json::to_vec(req)?;
     writer.write_all(&json).await?;
@@ -682,12 +658,14 @@ fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
 /// with environment variable AROUND_DAEMON_CHILD=1 set.
 #[cfg(windows)]
 fn daemonize() -> Result<(), Box<dyn std::error::Error>> {
-  // On Windows, daemonize by spawning a detached process.
+  use std::os::windows::process::CommandExt;
+
+  const CREATE_NO_WINDOW: u32 = 0x0800_0000;
   let args: Vec<String> = std::env::args().collect();
   let child = std::process::Command::new(&args[0])
     .args(&args[1..])
     .env("AROUND_DAEMON_CHILD", "1")
-    .creation_flags(std::process::CreationFlags::CREATE_NO_WINDOW)
+    .creation_flags(CREATE_NO_WINDOW)
     .spawn()?;
   println!("Daemonized with PID {}", child.id());
   std::process::exit(0);

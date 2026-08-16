@@ -3,7 +3,7 @@
 //! Fully async — no `spawn_blocking` or raw Win32 FFI needed.
 //! tokio's `net` feature (already enabled) includes named pipe support on Windows.
 
-use crate::ipc::codec::IpcCodec;
+use crate::ipc::codec::IpcWire;
 use crate::pipeline::Engine;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ pub(crate) async fn create_named_pipe(
 pub(crate) async fn serve_pipe(
   engine: Arc<Engine>,
   mut server: tokio::net::windows::named_pipe::NamedPipeServer,
-  codec: impl IpcCodec + Clone + Send + 'static,
+  codec: IpcWire,
 ) {
   loop {
     if engine.is_shutdown() {

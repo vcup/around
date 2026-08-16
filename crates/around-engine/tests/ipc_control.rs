@@ -2,7 +2,6 @@
 //!
 //! Tests IPC command serialization, engine lifecycle, and response formats.
 use around_engine::{Engine, EngineConfig};
-#[cfg(target_os = "linux")]
 use cpal::traits::HostTrait;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, BufWriter, Write};

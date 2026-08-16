@@ -11,6 +11,7 @@ pub(crate) mod connection;
 pub(crate) mod handlers;
 pub mod transport_manager;
 pub(crate) mod transport_udp;
+#[cfg(unix)]
 pub mod transport_unix;
 #[cfg(windows)]
 pub(crate) mod transport_win;
