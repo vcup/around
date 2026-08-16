@@ -159,6 +159,12 @@ static AROUND_SLOTS: &[OwnedSlotDef] = &[OwnedSlotDef {
   reg_instance: std::ptr::addr_of!(OWNED_REGISTER).cast_mut().cast(),
 }];
 
+/// Create the sole entry for the extension-owned test slot.
+///
+/// # Safety
+///
+/// The framework must poll sequential indices beginning at zero and take
+/// ownership of every non-null pointer returned.
 #[no_mangle]
 pub unsafe extern "C" fn ownedtestslot_create(index: usize) -> *mut std::ffi::c_void {
   if index == 0 {

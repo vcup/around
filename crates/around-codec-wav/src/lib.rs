@@ -64,7 +64,7 @@ impl WavStream {
     if ret < 0 {
       Err(io::Error::other("reader read error"))
     } else {
-      Ok(ret as usize)
+      Ok(usize::try_from(ret).unwrap_or(0))
     }
   }
 
@@ -75,10 +75,9 @@ impl WavStream {
     if ret < 0 {
       Err(io::Error::other("reader seek error"))
     } else {
-      Ok(ret as u64)
+      Ok(u64::try_from(ret).unwrap_or(0))
     }
   }
-
   /// Parse RIFF/WAV header from the callback reader.
   fn parse_header(
     ctx: *mut c_void,
@@ -102,7 +101,7 @@ impl WavStream {
     let mut riff = [0u8; 4];
     tmp
       .read_bytes(&mut riff)
-      .map_err(|e| format!("read RIFF: {}", e))?;
+      .map_err(|e| format!("read RIFF: {e}"))?;
     if &riff != b"RIFF" {
       return Err("not a RIFF file".into());
     }
@@ -110,12 +109,12 @@ impl WavStream {
     let mut size_buf = [0u8; 4];
     tmp
       .read_bytes(&mut size_buf)
-      .map_err(|e| format!("read size: {}", e))?;
+      .map_err(|e| format!("read size: {e}"))?;
 
     let mut wave = [0u8; 4];
     tmp
       .read_bytes(&mut wave)
-      .map_err(|e| format!("read WAVE: {}", e))?;
+      .map_err(|e| format!("read WAVE: {e}"))?;
     if &wave != b"WAVE" {
       return Err("not a WAVE file".into());
     }
@@ -138,7 +137,7 @@ impl WavStream {
       let mut len_buf = [0u8; 4];
       tmp
         .read_bytes(&mut len_buf)
-        .map_err(|e| format!("read chunk len: {}", e))?;
+        .map_err(|e| format!("read chunk len: {e}"))?;
       let chunk_len = u32::from_le_bytes(len_buf);
 
       match &chunk_id {
@@ -147,20 +146,20 @@ impl WavStream {
           let to_read = chunk_len.min(16) as usize;
           tmp
             .read_bytes(&mut fmt_buf[..to_read])
-            .map_err(|e| format!("read fmt: {}", e))?;
+            .map_err(|e| format!("read fmt: {e}"))?;
 
           let audio_format = u16::from_le_bytes([fmt_buf[0], fmt_buf[1]]);
           if audio_format != 1 {
-            return Err(format!("unsupported audio format: {}", audio_format));
+            return Err(format!("unsupported audio format: {audio_format}"));
           }
           channels = u16::from_le_bytes([fmt_buf[2], fmt_buf[3]]) as u8;
           sample_rate = u32::from_le_bytes([fmt_buf[4], fmt_buf[5], fmt_buf[6], fmt_buf[7]]);
           bit_depth = u16::from_le_bytes([fmt_buf[14], fmt_buf[15]]) as u8;
           if ![8, 16, 24, 32].contains(&bit_depth) {
-            return Err(format!("unsupported bit depth: {}", bit_depth));
+            return Err(format!("unsupported bit depth: {bit_depth}"));
           }
           if channels == 0 || channels > 8 {
-            return Err(format!("unsupported channel count: {}", channels));
+            return Err(format!("unsupported channel count: {channels}"));
           }
           found_fmt = true;
           // Skip remaining fmt bytes
@@ -168,7 +167,7 @@ impl WavStream {
             let skip = (chunk_len - 16) as usize;
             tmp
               .seek_bytes(skip as i64, 1)
-              .map_err(|e| format!("skip fmt extra: {}", e))?;
+              .map_err(|e| format!("skip fmt extra: {e}"))?;
           }
         }
         b"data" => {
@@ -180,8 +179,8 @@ impl WavStream {
         _ => {
           // Skip unknown chunk
           tmp
-            .seek_bytes(chunk_len as i64, 1)
-            .map_err(|e| format!("skip chunk: {}", e))?;
+            .seek_bytes(i64::from(chunk_len), 1)
+            .map_err(|e| format!("skip chunk: {e}"))?;
         }
       }
     }
@@ -195,7 +194,7 @@ impl WavStream {
 
     let bytes_per_frame = (channels as usize) * (bit_depth as usize / 8);
     let total_frames = if bytes_per_frame > 0 {
-      data_size as u64 / bytes_per_frame as u64
+      u64::from(data_size) / bytes_per_frame as u64
     } else {
       0
     };
@@ -282,10 +281,10 @@ impl around_audio_sdk::codec::Codec for WavCodec {
       if ret < 0 {
         Err("seek failed".into())
       } else {
-        Ok(ret as u64)
+        Ok(u64::try_from(ret).map_err(|_| "seek overflow".to_string())?)
       }
     };
-    if tmp_seek(data_start as i64, 0).is_err() {
+    if tmp_seek(i64::try_from(data_start).unwrap_or(-1), 0).is_err() {
       return -2;
     }
 
@@ -356,8 +355,14 @@ impl around_audio_sdk::codec::Codec for WavCodec {
       for ch in 0..s.channels as usize {
         let offset = ch * bytes_per_sample;
         let sample_f32 = match s.bit_depth {
-          8 => s.raw_buf[offset] as i8 as f32 / 128.0,
-          16 => i16::from_le_bytes([s.raw_buf[offset], s.raw_buf[offset + 1]]) as f32 / 32768.0,
+          8 => f32::from(s.raw_buf[offset] as i8) / 128.0,
+          16 => {
+            f32::from(i16::from_le_bytes([
+              s.raw_buf[offset],
+              s.raw_buf[offset + 1],
+            ]))
+              / 32768.0
+          }
           24 => {
             i32::from_le_bytes([
               s.raw_buf[offset],
@@ -387,7 +392,7 @@ impl around_audio_sdk::codec::Codec for WavCodec {
           out[idx] = sample_f32;
         }
       }
-      samples_written += s.channels as i32;
+      samples_written += i32::from(s.channels);
       s.position += 1;
     }
 
@@ -409,10 +414,10 @@ impl around_audio_sdk::codec::Codec for WavCodec {
     };
 
     let byte_offset = target * s.bytes_per_frame as u64;
-    match s.seek_bytes((s.data_start + byte_offset) as i64, 0) {
+    match s.seek_bytes(i64::try_from(s.data_start + byte_offset).unwrap_or(-1), 0) {
       Ok(_) => {
         s.position = target;
-        target as i64
+        i64::try_from(target).unwrap_or(-1)
       }
       Err(_) => -2,
     }
@@ -520,12 +525,12 @@ mod tests {
     wav.extend_from_slice(b"fmt ");
     wav.extend_from_slice(&fmt_size.to_le_bytes());
     wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
-    wav.extend_from_slice(&(channels as u16).to_le_bytes());
+    wav.extend_from_slice(&u16::from(channels).to_le_bytes());
     wav.extend_from_slice(&8000u32.to_le_bytes()); // sample rate
                                                    // byte rate
-    wav.extend_from_slice(&(8000u32 * channels as u32 * bytes_per_sample as u32).to_le_bytes());
-    wav.extend_from_slice(&(channels as u16 * bytes_per_sample as u16).to_le_bytes()); // block align
-    wav.extend_from_slice(&(bit_depth as u16).to_le_bytes());
+    wav.extend_from_slice(&(8000u32 * u32::from(channels) * bytes_per_sample as u32).to_le_bytes());
+    wav.extend_from_slice(&(u16::from(channels) * bytes_per_sample as u16).to_le_bytes()); // block align
+    wav.extend_from_slice(&u16::from(bit_depth).to_le_bytes());
 
     // data chunk
     wav.extend_from_slice(b"data");
@@ -539,7 +544,7 @@ mod tests {
   fn build_wav_with_format(audio_format: u16, channels: u8, bit_depth: u8) -> Vec<u8> {
     let bytes_per_sample = (bit_depth as usize) / 8;
     let fmt_size: u32 = 16;
-    let data_size: u32 = bytes_per_sample as u32 * channels as u32; // one frame
+    let data_size: u32 = bytes_per_sample as u32 * u32::from(channels); // one frame
     let riff_data_size = 4 + 8 + fmt_size + 8 + data_size;
 
     let mut wav = Vec::new();
@@ -549,11 +554,11 @@ mod tests {
     wav.extend_from_slice(b"fmt ");
     wav.extend_from_slice(&fmt_size.to_le_bytes());
     wav.extend_from_slice(&audio_format.to_le_bytes());
-    wav.extend_from_slice(&(channels as u16).to_le_bytes());
+    wav.extend_from_slice(&u16::from(channels).to_le_bytes());
     wav.extend_from_slice(&8000u32.to_le_bytes());
-    wav.extend_from_slice(&(8000u32 * channels as u32 * bytes_per_sample as u32).to_le_bytes());
-    wav.extend_from_slice(&(channels as u16 * bytes_per_sample as u16).to_le_bytes());
-    wav.extend_from_slice(&(bit_depth as u16).to_le_bytes());
+    wav.extend_from_slice(&(8000u32 * u32::from(channels) * bytes_per_sample as u32).to_le_bytes());
+    wav.extend_from_slice(&(u16::from(channels) * bytes_per_sample as u16).to_le_bytes());
+    wav.extend_from_slice(&u16::from(bit_depth).to_le_bytes());
     wav.extend_from_slice(b"data");
     wav.extend_from_slice(&data_size.to_le_bytes());
     wav.resize(wav.len() + data_size as usize, 0);
@@ -697,8 +702,7 @@ mod tests {
       .expect("name should be valid UTF-8");
     assert!(
       name.to_lowercase().contains("wav"),
-      "name '{}' should contain 'wav'",
-      name
+      "name '{name}' should contain 'wav'"
     );
   }
 
@@ -928,11 +932,10 @@ mod tests {
     // This verifies the 16-bit conversion runs without NaN/Inf.
     assert!(samples > 0);
     for &s in output.iter().take(samples as usize) {
-      assert!(s.is_finite(), "sample should be finite: {}", s);
+      assert!(s.is_finite(), "sample should be finite: {s}");
       assert!(
         (-1.0..=1.0).contains(&s),
-        "sample should be in [-1, 1]: {}",
-        s
+        "sample should be in [-1, 1]: {s}"
       );
     }
     cleanup(&codec, stream);
@@ -946,7 +949,7 @@ mod tests {
     let samples = codec.read(stream, output.as_mut_ptr(), output.len());
     assert!(samples > 0);
     for &s in output.iter().take(samples as usize) {
-      assert!(s.is_finite(), "8-bit sample should be finite: {}", s);
+      assert!(s.is_finite(), "8-bit sample should be finite: {s}");
     }
     cleanup(&codec, stream);
   }

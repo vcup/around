@@ -51,7 +51,7 @@ impl EngineConfig {
       let path = p.as_ref();
       if path.exists() {
         let content =
-          std::fs::read_to_string(path).map_err(|e| format!("failed to read {:?}: {}", path, e))?;
+          std::fs::read_to_string(path).map_err(|e| format!("failed to read {path:?}: {e}"))?;
         return Self::parse(&content);
       }
     }
@@ -59,9 +59,7 @@ impl EngineConfig {
   }
 
   fn parse(input: &str) -> Result<Self, String> {
-    let doc: KdlDocument = input
-      .parse()
-      .map_err(|e| format!("KDL parse error: {}", e))?;
+    let doc: KdlDocument = input.parse().map_err(|e| format!("KDL parse error: {e}"))?;
     let mut cfg = Self::default();
 
     for node in doc.nodes() {

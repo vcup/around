@@ -1084,6 +1084,10 @@ impl Drop for Engine {
 
 #[cfg(all(test, feature = "async-decode"))]
 mod tests {
+  #![expect(
+    clippy::expect_used,
+    reason = "committed audio fixture and freshly prepared stream are test invariants"
+  )]
   use super::*;
 
   #[test]

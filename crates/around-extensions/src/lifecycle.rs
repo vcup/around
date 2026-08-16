@@ -10,6 +10,10 @@ use crate::ExtensionMeta;
 
 /// Events that can be broadcast to lifecycle hooks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+  clippy::enum_variant_names,
+  reason = "On* prefix mirrors C callback naming convention (OnLoad/OnUnload/OnReload) and matches the mental model of event callbacks"
+)]
 pub(crate) enum LifecycleEvent {
   OnLoad,
   OnUnload,
@@ -69,9 +73,9 @@ impl LifecycleRegister {
   /// The closure is boxed into a heap allocation and called through a
   /// non-generic `extern "C"` trampoline, keeping the storage type as a
   /// raw function pointer (no vtable at the broadcast site).
-  #[expect(
+  #[allow(
     dead_code,
-    reason = "API for external hook registration; unused until Framework::register_lifecycle_hook is called"
+    reason = "used by tests only — dead in lib-only builds, alive in --all-targets"
   )]
   pub(crate) fn register(
     &mut self,
@@ -81,7 +85,7 @@ impl LifecycleRegister {
     // Trampoline: non-generic extern "C" fn that calls the boxed closure.
     // catch_unwind is required because extern "C" frames cannot safely unwind.
     unsafe extern "C" fn closure_trampoline(meta: *const ExtensionMeta, context: *mut ()) {
-      let f: &Box<dyn Fn(*const ExtensionMeta) + Send + Sync> =
+      let f: &(dyn Fn(*const ExtensionMeta) + Send + Sync) =
         unsafe { &*(context as *const Box<dyn Fn(*const ExtensionMeta) + Send + Sync>) };
       if let Err(panic_payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         f(meta);
@@ -158,7 +162,6 @@ impl LifecycleRegister {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use std::ffi::CString;
 
   /// Verify that registering and broadcasting calls the hook.
   #[test]

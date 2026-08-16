@@ -19,6 +19,7 @@ fn file_source_reports_correct_capabilities() {
 
 #[test]
 #[expect(
+  deprecated,
   clippy::expect_used,
   reason = "example.wav exists as a committed test fixture; open() and read() must succeed by contract for contract tests"
 )]
@@ -31,6 +32,10 @@ fn file_source_open_returns_readable_stream() {
   assert_eq!(&buf, b"RIFF");
 }
 
+#[expect(
+  deprecated,
+  reason = "Phase 1 backward compat: sync open()/open_seekable() retained for legacy tests"
+)]
 #[test]
 fn file_source_open_nonexistent_file_returns_error() {
   let src = FileSource::new(fixture_path("nonexistent.wav"));
@@ -51,6 +56,7 @@ fn file_source_content_length_matches_file_size() {
 
 #[test]
 #[expect(
+  deprecated,
   clippy::unwrap_used,
   clippy::expect_used,
   reason = "zero.wav is a committed 0-byte test fixture; content_length(), open(), and read() are well-defined for empty files"
@@ -66,6 +72,7 @@ fn file_source_empty_file() {
 
 #[test]
 #[expect(
+  deprecated,
   clippy::expect_used,
   reason = "example.wav is a committed fixture with MULTI_OPEN capability; both opens succeed by contract"
 )]
@@ -85,6 +92,7 @@ fn file_source_identifier_is_stable() {
 
 #[test]
 #[expect(
+  deprecated,
   clippy::expect_used,
   reason = "example.wav is a committed fixture with SEEKABLE capability; open_seekable(), read(), seek(), and read_exact() succeed by contract"
 )]
@@ -106,6 +114,7 @@ fn file_source_open_seekable_returns_seekable_stream() {
 
 #[test]
 #[expect(
+  deprecated,
   clippy::expect_used,
   reason = "example.wav is a committed fixture; open() and open_seekable() both produce valid independent streams for MULTI_OPEN sources"
 )]

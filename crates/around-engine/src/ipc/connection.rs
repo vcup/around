@@ -87,6 +87,10 @@ pub(crate) async fn handle_connection<S: AsyncRead + AsyncWrite + Unpin>(
 
 #[cfg(all(test, feature = "protobuf-ipc", feature = "json-ipc"))]
 mod tests {
+  #![expect(
+    clippy::expect_used,
+    reason = "in-memory duplex I/O and hardcoded JSON are test invariants"
+  )]
   use super::*;
   use crate::config::OutputDriver;
   use tokio::io::{AsyncBufReadExt, AsyncWriteExt};

@@ -63,7 +63,14 @@ impl Source for FileSource {
         self.file = Some(file);
       }
 
-      let file = self.file.as_mut().expect("file was just opened — handle is Some");
+      #[expect(
+        clippy::expect_used,
+        reason = "invariant: file handle was just set to Some on lines 52-63; None would be a logic bug"
+      )]
+      let file = self
+        .file
+        .as_mut()
+        .expect("file was just opened — handle is Some");
       let n = file.read(buf).await.map_err(|e| AroundError::Internal {
         message: format!("read error '{}': {}", self.path.display(), e),
       })?;

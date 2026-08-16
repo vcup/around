@@ -46,7 +46,7 @@ fn send_command(port_file: &str, cmd: &Value) -> Value {
     clippy::expect_used,
     reason = "server must be listening on port from port file; connection refused means server died"
   )]
-  let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
+  let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
 
   // JsonLineCodec protocol: newline-delimited JSON (no length prefix)
   #[expect(
@@ -85,7 +85,7 @@ fn poke_server(port_file: &str) {
   let port_str = std::fs::read_to_string(port_file).ok();
   if let Some(s) = port_str {
     if let Ok(port) = s.trim().parse::<u16>() {
-      let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
+      let _ = TcpStream::connect(format!("127.0.0.1:{port}"));
     }
   }
 }
@@ -136,7 +136,7 @@ fn engine_play_valid_wav_returns_handle() {
       // Run and immediately stop (the stream will consume resources on drop)
       engine.stop_stream(Some(prepared.stream_id));
     }
-    Err(e) => panic!("prepare failed: {}", e),
+    Err(e) => panic!("prepare failed: {e}"),
   }
 }
 
@@ -216,7 +216,7 @@ fn ipc_server_creates_port_file_on_play() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !std::path::Path::new(&port_file).exists() {
       if std::time::Instant::now() > deadline {
-        panic!("IPC server port file not created within 5s: {}", port_file);
+        panic!("IPC server port file not created within 5s: {port_file}");
       }
       std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -467,7 +467,7 @@ fn command_round_trip() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !std::path::Path::new(&port_file).exists() {
       if std::time::Instant::now() > deadline {
-        panic!("IPC server port file not created within 5s: {}", port_file);
+        panic!("IPC server port file not created within 5s: {port_file}");
       }
       std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -811,7 +811,7 @@ fn spawn_ipc_server(suffix: &str) -> (ServerGuard, String) {
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
   while !std::path::Path::new(&port_file).exists() {
     if std::time::Instant::now() > deadline {
-      panic!("IPC server port file not created within 5s: {}", port_file);
+      panic!("IPC server port file not created within 5s: {port_file}");
     }
     std::thread::sleep(std::time::Duration::from_millis(50));
   }
@@ -849,7 +849,7 @@ fn shutdown_command_terminates_engine() {
   if let Some(s) = port_str {
     // Server may have cleaned up port file; if not, connection should error.
     if let Ok(port) = s.trim().parse::<u16>() {
-      let result = TcpStream::connect(format!("127.0.0.1:{}", port));
+      let result = TcpStream::connect(format!("127.0.0.1:{port}"));
       assert!(result.is_err(), "server should be stopped");
     }
   }
@@ -957,7 +957,7 @@ fn ipc_multiple_commands_over_one_connection() {
     clippy::expect_used,
     reason = "server must be listening on port from port file; connection refused means server died"
   )]
-  let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect");
+  let stream = TcpStream::connect(format!("127.0.0.1:{port}")).expect("connect");
 
   let mut reader = BufReader::new(&stream);
   let mut writer = BufWriter::new(&stream);
@@ -1021,7 +1021,7 @@ fn ipc_multiple_commands_over_one_connection() {
   drop(writer);
   drop(reader);
   // Connect to unblock accept loop.
-  let _ = TcpStream::connect(format!("127.0.0.1:{}", port));
+  let _ = TcpStream::connect(format!("127.0.0.1:{port}"));
 }
 
 #[test]

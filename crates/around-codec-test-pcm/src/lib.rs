@@ -159,15 +159,21 @@ impl around_audio_sdk::codec::Codec for PcmCodec {
       // SAFETY: read_fn and ctx are valid function pointer and context stored during open().
       let read_ret = unsafe { (read_fn)(ctx, buf_ptr, frame_size) };
 
-      if read_ret <= 0 || (read_ret as usize) < frame_size {
+      if read_ret <= 0 || (usize::try_from(read_ret).unwrap_or(0)) < frame_size {
         break;
       }
 
       for ch in 0..s.channels as usize {
         let offset = ch * bytes_per_sample;
         let sample_f32 = match s.bit_depth {
-          8 => s.raw_buf[offset] as i8 as f32 / 128.0,
-          16 => i16::from_le_bytes([s.raw_buf[offset], s.raw_buf[offset + 1]]) as f32 / 32768.0,
+          8 => f32::from(s.raw_buf[offset] as i8) / 128.0,
+          16 => {
+            f32::from(i16::from_le_bytes([
+              s.raw_buf[offset],
+              s.raw_buf[offset + 1],
+            ]))
+              / 32768.0
+          }
           24 => {
             i32::from_le_bytes([
               s.raw_buf[offset],
@@ -197,7 +203,7 @@ impl around_audio_sdk::codec::Codec for PcmCodec {
           out[idx] = sample_f32;
         }
       }
-      samples_written += s.channels as i32;
+      samples_written += i32::from(s.channels);
       s.position += 1;
     }
 

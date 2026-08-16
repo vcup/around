@@ -72,7 +72,7 @@ impl TransportManager {
     // TCP probe — try to read port file and connect.
     if let Ok(port_str) = std::fs::read_to_string(&self.port_path) {
       if let Ok(port) = port_str.trim().parse::<u16>() {
-        if TcpListener::bind(format!("127.0.0.1:{}", port))
+        if TcpListener::bind(format!("127.0.0.1:{port}"))
           .await
           .is_err()
         {

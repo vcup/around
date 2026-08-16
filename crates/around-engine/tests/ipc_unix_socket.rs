@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 fn test_socket_path(suffix: &str) -> std::path::PathBuf {
-  std::env::temp_dir().join(format!("around-test-{}.sock", suffix))
+  std::env::temp_dir().join(format!("around-test-{suffix}.sock"))
 }
 
 #[expect(

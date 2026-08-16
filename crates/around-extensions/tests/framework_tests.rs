@@ -61,7 +61,7 @@ fn find_test_plugin() -> PathBuf {
   let target_dir = workspace_root.join("target").join("debug");
 
   let mut candidates: Vec<PathBuf> = std::fs::read_dir(&target_dir)
-    .unwrap_or_else(|e| panic!("cannot read directory {:?}: {}", target_dir, e))
+    .unwrap_or_else(|e| panic!("cannot read directory {target_dir:?}: {e}"))
     .filter_map(|e| e.ok())
     .map(|e| e.path())
     .filter(|p| {
@@ -80,10 +80,9 @@ fn find_test_plugin() -> PathBuf {
   candidates.sort();
   candidates.into_iter().next().unwrap_or_else(|| {
     panic!(
-      "test plugin not found in {:?}\n\
-             (looking for prefix={:?}, ext={:?})\n\
+      "test plugin not found in {target_dir:?}\n\
+             (looking for prefix={PLUGIN_PREFIX:?}, ext={PLUGIN_EXT:?})\n\
              Build it with: cargo build -p around-extensions-test-plugin",
-      target_dir, PLUGIN_PREFIX, PLUGIN_EXT,
     )
   })
 }
@@ -364,8 +363,7 @@ fn duplicate_scan_ignored() {
 
   assert_eq!(
     after_first, after_second,
-    "duplicate scan should not increase index_len ({} vs {})",
-    after_first, after_second
+    "duplicate scan should not increase index_len ({after_first} vs {after_second})"
   );
 }
 
@@ -378,8 +376,7 @@ fn load_nonexistent_errors() {
 
   assert!(
     matches!(result, Err(FrameworkError::NotFound(_))),
-    "loading a nonexistent extension should return NotFound, got {:?}",
-    result
+    "loading a nonexistent extension should return NotFound, got {result:?}"
   );
 }
 
@@ -686,7 +683,6 @@ fn scan_nonexistent_directory_errors() {
   let result = fw.scan(&[bogus]);
   assert!(
     matches!(result, Err(FrameworkError::Io(_))),
-    "scan of nonexistent directory must return Io error, got {:?}",
-    result
+    "scan of nonexistent directory must return Io error, got {result:?}"
   );
 }

@@ -42,54 +42,45 @@ pub enum AroundError {
 impl fmt::Display for AroundError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      Self::FileNotFound { path } => write!(f, "file not found: {}", path),
+      Self::FileNotFound { path } => write!(f, "file not found: {path}"),
       Self::UnsupportedFormat { format, reason } => {
         if let Some(fmt) = format {
-          write!(f, "unsupported format '{}': {}", fmt, reason)
+          write!(f, "unsupported format '{fmt}': {reason}")
         } else {
-          write!(f, "unsupported format: {}", reason)
+          write!(f, "unsupported format: {reason}")
         }
       }
-      Self::DecodeError { message } => write!(f, "decode error: {}", message),
+      Self::DecodeError { message } => write!(f, "decode error: {message}"),
       Self::SourceIncompatible { source, required } => {
-        write!(
-          f,
-          "source '{}' is incompatible: requires {}",
-          source, required
-        )
+        write!(f, "source '{source}' is incompatible: requires {required}")
       }
       Self::NoTrack => write!(f, "no track loaded"),
       Self::CodecLoadFailed { path, reason } => {
         if let Some(p) = path {
-          write!(f, "codec load failed for '{}': {}", p, reason)
+          write!(f, "codec load failed for '{p}': {reason}")
         } else {
-          write!(f, "codec load failed: {}", reason)
+          write!(f, "codec load failed: {reason}")
         }
       }
-      Self::Internal { message } => write!(f, "internal error: {}", message),
+      Self::Internal { message } => write!(f, "internal error: {message}"),
       Self::SourceAlreadyConsumed { source } => {
-        write!(f, "source '{}' already consumed", source)
+        write!(f, "source '{source}' already consumed")
       }
       Self::InvalidPosition {
         position_ms,
         duration_ms,
       } => {
         if let Some(dur) = duration_ms {
-          write!(
-            f,
-            "invalid position {}ms (duration: {}ms)",
-            position_ms, dur
-          )
+          write!(f, "invalid position {position_ms}ms (duration: {dur}ms)")
         } else {
           write!(
             f,
-            "invalid position {}ms (no duration available)",
-            position_ms
+            "invalid position {position_ms}ms (no duration available)"
           )
         }
       }
       Self::CodecNotSupported { codec, reason } => {
-        write!(f, "codec '{}' not supported: {}", codec, reason)
+        write!(f, "codec '{codec}' not supported: {reason}")
       }
     }
   }
@@ -104,7 +95,7 @@ impl From<std::io::Error> for AroundError {
         path: e.to_string(),
       },
       _ => Self::Internal {
-        message: format!("I/O error: {}", e),
+        message: format!("I/O error: {e}"),
       },
     }
   }

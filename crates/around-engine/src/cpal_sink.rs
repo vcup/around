@@ -43,7 +43,7 @@ impl CpalSink {
     let config = device
       .default_output_config()
       .map_err(|e| AroundError::Internal {
-        message: format!("audio device error: {}", e),
+        message: format!("audio device error: {e}"),
       })?;
 
     let (producer, consumer) = create_output(16384);
@@ -69,11 +69,11 @@ impl CpalSink {
         None,
       )
       .map_err(|e| AroundError::Internal {
-        message: format!("failed to build audio output stream: {}", e),
+        message: format!("failed to build audio output stream: {e}"),
       })?;
 
     stream.play().map_err(|e| AroundError::Internal {
-      message: format!("failed to start audio output stream: {}", e),
+      message: format!("failed to start audio output stream: {e}"),
     })?;
 
     Ok(Self {
