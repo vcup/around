@@ -52,7 +52,7 @@ fn write_temp_so(data: &[u8]) -> Option<std::path::PathBuf> {
   let count = LOAD_BYTES_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
   let dir = std::env::temp_dir().join("around-extensions-load");
   std::fs::create_dir_all(&dir).ok()?;
-  let path = dir.join(format!("load_bytes_{:x}.so", count));
+  let path = dir.join(format!("load_bytes_{count:x}.so"));
   std::fs::write(&path, data).ok()?;
   Some(path)
 }
@@ -192,7 +192,7 @@ pub unsafe extern "C" fn around_unload(meta: *const ExtensionMeta) -> bool {
     let loaded_meta = fw.loaded_meta.read();
     let mut found: Option<Box<str>> = None;
     for (n, boxed) in loaded_meta.iter() {
-      if &boxed.meta as *const ExtensionMeta == meta {
+      if std::ptr::eq(&boxed.meta, meta) {
         found = Some(n.clone());
         break;
       }
@@ -298,12 +298,13 @@ pub unsafe extern "C" fn around_push_entry(
     return;
   }
 
-  // SAFETY: caller guarantees validity of all pointers.
-  let vt: &RegisterVTable = unsafe { &*(vtable as *const RegisterVTable) };
-
   let fw = Framework::instance();
   let slot_map = fw.slot_map.read();
-  if let Some((_reg_vt, opaque_reg)) = slot_map.get(name) {
+  if let Some(storage) = slot_map.get(name) {
+    let (vt, opaque_reg) = match storage {
+      crate::SlotStorage::Static { vtable, reg } => (*vtable, *reg),
+      crate::SlotStorage::Owned { vtable, reg, .. } => (*vtable, *reg),
+    };
     // SAFETY: opaque_reg is the Register pointer from attach_register.
     unsafe { (vt.push_raw)(opaque_reg.0, entry, source) };
   }

@@ -620,6 +620,58 @@ fn load_after_unload_round_trip() {
 }
 
 #[test]
+#[expect(
+  clippy::unwrap_used,
+  clippy::expect_used,
+  reason = "test plugin and its exported counters are controlled fixtures"
+)]
+fn extension_owned_slot_is_registered_once_and_removed_before_unload() {
+  let _guard = test_setup();
+  let fw = Framework::instance();
+  let plugin_path = find_test_plugin();
+  let dir = plugin_path.parent().unwrap().to_path_buf();
+  fw.scan(&[dir]).unwrap();
+
+  // Keep the first mapping alive so resetting the plugin's counters remains
+  // visible when the framework opens the same shared object again.
+  let first = fw.load(PLUGIN_NAME).unwrap();
+  fw.unload(PLUGIN_NAME).unwrap();
+  unsafe {
+    let reset: libloading::Symbol<extern "C" fn()> = first
+      .get(b"owned_slot_reset_counts\0")
+      .expect("owned slot reset symbol");
+    reset();
+  }
+
+  let second = fw.load(PLUGIN_NAME).unwrap();
+  let push_count = unsafe {
+    let pushes: libloading::Symbol<extern "C" fn() -> usize> = first
+      .get(b"owned_slot_push_count\0")
+      .expect("owned slot push counter");
+    pushes()
+  };
+
+  fw.unload(PLUGIN_NAME).unwrap();
+  let remove_count = unsafe {
+    let removals: libloading::Symbol<extern "C" fn() -> usize> = first
+      .get(b"owned_slot_remove_count\0")
+      .expect("owned slot remove counter");
+    removals()
+  };
+
+  drop(second);
+  drop(first);
+  assert_eq!(
+    push_count, 1,
+    "the owner slot factory must be polled exactly once per load"
+  );
+  assert_eq!(
+    remove_count, 1,
+    "owned registers must remove entries before their library is unmapped"
+  );
+}
+
+#[test]
 fn scan_nonexistent_directory_errors() {
   let _guard = test_setup();
   let fw = Framework::instance();

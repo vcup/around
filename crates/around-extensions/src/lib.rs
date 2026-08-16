@@ -352,6 +352,52 @@ unsafe impl Send for OpaquePtr {}
 unsafe impl Sync for OpaquePtr {}
 
 // ---------------------------------------------------------------------------
+// SlotStorage — static vs owned slot distinction
+// ---------------------------------------------------------------------------
+
+/// Distinguishes how a slot register was registered with the Framework.
+#[derive(Clone)]
+pub(crate) enum SlotStorage {
+  /// A slot registered by the host at startup (e.g. Codec, Filter).
+  /// Never removed during unload or reload.
+  Static {
+    vtable: &'static RegisterVTable,
+    reg: OpaquePtr,
+  },
+  /// A slot defined by an extension via AROUND_SLOTS.
+  /// Removed when the defining extension is unloaded or reloaded.
+  Owned {
+    vtable: &'static RegisterVTable,
+    reg: OpaquePtr,
+    /// Name of the extension that owns this slot.
+    /// Used by unload() to find and remove Owned slots.
+    owner: Box<str>,
+  },
+}
+
+// ---------------------------------------------------------------------------
+// PendingEntry — buffered slot entry waiting for target register
+// ---------------------------------------------------------------------------
+
+/// A buffered slot entry waiting for its target register to be created.
+///
+/// Produced during `load()` or `prepare_reload()` when a `push_raw` call
+/// fails because the target SlotStorage doesn't exist yet.
+struct PendingEntry {
+  /// Target slot name (e.g. `"com.example::Filter"`).
+  slot_name: Box<str>,
+  /// Opaque entry pointer (from `{slot_name}_create(index)`).
+  entry: *mut (),
+  /// ExtensionMeta pointer of the extension that produced this entry.
+  ext_meta: *const ExtensionMeta,
+}
+
+// SAFETY: PendingEntry holds raw pointers that remain valid as long as
+// the extension that produced them is loaded. The entries are drained
+// before any unload that would invalidate them.
+unsafe impl Send for PendingEntry {}
+
+// ---------------------------------------------------------------------------
 // SlotDef — slot definition from AROUND_SLOTS
 // ---------------------------------------------------------------------------
 
@@ -360,6 +406,7 @@ unsafe impl Sync for OpaquePtr {}
 /// Each slot describes a typed register that the extension provides entries
 /// for (e.g. Codec, Filter). The Framework uses these to dynamically attach
 /// new register types introduced by an extension.
+#[derive(Clone)]
 #[repr(C)]
 pub(crate) struct SlotDef {
   /// Canonical slot name, e.g. `"around_audio_sdk::codec::Codec"`.
@@ -390,7 +437,6 @@ pub struct PendingReload {
   /// Heap-allocated `ExtensionMeta` with owned backing strings.
   meta: Box<OwnedFFIMeta>,
   /// Slot definitions from `AROUND_SLOTS` in the new `.so`.
-  #[expect(dead_code, reason = "reserved for future use by attach_register")]
   slot_defs: Vec<SlotDef>,
   /// Per-slot registration entries, indexed by slot name.
   /// Populated by polling `{slot_name}_create()` during prepare.
@@ -408,8 +454,8 @@ pub struct PendingReload {
 ///
 /// The framework owns the scanned index (name → path + meta), the active
 pub struct Framework {
-  /// slot_name → (RegisterVTable reference, opaque Register pointer).
-  slot_map: RwLock<HashMap<Box<str>, (&'static RegisterVTable, OpaquePtr)>>,
+  /// slot_name → SlotStorage (Static or Owned).
+  slot_map: RwLock<HashMap<Box<str>, SlotStorage>>,
   /// extension name → (path on disk, owned metadata).
   index: RwLock<HashMap<Box<str>, (PathBuf, IndexedMeta)>>,
   /// Loaded libraries kept alive (Arc so callers can share ownership).
@@ -432,6 +478,12 @@ pub struct Framework {
   /// [`record_guarded_outcome`]. When a Register reaches `Trusted`,
   /// crash guard elision is eligible for that slot's operations.
   slot_trust: RwLock<HashMap<Box<str>, TrustCounter>>,
+  /// Entries buffered during load() / prepare_reload() whose target
+  /// slot register doesn't exist yet. Drained when the missing slot
+  /// is registered via attach_register or attach_register_owned.
+  pending: Mutex<Vec<PendingEntry>>,
+  /// Search paths remembered from scan(), used by fresh_scan().
+  search_paths: RwLock<Vec<PathBuf>>,
 }
 impl Framework {
   pub fn instance() -> &'static Framework {
@@ -446,6 +498,8 @@ impl Framework {
       on_reload: Mutex::new(LifecycleRegister::new()),
       loaded_trust: RwLock::new(HashMap::new()),
       slot_trust: RwLock::new(HashMap::new()),
+      pending: Mutex::new(Vec::new()),
+      search_paths: RwLock::new(Vec::new()),
     });
     &FW
   }
@@ -457,13 +511,83 @@ impl Framework {
   /// `vt` and `reg` come from the `#[slot]`-generated `CodecRegister`.
   pub fn attach_register(&self, name: &'static str, vt: &'static RegisterVTable, reg: *mut ()) {
     let mut map = self.slot_map.write();
-    map.insert(Box::from(name), (vt, OpaquePtr(reg)));
+    map.insert(
+      Box::from(name),
+      SlotStorage::Static {
+        vtable: vt,
+        reg: OpaquePtr(reg),
+      },
+    );
     // Initialise per-Register trust counter (default 100 successes to reach Trusted).
     let mut slot_trust = self.slot_trust.write();
     slot_trust
       .entry(Box::from(name))
       .or_insert_with(|| TrustCounter::new(100));
     tracing::debug!(slot = name, "slot registered");
+    // Drain any buffered PendingEntry's for this slot.
+    self.drain_pending(name, vt, OpaquePtr(reg));
+  }
+
+  /// Register an Owned slot. Called during AROUND_SLOTS processing
+  /// in load() / prepare_reload(). Not part of the public API.
+  pub(crate) fn attach_register_owned(
+    &self,
+    name: &str,
+    vt: &'static RegisterVTable,
+    reg: *mut (),
+    owner: &str,
+  ) {
+    let mut map = self.slot_map.write();
+    if map.contains_key(name) {
+      tracing::warn!(
+        slot = name,
+        "attach_register_owned: overwriting existing slot"
+      );
+    }
+    map.insert(
+      Box::from(name),
+      SlotStorage::Owned {
+        vtable: vt,
+        reg: OpaquePtr(reg),
+        owner: Box::from(owner),
+      },
+    );
+    // Drain any buffered PendingEntry's for this slot.
+    self.drain_pending(name, vt, OpaquePtr(reg));
+  }
+
+  /// Drain buffered pending entries for a given slot name.
+  ///
+  /// Called from `attach_register` and `attach_register_owned` after
+  /// inserting a new SlotStorage, and after AROUND_SLOTS processing.
+  fn drain_pending(&self, slot_name: &str, vt: &'static RegisterVTable, reg: OpaquePtr) {
+    let mut pending = self.pending.lock();
+    let mut remaining = Vec::new();
+    for pe in pending.drain(..) {
+      if pe.slot_name.as_ref() == slot_name {
+        // Drain: push into the now-existing register.
+        let result = crash_guard_unsafe("drain_push", None, || unsafe {
+          (vt.push_raw)(reg.0, pe.entry, pe.ext_meta)
+        });
+        if result.is_err() {
+          // Keep remaining (failed) entries for retry.
+          remaining.push(pe);
+        }
+      } else {
+        remaining.push(pe);
+      }
+    }
+    *pending = remaining;
+  }
+
+  /// Remove all Owned slots belonging to a given extension.
+  /// Called during unload() before the remove_by_meta loop.
+  pub(crate) fn remove_owned_slots(&self, owner: &str) {
+    let mut slot_map = self.slot_map.write();
+    slot_map.retain(|_slot_name, storage| match storage {
+      SlotStorage::Owned { owner: o, .. } => o.as_ref() != owner,
+      SlotStorage::Static { .. } => true,
+    });
   }
 
   /// Record a guarded operation outcome for a Register.
@@ -495,9 +619,14 @@ impl Framework {
   /// read the [`ExtensionMeta`], and `dlclose`.  Populates the internal index.
   /// Does NOT load dependencies — that happens on first [`load`](Self::load).
   pub fn scan(&self, search_paths: &[PathBuf]) -> Result<(), FrameworkError> {
+    // Store search paths for fresh_scan().
+    {
+      let mut sp = self.search_paths.write();
+      *sp = search_paths.to_vec();
+    }
     for search_path in search_paths {
       let entries = std::fs::read_dir(search_path)
-        .map_err(|e| FrameworkError::Io(format!("read_dir {:?}: {}", search_path, e)))?;
+        .map_err(|e| FrameworkError::Io(format!("read_dir {search_path:?}: {e}")))?;
       for entry in entries {
         let entry = match entry {
           Ok(e) => e,
@@ -560,6 +689,49 @@ impl Framework {
     Ok(())
   }
 
+  /// Fresh-scan search paths for a specific extension by name.
+  ///
+  /// Walks the stored search paths looking for a `.so` that exports
+  /// `AROUND_META` with the matching extension name. Adds it to the
+  /// index if found.
+  ///
+  /// Returns `true` if the extension was found and added.
+  pub fn fresh_scan(&self, name: &str) -> bool {
+    let paths: Vec<PathBuf> = self.search_paths.read().clone();
+    for search_path in &paths {
+      let Ok(entries) = std::fs::read_dir(search_path) else {
+        continue;
+      };
+      for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+          continue;
+        };
+        if !SHARED_LIB_EXTENSIONS.contains(&ext) {
+          continue;
+        }
+        // SAFETY: dlopen to read metadata only.
+        let Ok(lib) = (unsafe { open_library(&path) }) else {
+          continue;
+        };
+        // SAFETY: dlsym returns a raw pointer to static read-only data.
+        let Ok(meta_sym) = (unsafe { lib.get::<&'static ExtensionMeta>(b"AROUND_META\0") }) else {
+          continue;
+        };
+        let indexed = IndexedMeta::from_ffi(*meta_sym);
+        if indexed.name.as_ref() == name {
+          let mut index = self.index.write();
+          index.insert(Box::from(name), (path.clone(), indexed));
+          tracing::info!(name, path = %path.display(), "fresh_scan found extension");
+          return true;
+        }
+        // lib dropped here → dlclose.
+      }
+    }
+    false
+  }
+
   /// Load an extension by name.
   ///
   /// 1. Resolve the name in the index (error if unknown).
@@ -574,8 +746,8 @@ impl Framework {
   ///
   /// The create symbol name for a slot is derived as:
   /// `slot_name.to_lowercase().replace("::", "_") + "_create"`.
-  /// For example, the slot `"around_audio_sdk::codec::Codec"` becomes the
-  /// symbol `"around_audio_sdk_codec_codec_create"`.
+  /// For example, the slot `"around_audio_sdk::Codec"` becomes the
+  /// symbol `"around_audio_sdk_codec_create"`.
   ///
   /// The framework polls consecutive indices starting from 0 until the
   /// exported function returns a null pointer, signalling the end of
@@ -605,8 +777,7 @@ impl Framework {
       let mut loading = self.loading.lock();
       if loading.contains(name) {
         return Err(FrameworkError::Load(format!(
-          "circular dependency detected while loading {}",
-          name
+          "circular dependency detected while loading {name}"
         )));
       }
       loading.insert(Box::from(name));
@@ -620,12 +791,20 @@ impl Framework {
     };
 
     // Resolve in index — get IndexedMeta with owned strings.
-    let (path, indexed) = {
-      let index = self.index.read();
-      let (path, meta) = index
-        .get(name)
-        .ok_or_else(|| FrameworkError::NotFound(name.to_string()))?;
-      (path.clone(), meta.clone())
+    let indexed_entry = self.index.read().get(name).cloned();
+    let (path, indexed) = match indexed_entry {
+      Some(entry) => entry,
+      None => {
+        if !self.fresh_scan(name) {
+          return Err(FrameworkError::NotFound(name.to_string()));
+        }
+        self
+          .index
+          .read()
+          .get(name)
+          .cloned()
+          .ok_or_else(|| FrameworkError::NotFound(name.to_string()))?
+      }
     };
 
     // Validate API version before proceeding further.
@@ -653,7 +832,7 @@ impl Framework {
 
     // dlopen with RTLD_NOW | RTLD_LOCAL on Unix.
     let lib = unsafe { open_library(&path) }
-      .map_err(|e| FrameworkError::Load(format!("dlopen {:?}: {}", path, e)))?;
+      .map_err(|e| FrameworkError::Load(format!("dlopen {path:?}: {e}")))?;
     let lib = Arc::new(lib);
 
     // Build heap-allocated ExtensionMeta with CString data for stable FFI pointers.
@@ -668,13 +847,66 @@ impl Framework {
         Ok(0) => { /* success */ }
         Ok(rc) => {
           return Err(FrameworkError::Init(format!(
-            "around_init returned {} for {}",
-            rc, name
+            "around_init returned {rc} for {name}"
           )));
         }
         Err(e) => {
           return Err(e);
         }
+      }
+    }
+
+    // --- NEW: Read AROUND_SLOTS and register Owned slots. ---
+    let meta_ptr_for_slots = &meta_box.meta as *const ExtensionMeta;
+    if let Ok(slots_sym) = unsafe { lib.get::<*const &[SlotDef]>(b"AROUND_SLOTS\0") } {
+      let slots_ptr: *const &[SlotDef] = *slots_sym;
+      // SAFETY: AROUND_SLOTS is an exported static slice whose backing array
+      // remains mapped for the lifetime of lib.
+      let slot_defs: &[SlotDef] = unsafe { *slots_ptr };
+      for slot_def in slot_defs {
+        assert!(!slot_def.reg_vtable.is_null());
+        assert!(!slot_def.reg_instance.is_null());
+        // SAFETY: the slot_def's vtable pointer comes from the extension's data segment.
+        let vt: &'static RegisterVTable =
+          unsafe { &*(slot_def.reg_vtable as *const RegisterVTable) };
+
+        // Register the Owned slot.
+        self.attach_register_owned(slot_def.slot_name, vt, slot_def.reg_instance, name);
+
+        // Poll {slot_name}_create for initial entries.
+        let create_sym_name = {
+          let base = slot_def.slot_name.to_lowercase().replace("::", "_");
+          format!("{base}_create\0")
+        };
+        let mut index: usize = 0;
+        loop {
+          type CreateFn = unsafe extern "C" fn(usize) -> *mut ();
+          let create: Symbol<CreateFn> = match unsafe { lib.get(create_sym_name.as_bytes()) } {
+            Ok(s) => s,
+            Err(_) => break,
+          };
+          let entry: *mut () = unsafe { create(index) };
+          if entry.is_null() {
+            break;
+          }
+          // Push into the newly registered Owned slot.
+          let push_result = crash_guard_unsafe("push_raw", Some(name.to_string()), || unsafe {
+            (vt.push_raw)(slot_def.reg_instance, entry, meta_ptr_for_slots)
+          });
+          if push_result.is_err() {
+            // Buffer if push failed (slot might not be fully ready yet).
+            let mut pending = self.pending.lock();
+            pending.push(PendingEntry {
+              slot_name: Box::from(slot_def.slot_name),
+              entry,
+              ext_meta: meta_ptr_for_slots,
+            });
+          }
+          index += 1;
+        }
+
+        // Drain any pending entries for this new slot.
+        self.drain_pending(slot_def.slot_name, vt, OpaquePtr(slot_def.reg_instance));
       }
     }
 
@@ -684,7 +916,13 @@ impl Framework {
       let slot_map = self.slot_map.read();
       slot_map
         .iter()
-        .map(|(name, (vt, reg))| (*vt, *reg, name.clone()))
+        .filter_map(|(slot_name, storage)| match storage {
+          SlotStorage::Static { vtable, reg } => Some((*vtable, *reg, slot_name.clone())),
+          SlotStorage::Owned { vtable, reg, owner } if owner.as_ref() != name => {
+            Some((*vtable, *reg, slot_name.clone()))
+          }
+          SlotStorage::Owned { .. } => None,
+        })
         .collect()
     };
     for (vt, opaque_reg, slot_name) in &slot_entries {
@@ -772,15 +1010,23 @@ impl Framework {
         .ok_or_else(|| FrameworkError::NotFound(name.to_string()))?
     };
 
-    // Call remove_by_meta on all slot registers for this extension.
+    // Remove this extension's entries from every live register while the
+    // extension's metadata and any owned register vtables are still valid.
     {
       let slot_map = self.slot_map.read();
-      for (_slot_name, (vt, opaque_reg)) in slot_map.iter() {
+      for storage in slot_map.values() {
+        let (vt, opaque_reg) = match storage {
+          SlotStorage::Static { vtable, reg } | SlotStorage::Owned { vtable, reg, .. } => {
+            (*vtable, *reg)
+          }
+        };
         tracing::debug!(name, "calling remove_by_meta for extension");
-        // SAFETY: reg is a valid Register pointer; meta_box.meta is valid.
+        // SAFETY: reg is a live Register pointer and meta_box remains valid
+        // until every register has removed entries associated with it.
         unsafe { (vt.remove_by_meta)(opaque_reg.0, &meta_box.meta as *const ExtensionMeta) };
       }
     }
+    self.remove_owned_slots(name);
 
     // Remove the loaded library.
     let lib = {
@@ -862,28 +1108,40 @@ impl Framework {
   pub fn prepare_reload(&self, path: &Path) -> Result<PendingReload, FrameworkError> {
     // dlopen the new .so with RTLD_NOW | RTLD_LOCAL.
     let lib = unsafe { open_library(path) }
-      .map_err(|e| FrameworkError::Load(format!("prepare_reload dlopen {:?}: {}", path, e)))?;
+      .map_err(|e| FrameworkError::Load(format!("prepare_reload dlopen {path:?}: {e}")))?;
     let lib = Arc::new(lib);
 
     // Read AROUND_META and build OwnedFFIMeta with owned backing strings.
     let meta_sym: Symbol<&'static ExtensionMeta> = unsafe {
       lib
         .get(b"AROUND_META\0")
-        .map_err(|_| FrameworkError::Load(format!("no AROUND_META in {:?}", path)))?
+        .map_err(|_| FrameworkError::Load(format!("no AROUND_META in {path:?}")))?
     };
 
-    // Read AROUND_SLOTS (V0: slot definitions from the extension are
-    // deferred — extensions typically provide entries to host-registered
-    // slots rather than defining new slot types).
-    let slot_defs: Vec<SlotDef> = Vec::new();
+    // Read AROUND_SLOTS — populate slot_defs for commit_reload.
+    let slot_defs: Vec<SlotDef> =
+      if let Ok(slots_sym) = unsafe { lib.get::<*const &[SlotDef]>(b"AROUND_SLOTS\0") } {
+        let slots_ptr: *const &[SlotDef] = *slots_sym;
+        // SAFETY: AROUND_SLOTS is backed by immutable storage in lib.
+        unsafe { (*slots_ptr).to_vec() }
+      } else {
+        Vec::new()
+      };
     let meta_box = IndexedMeta::from_ffi(*meta_sym).to_heap_ffi();
+    let extension_name = meta_box.meta.name().to_owned();
     // Snapshot slot_map entries before iterating to avoid deadlock
     // if a create() function calls back into attach_register() (B5).
     let slot_entries: Vec<(Box<str>, &'static RegisterVTable, OpaquePtr)> = {
       let slot_map = self.slot_map.read();
       slot_map
         .iter()
-        .map(|(name, (vt, reg))| (name.clone(), *vt, *reg))
+        .filter_map(|(slot_name, storage)| match storage {
+          SlotStorage::Static { vtable, reg } => Some((slot_name.clone(), *vtable, *reg)),
+          SlotStorage::Owned { vtable, reg, owner } if owner.as_ref() != extension_name => {
+            Some((slot_name.clone(), *vtable, *reg))
+          }
+          SlotStorage::Owned { .. } => None,
+        })
         .collect()
     };
     // Lock released — safe to call create().
@@ -928,8 +1186,7 @@ impl Framework {
         Ok(0) => { /* success */ }
         Ok(rc) => {
           return Err(FrameworkError::Init(format!(
-            "around_init returned {} for {:?}",
-            rc, path
+            "around_init returned {rc} for {path:?}"
           )));
         }
         Err(e) => {
@@ -979,7 +1236,7 @@ impl Framework {
       let loaded_meta = self.loaded_meta.read();
       let mut found: Option<Box<str>> = None;
       for (name, boxed_meta) in loaded_meta.iter() {
-        if &boxed_meta.meta as *const ExtensionMeta == old_meta {
+        if std::ptr::eq(&boxed_meta.meta, old_meta) {
           found = Some(name.clone());
           break;
         }
@@ -1023,24 +1280,31 @@ impl Framework {
     {
       let mut loaded = self.loaded.write();
       let mut loaded_meta = self.loaded_meta.write();
-      old_meta_box = loaded_meta.remove(&old_name).ok_or_else(|| {
-        FrameworkError::NotFound(format!("{} not found in loaded_meta", old_name))
-      })?;
+      old_meta_box = loaded_meta
+        .remove(&old_name)
+        .ok_or_else(|| FrameworkError::NotFound(format!("{old_name} not found in loaded_meta")))?;
       old_lib = loaded
         .remove(&old_name)
-        .ok_or_else(|| FrameworkError::NotFound(format!("{} not found in loaded", old_name)))?;
+        .ok_or_else(|| FrameworkError::NotFound(format!("{old_name} not found in loaded")))?;
     }
     // Write locks dropped here — safe for lifecycle hooks to query state.
 
-    // Remove entries from all slot registers.
+    // Remove old entries before unregistering extension-owned slots; their
+    // register vtables become invalid as soon as the old library is dropped.
     {
       let slot_map = self.slot_map.read();
-      for (_slot_name, (vt, opaque_reg)) in slot_map.iter() {
+      for storage in slot_map.values() {
+        let (vt, opaque_reg) = match storage {
+          SlotStorage::Static { vtable, reg } | SlotStorage::Owned { vtable, reg, .. } => {
+            (*vtable, *reg)
+          }
+        };
         tracing::debug!(name = &*old_name, "commit_reload: remove_by_meta");
-        // SAFETY: reg is a valid Register pointer; old_meta_box.meta is valid.
+        // SAFETY: reg and old_meta_box are valid until the old library is dropped below.
         unsafe { (vt.remove_by_meta)(opaque_reg.0, &old_meta_box.meta as *const ExtensionMeta) };
       }
     }
+    self.remove_owned_slots(&old_name);
 
     // Call around_deinit on the old extension.
     if let Ok(deinit) = unsafe { old_lib.get::<unsafe extern "C" fn()>(b"around_deinit\0") } {
@@ -1070,10 +1334,56 @@ impl Framework {
     // ── Phase 3: Install new extension. ──
     let new_meta_ptr = &pending.meta.meta as *const ExtensionMeta;
 
+    // Install Owned slots from AROUND_SLOTS.
+    for slot_def in &pending.slot_defs {
+      assert!(!slot_def.reg_vtable.is_null());
+      assert!(!slot_def.reg_instance.is_null());
+      // SAFETY: the slot_def's vtable pointer comes from the extension's data segment.
+      let vt: &'static RegisterVTable = unsafe { &*(slot_def.reg_vtable as *const RegisterVTable) };
+
+      self.attach_register_owned(slot_def.slot_name, vt, slot_def.reg_instance, &old_name);
+
+      // Poll {slot_name}_create for initial entries from the new .so.
+      let create_sym_name = {
+        let base = slot_def.slot_name.to_lowercase().replace("::", "_");
+        format!("{base}_create\0")
+      };
+      let mut index: usize = 0;
+      loop {
+        type CreateFn = unsafe extern "C" fn(usize) -> *mut ();
+        let create: Symbol<CreateFn> = match unsafe { pending.lib.get(create_sym_name.as_bytes()) }
+        {
+          Ok(s) => s,
+          Err(_) => break,
+        };
+        let entry: *mut () = unsafe { create(index) };
+        if entry.is_null() {
+          break;
+        }
+        let push_result = crash_guard_unsafe("push_raw", Some(old_name.to_string()), || unsafe {
+          (vt.push_raw)(slot_def.reg_instance, entry, new_meta_ptr)
+        });
+        if push_result.is_err() {
+          let mut pending_vec = self.pending.lock();
+          pending_vec.push(PendingEntry {
+            slot_name: Box::from(slot_def.slot_name),
+            entry,
+            ext_meta: new_meta_ptr,
+          });
+        }
+        index += 1;
+      }
+      self.drain_pending(slot_def.slot_name, vt, OpaquePtr(slot_def.reg_instance));
+    }
+
     // Push entries for the new extension into each slot register.
     for (slot_name, entries) in &pending.entries {
       let slot_map = self.slot_map.read();
-      if let Some((vt, opaque_reg)) = slot_map.get(slot_name) {
+      if let Some(storage) = slot_map.get(slot_name) {
+        let (vt, opaque_reg) = match storage {
+          SlotStorage::Static { vtable, reg } => (*vtable, *reg),
+          SlotStorage::Owned { vtable, reg, .. } => (*vtable, *reg),
+        };
         for &entry in entries {
           crash_guard_unsafe("push_raw", Some(old_name.to_string()), || unsafe {
             (vt.push_raw)(opaque_reg.0, entry, new_meta_ptr)
@@ -1167,10 +1477,10 @@ pub enum FrameworkError {
 impl fmt::Display for FrameworkError {
   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match self {
-      FrameworkError::Io(msg) => write!(f, "I/O error: {}", msg),
-      FrameworkError::NotFound(name) => write!(f, "extension not found: {}", name),
-      FrameworkError::Load(msg) => write!(f, "load error: {}", msg),
-      FrameworkError::Init(msg) => write!(f, "init error: {}", msg),
+      FrameworkError::Io(msg) => write!(f, "I/O error: {msg}"),
+      FrameworkError::NotFound(name) => write!(f, "extension not found: {name}"),
+      FrameworkError::Load(msg) => write!(f, "load error: {msg}"),
+      FrameworkError::Init(msg) => write!(f, "init error: {msg}"),
       FrameworkError::ApiVersionMismatch {
         name,
         expected,
@@ -1178,19 +1488,14 @@ impl fmt::Display for FrameworkError {
       } => {
         write!(
           f,
-          "API version mismatch for {}: expected {}, got {}",
-          name, expected, got
+          "API version mismatch for {name}: expected {expected}, got {got}"
         )
       }
       FrameworkError::DependentsRemain { name, dependent } => {
-        write!(
-          f,
-          "cannot unload {}: {} still depends on it",
-          name, dependent
-        )
+        write!(f, "cannot unload {name}: {dependent} still depends on it")
       }
       FrameworkError::SlotNotRegistered { slot } => {
-        write!(f, "required slot not registered: {}", slot)
+        write!(f, "required slot not registered: {slot}")
       }
       FrameworkError::Crashed {
         operation,
@@ -1199,7 +1504,7 @@ impl fmt::Display for FrameworkError {
       } => {
         let ext = extension.as_deref().unwrap_or("<unknown>");
         let msg = payload.as_deref().unwrap_or("<no payload>");
-        write!(f, "{} crashed in '{}': {}", operation, ext, msg)
+        write!(f, "{operation} crashed in '{ext}': {msg}")
       }
     }
   }

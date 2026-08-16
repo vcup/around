@@ -3,7 +3,7 @@
 //! Exports `AROUND_META` and `TestSlot_create` so integration tests can
 //! verify scan, load, unload, and remove_by_meta lifecycle.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // ---------------------------------------------------------------------------
 // Extension metadata
@@ -105,4 +105,81 @@ pub unsafe extern "C" fn testslot_create(index: usize) -> *mut std::ffi::c_void 
   } else {
     std::ptr::null_mut()
   }
+}
+
+// ---------------------------------------------------------------------------
+// Extension-owned slot — exercises AROUND_SLOTS lifecycle
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+struct OwnedSlotDef {
+  slot_name: &'static str,
+  reg_vtable: *const (),
+  reg_instance: *mut (),
+}
+
+// SAFETY: every field points to immutable static storage.
+unsafe impl Sync for OwnedSlotDef {}
+
+static OWNED_PUSH_COUNT: AtomicUsize = AtomicUsize::new(0);
+static OWNED_REMOVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static OWNED_REGISTER: u8 = 0;
+
+unsafe extern "C" fn owned_push_raw(
+  _reg: *mut (),
+  entry: *mut (),
+  _meta: *const around_extensions::ExtensionMeta,
+) {
+  OWNED_PUSH_COUNT.fetch_add(1, Ordering::SeqCst);
+  if !entry.is_null() {
+    // SAFETY: ownedtestslot_create allocates every non-null entry as TestEntry.
+    unsafe {
+      drop(Box::from_raw(entry.cast::<TestEntry>()));
+    }
+  }
+}
+
+unsafe extern "C" fn owned_remove_by_meta(
+  _reg: *mut (),
+  _meta: *const around_extensions::ExtensionMeta,
+) -> usize {
+  OWNED_REMOVE_COUNT.fetch_add(1, Ordering::SeqCst);
+  0
+}
+
+static OWNED_VTABLE: around_extensions::RegisterVTable = around_extensions::RegisterVTable {
+  push_raw: owned_push_raw,
+  remove_by_meta: owned_remove_by_meta,
+};
+
+#[no_mangle]
+static AROUND_SLOTS: &[OwnedSlotDef] = &[OwnedSlotDef {
+  slot_name: "OwnedTestSlot",
+  reg_vtable: std::ptr::addr_of!(OWNED_VTABLE).cast(),
+  reg_instance: std::ptr::addr_of!(OWNED_REGISTER).cast_mut().cast(),
+}];
+
+#[no_mangle]
+pub unsafe extern "C" fn ownedtestslot_create(index: usize) -> *mut std::ffi::c_void {
+  if index == 0 {
+    Box::into_raw(Box::new(TestEntry { id: 84 })).cast()
+  } else {
+    std::ptr::null_mut()
+  }
+}
+
+#[no_mangle]
+pub extern "C" fn owned_slot_push_count() -> usize {
+  OWNED_PUSH_COUNT.load(Ordering::SeqCst)
+}
+
+#[no_mangle]
+pub extern "C" fn owned_slot_remove_count() -> usize {
+  OWNED_REMOVE_COUNT.load(Ordering::SeqCst)
+}
+
+#[no_mangle]
+pub extern "C" fn owned_slot_reset_counts() {
+  OWNED_PUSH_COUNT.store(0, Ordering::SeqCst);
+  OWNED_REMOVE_COUNT.store(0, Ordering::SeqCst);
 }
