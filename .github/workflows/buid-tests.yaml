@@ -27,7 +27,7 @@ jobs:
         env:
           ALSA_CONFIG_PATH: ${{ github.workspace }}/ci/alsa-null.conf
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   macos:
     runs-on: macos-latest
@@ -44,7 +44,7 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   windows:
     runs-on: windows-latest
@@ -61,4 +61,4 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings 2>&1 | head -80
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
