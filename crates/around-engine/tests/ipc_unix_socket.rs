@@ -136,9 +136,11 @@ fn resolve_socket_dir_falls_back_to_tmpdir() {
     return;
   }
   let (sp, _) = around_engine::ipc::transport_unix::resolve_socket_dir();
+  let temp_dir = std::env::temp_dir();
   assert!(
-    sp.to_string_lossy().contains("tmp") || sp.to_string_lossy().contains("TMP"),
-    "socket path should resolve to tmpdir: {}",
+    sp.starts_with(&temp_dir),
+    "socket path should resolve under temp dir {}: {}",
+    temp_dir.display(),
     sp.display()
   );
 }

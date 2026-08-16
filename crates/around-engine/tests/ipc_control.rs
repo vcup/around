@@ -2,7 +2,6 @@
 //!
 //! Tests IPC command serialization, engine lifecycle, and response formats.
 use around_engine::{Engine, EngineConfig};
-use cpal::traits::HostTrait;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::TcpStream;
@@ -15,12 +14,6 @@ use std::sync::Arc;
 static NEXT_TEST_ID: AtomicU64 = AtomicU64::new(0);
 fn unique_test_id() -> u64 {
   NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Check if an audio device is available for tests that require real playback.
-fn audio_device_available() -> bool {
-  let host = cpal::default_host();
-  host.default_output_device().is_some()
 }
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -89,16 +82,37 @@ fn poke_server(port_file: &str) {
   }
 }
 
-/// Ensures engine shutdown + server unblock on panic (avoids thread leak).
+/// Owns an IPC server until the test ends.
+///
+/// Tests run concurrently, so merely signaling shutdown is insufficient: the
+/// server thread must finish before its Engine and temporary files are dropped.
 struct ServerGuard {
   engine: Arc<Engine>,
   port_file: String,
+  server_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ServerGuard {
+  fn new(
+    engine: Arc<Engine>,
+    port_file: String,
+    server_thread: std::thread::JoinHandle<()>,
+  ) -> Self {
+    Self {
+      engine,
+      port_file,
+      server_thread: Some(server_thread),
+    }
+  }
 }
 
 impl Drop for ServerGuard {
   fn drop(&mut self) {
     self.engine.shutdown();
     poke_server(&self.port_file);
+    if let Some(server_thread) = self.server_thread.take() {
+      let _ = server_thread.join();
+    }
   }
 }
 
@@ -107,6 +121,24 @@ impl Deref for ServerGuard {
   fn deref(&self) -> &Engine {
     &self.engine
   }
+}
+
+fn spawn_server_thread(
+  engine: Arc<Engine>,
+  ipc_config: around_engine::ipc::IpcConfig,
+) -> std::thread::JoinHandle<()> {
+  std::thread::spawn(move || {
+    #[expect(
+      clippy::expect_used,
+      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
+    )]
+    let rt = tokio::runtime::Builder::new_current_thread()
+      .enable_io()
+      .enable_time()
+      .build()
+      .expect("tokio runtime");
+    let _ = rt.block_on(around_engine::run_ipc_server(ipc_config, engine));
+  })
 }
 
 #[test]
@@ -120,10 +152,6 @@ fn engine_play_nonexistent_file_errors() {
 
 #[test]
 fn engine_play_valid_wav_returns_handle() {
-  if !audio_device_available() {
-    eprintln!("skipping test: no audio output device available");
-    return;
-  }
   let config = EngineConfig::load();
   let engine = Engine::new(config);
   let source = around_source_file::FileSource::new(fixture_path("example.wav"));
@@ -158,13 +186,12 @@ fn ipc_server_creates_port_file_on_play() {
     }
   }
 
-  if !audio_device_available() {
-    eprintln!("skipping test: no audio output device available");
-    return;
-  }
-
   let port_file = std::env::temp_dir()
-    .join("around-test-ipc_server_creates_port_file_on_play.port")
+    .join(format!(
+      "around-test-{}-{}-ipc-server.port",
+      std::process::id(),
+      unique_test_id()
+    ))
     .to_string_lossy()
     .to_string();
 
@@ -182,33 +209,16 @@ fn ipc_server_creates_port_file_on_play() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let _server_guard = ServerGuard {
-    engine: engine.clone(),
-    port_file: port_file.clone(),
-  };
-
   // Start IPC server on a background thread.
-  let ipc_engine = engine.clone();
-  let pf = port_file.clone();
-  let _ipc_server = std::thread::spawn(move || {
-    #[expect(
-      clippy::expect_used,
-      reason = "tokio runtime builder with standard config must succeed"
-    )]
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_io()
-      .enable_time()
-      .build()
-      .expect("tokio runtime");
-    let ipc_config = around_engine::ipc::IpcConfig {
-      enable_platform_native: false,
-      check_running_instance: false,
-      force_json: true,
-      port_file_path: Some(std::path::PathBuf::from(pf)),
-      ..Default::default()
-    };
-    let _ = rt.block_on(around_engine::run_ipc_server(ipc_config, ipc_engine));
-  });
+  let ipc_config = around_engine::ipc::IpcConfig {
+    enable_platform_native: false,
+    check_running_instance: false,
+    force_json: true,
+    port_file_path: Some(std::path::PathBuf::from(&port_file)),
+    ..Default::default()
+  };
+  let server_thread = spawn_server_thread(engine.clone(), ipc_config);
+  let _server_guard = ServerGuard::new(engine.clone(), port_file.clone(), server_thread);
   // Give server time to bind.
   // Wait for server to bind (poll for port file).
   {
@@ -276,10 +286,6 @@ fn signal_cleanup_deletes_port_file() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let _server_guard = ServerGuard {
-    engine: engine.clone(),
-    port_file: port_file.clone(),
-  };
   let ipc_config = around_engine::ipc::IpcConfig {
     enable_platform_native: false,
     check_running_instance: false,
@@ -287,20 +293,8 @@ fn signal_cleanup_deletes_port_file() {
     port_file_path: Some(std::path::PathBuf::from(&port_file)),
     ..Default::default()
   };
-
-  let ipc_engine = engine.clone();
-  let server_thread = std::thread::spawn(move || {
-    #[expect(
-      clippy::expect_used,
-      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
-    )]
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_io()
-      .enable_time()
-      .build()
-      .expect("tokio runtime");
-    rt.block_on(around_engine::run_ipc_server(ipc_config, ipc_engine))
-  });
+  let server_thread = spawn_server_thread(engine.clone(), ipc_config);
+  let _server_guard = ServerGuard::new(engine.clone(), port_file.clone(), server_thread);
 
   // Wait for server to bind.
   {
@@ -329,8 +323,6 @@ fn signal_cleanup_deletes_port_file() {
     }
     std::thread::sleep(std::time::Duration::from_millis(50));
   }
-
-  let _ = server_thread.join();
 }
 
 // =============================================================================
@@ -358,11 +350,6 @@ fn port_file_created_on_bind() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let _server_guard = ServerGuard {
-    engine: engine.clone(),
-    port_file: port_file.clone(),
-  };
-
   let ipc_config = around_engine::ipc::IpcConfig {
     enable_platform_native: false,
     check_running_instance: false,
@@ -370,20 +357,8 @@ fn port_file_created_on_bind() {
     port_file_path: Some(std::path::PathBuf::from(&port_file)),
     ..Default::default()
   };
-
-  let ipc_engine = engine.clone();
-  let _server_thread = std::thread::spawn(move || {
-    #[expect(
-      clippy::expect_used,
-      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
-    )]
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_io()
-      .enable_time()
-      .build()
-      .expect("tokio runtime");
-    rt.block_on(around_engine::run_ipc_server(ipc_config, ipc_engine))
-  });
+  let server_thread = spawn_server_thread(engine.clone(), ipc_config);
+  let _server_guard = ServerGuard::new(engine.clone(), port_file.clone(), server_thread);
 
   let _guard = PortFileGuard(port_file.clone());
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -420,13 +395,12 @@ fn command_round_trip() {
     }
   }
 
-  if !audio_device_available() {
-    eprintln!("skipping test: no audio output device available");
-    return;
-  }
-
   let port_file = std::env::temp_dir()
-    .join("around-test-command_round_trip.port")
+    .join(format!(
+      "around-test-{}-{}-command-round-trip.port",
+      std::process::id(),
+      unique_test_id()
+    ))
     .to_string_lossy()
     .to_string();
   let _ = std::fs::remove_file(&port_file);
@@ -434,11 +408,6 @@ fn command_round_trip() {
 
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
-
-  let _server_guard = ServerGuard {
-    engine: engine.clone(),
-    port_file: port_file.clone(),
-  };
 
   let ipc_config = around_engine::ipc::IpcConfig {
     enable_platform_native: false,
@@ -448,19 +417,8 @@ fn command_round_trip() {
     ..Default::default()
   };
   // Start IPC server on a background thread.
-  let ipc_engine = engine.clone();
-  let _ipc_server = std::thread::spawn(move || {
-    #[expect(
-      clippy::expect_used,
-      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
-    )]
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_io()
-      .enable_time()
-      .build()
-      .expect("tokio runtime");
-    rt.block_on(around_engine::run_ipc_server(ipc_config, ipc_engine))
-  });
+  let server_thread = spawn_server_thread(engine.clone(), ipc_config);
+  let _server_guard = ServerGuard::new(engine.clone(), port_file.clone(), server_thread);
   // Wait for server to bind and write port file.
   {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -517,10 +475,6 @@ fn stale_port_file_handled() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let _server_guard = ServerGuard {
-    engine: engine.clone(),
-    port_file: port_file.clone(),
-  };
   let ipc_config = around_engine::ipc::IpcConfig {
     enable_platform_native: false,
     check_running_instance: false,
@@ -534,20 +488,8 @@ fn stale_port_file_handled() {
     tcp_bind: Some("127.0.0.1:0".parse().unwrap()),
     ..Default::default()
   };
-
-  let ipc_engine = engine.clone();
-  let _server_thread = std::thread::spawn(move || {
-    #[expect(
-      clippy::expect_used,
-      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
-    )]
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_io()
-      .enable_time()
-      .build()
-      .expect("tokio runtime");
-    rt.block_on(around_engine::run_ipc_server(ipc_config, ipc_engine))
-  });
+  let server_thread = spawn_server_thread(engine.clone(), ipc_config);
+  let _server_guard = ServerGuard::new(engine.clone(), port_file.clone(), server_thread);
 
   // Give it time to start.
   std::thread::sleep(std::time::Duration::from_millis(200));
@@ -576,10 +518,6 @@ fn running_instance_rejection() {
   let config = EngineConfig::load();
   let engine_a = Arc::new(Engine::new(config.clone()));
 
-  let _server_guard = ServerGuard {
-    engine: engine_a.clone(),
-    port_file: port_file.clone(),
-  };
   let ipc_config_a = around_engine::ipc::IpcConfig {
     enable_platform_native: false,
     check_running_instance: false,
@@ -587,21 +525,8 @@ fn running_instance_rejection() {
     port_file_path: Some(std::path::PathBuf::from(&port_file)),
     ..Default::default()
   };
-
-  let ipc_engine_a = engine_a.clone();
-  let pf_a = port_file.clone();
-  let _server_a = std::thread::spawn(move || {
-    #[expect(
-      clippy::expect_used,
-      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
-    )]
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_io()
-      .enable_time()
-      .build()
-      .expect("tokio runtime");
-    rt.block_on(around_engine::run_ipc_server(ipc_config_a, ipc_engine_a))
-  });
+  let server_thread = spawn_server_thread(engine_a.clone(), ipc_config_a);
+  let _server_guard = ServerGuard::new(engine_a.clone(), port_file.clone(), server_thread);
 
   // Wait for first instance to bind.
   {
@@ -625,7 +550,7 @@ fn running_instance_rejection() {
   );
 
   engine_a.shutdown();
-  poke_server(&pf_a);
+  poke_server(&port_file);
 }
 
 #[test]
@@ -647,10 +572,6 @@ fn port_file_cleanup_after_stop() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let _server_guard = ServerGuard {
-    engine: engine.clone(),
-    port_file: port_file.clone(),
-  };
   let ipc_config = around_engine::ipc::IpcConfig {
     enable_platform_native: false,
     check_running_instance: false,
@@ -658,21 +579,8 @@ fn port_file_cleanup_after_stop() {
     port_file_path: Some(std::path::PathBuf::from(&port_file)),
     ..Default::default()
   };
-
-  let ipc_engine = engine.clone();
-  let _pf = port_file.clone();
-  let _server = std::thread::spawn(move || {
-    #[expect(
-      clippy::expect_used,
-      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
-    )]
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_io()
-      .enable_time()
-      .build()
-      .expect("tokio runtime");
-    rt.block_on(around_engine::run_ipc_server(ipc_config, ipc_engine))
-  });
+  let server_thread = spawn_server_thread(engine.clone(), ipc_config);
+  let _server_guard = ServerGuard::new(engine.clone(), port_file.clone(), server_thread);
 
   // Wait for server to bind.
   {
@@ -720,11 +628,6 @@ fn port_file_cleanup_after_signal() {
   let config = EngineConfig::load();
   let engine = Arc::new(Engine::new(config));
 
-  let _server_guard = ServerGuard {
-    engine: engine.clone(),
-    port_file: port_file.clone(),
-  };
-
   let ipc_config = around_engine::ipc::IpcConfig {
     enable_platform_native: false,
     check_running_instance: false,
@@ -732,20 +635,8 @@ fn port_file_cleanup_after_signal() {
     port_file_path: Some(std::path::PathBuf::from(&port_file)),
     ..Default::default()
   };
-  let _epf = port_file.clone();
-  let srv_engine = engine.clone();
-  let _server = std::thread::spawn(move || {
-    #[expect(
-      clippy::expect_used,
-      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
-    )]
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_io()
-      .enable_time()
-      .build()
-      .expect("tokio runtime");
-    rt.block_on(around_engine::run_ipc_server(ipc_config, srv_engine))
-  });
+  let server_thread = spawn_server_thread(engine.clone(), ipc_config);
+  let _server_guard = ServerGuard::new(engine.clone(), port_file.clone(), server_thread);
 
   // Wait for server to bind.
   {
@@ -792,19 +683,7 @@ fn spawn_ipc_server(suffix: &str) -> (ServerGuard, String) {
     port_file_path: Some(std::path::PathBuf::from(&port_file)),
     ..Default::default()
   };
-  let ipc_engine = engine.clone();
-  std::thread::spawn(move || {
-    #[expect(
-      clippy::expect_used,
-      reason = "tokio runtime creation with basic config always succeeds; failure is catastrophic env issue"
-    )]
-    let rt = tokio::runtime::Builder::new_current_thread()
-      .enable_io()
-      .enable_time()
-      .build()
-      .expect("tokio runtime");
-    rt.block_on(around_engine::run_ipc_server(ipc_config, ipc_engine))
-  });
+  let server_thread = spawn_server_thread(engine.clone(), ipc_config);
 
   // Wait for server to bind (poll for port file existence).
   let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -815,10 +694,7 @@ fn spawn_ipc_server(suffix: &str) -> (ServerGuard, String) {
     std::thread::sleep(std::time::Duration::from_millis(50));
   }
 
-  let guard = ServerGuard {
-    engine: engine.clone(),
-    port_file: port_file.clone(),
-  };
+  let guard = ServerGuard::new(engine.clone(), port_file.clone(), server_thread);
   (guard, port_file)
 }
 
