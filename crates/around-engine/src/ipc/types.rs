@@ -32,6 +32,8 @@ pub struct StreamStatus {
   pub device_lost: bool,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub track: Option<TrackInfo>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub content_type: Option<String>,
 }
 
 /// Incoming IPC command, tagged by the `command` field in JSON.
@@ -145,6 +147,8 @@ pub struct IpcResponse {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub stream_id: Option<u64>,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub content_type: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub seekable: Option<bool>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub streams: Option<Vec<StreamStatus>>,
@@ -164,6 +168,7 @@ impl IpcResponse {
       device_lost: None,
       removed_files: None,
       stream_id: None,
+      content_type: None,
       seekable: None,
       streams: None,
     }
@@ -182,6 +187,7 @@ impl IpcResponse {
       device_lost: None,
       removed_files: None,
       stream_id: None,
+      content_type: None,
       seekable: None,
       streams: None,
     }

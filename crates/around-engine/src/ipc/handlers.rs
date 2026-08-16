@@ -28,7 +28,7 @@ pub(crate) fn handle_play(
 ) -> IpcResponse {
   // Fast-fail: check file existence synchronously per IPC contract.
   if std::fs::metadata(&path).is_err() {
-    return IpcResponse::error(ErrorCode::FileNotFound, &format!("No such file: {}", path));
+    return IpcResponse::error(ErrorCode::FileNotFound, &format!("No such file: {path}"));
   }
 
   // Prepare the source — opens codec, creates stream, returns metadata.
@@ -159,6 +159,7 @@ pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> Ipc
         let duration = engine.stream_duration_ms(sid);
         let s = engine.stream_seekable(sid);
         resp.seekable = s;
+        resp.content_type = engine.stream_content_type(sid);
         if let Some(p) = path {
           resp.track = Some(TrackInfo {
             id: sid,
@@ -193,6 +194,7 @@ pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> Ipc
               format: codec.unwrap_or_else(|| "unknown".into()),
               duration_ms: duration.unwrap_or(0),
             }),
+            content_type: engine.stream_content_type(id),
           });
         }
       }
@@ -206,6 +208,7 @@ pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> Ipc
           resp.stream_id = Some(sole);
           resp.device_lost = Some(ss.device_lost.load(std::sync::atomic::Ordering::SeqCst));
           resp.seekable = engine.stream_seekable(sole);
+          resp.content_type = engine.stream_content_type(sole);
           let path = engine.stream_source_path(sole);
           let codec = engine.stream_codec_name(sole);
           let duration = engine.stream_duration_ms(sole);
@@ -230,7 +233,7 @@ pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> Ipc
 pub(crate) fn scan_and_remove_stale_temp_files() -> Vec<String> {
   let mut removed = Vec::new();
   let current_pid = std::process::id();
-  let our_prefix = format!("around_codec_{}_", current_pid);
+  let our_prefix = format!("around_codec_{current_pid}_");
 
   let tmp_dir = std::env::var("TMPDIR")
     .map(std::path::PathBuf::from)
@@ -320,7 +323,7 @@ pub(crate) fn handle_load_codec_bytes(data: Vec<u8>) -> IpcResponse {
   if let Err(e) = std::fs::write(&tmp_path, &data) {
     return IpcResponse::error(
       ErrorCode::CodecLoadFailed,
-      &format!("failed to write temp file: {}", e),
+      &format!("failed to write temp file: {e}"),
     );
   }
 
@@ -358,4 +361,34 @@ fn map_framework_error(e: &around_extensions::FrameworkError) -> (ErrorCode, Str
 pub(crate) fn handle_shutdown(engine: &Arc<Engine>) -> IpcResponse {
   engine.shutdown();
   IpcResponse::ok()
+}
+
+#[cfg(test)]
+mod tests {
+  #![expect(
+    clippy::expect_used,
+    reason = "committed fixture and freshly prepared stream are test invariants"
+  )]
+  use super::*;
+  use crate::config::OutputDriver;
+
+  #[test]
+  fn status_preserves_source_content_type() {
+    let mut config = crate::EngineConfig::load();
+    config.output_driver = OutputDriver::Null;
+    let engine = Arc::new(Engine::new(config));
+    let fixture =
+      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/example.wav");
+    let prepared = engine
+      .prepare(Box::new(around_source_file::FileSource::new(fixture)))
+      .expect("fixture must prepare");
+
+    let single = handle_status(&engine, Some(prepared.stream_id));
+    assert_eq!(single.content_type.as_deref(), Some("audio/wav"));
+
+    let all = handle_status(&engine, None);
+    let streams = all.streams.expect("all-stream status must include streams");
+    assert_eq!(streams.len(), 1);
+    assert_eq!(streams[0].content_type.as_deref(), Some("audio/wav"));
+  }
 }

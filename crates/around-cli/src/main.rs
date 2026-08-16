@@ -7,7 +7,7 @@
 use around_engine::ipc::types::{IpcCommand, IpcResponse, ResponseStatus};
 use around_engine::{Engine, EngineConfig};
 use clap::{Parser, Subcommand};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -129,19 +129,19 @@ fn main() {
       stream_id,
     } => {
       if let Err(e) = cmd_play(path, ipc_listen_tcp, ipc_listen_udp, stream_id, remote) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
     Commands::Pause { stream_id } => {
       if let Err(e) = cmd_pause(stream_id, remote) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
     Commands::Resume { stream_id } => {
       if let Err(e) = cmd_resume(stream_id, remote) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
@@ -150,49 +150,49 @@ fn main() {
       stream_id,
     } => {
       if let Err(e) = cmd_seek(position, stream_id, remote) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
     Commands::Stop { stream_id } => {
       if let Err(e) = cmd_stop(stream_id, remote) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
     Commands::Status { stream_id } => {
       if let Err(e) = cmd_status(stream_id, remote) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
     Commands::LoadCodec { path } => {
       if let Err(e) = cmd_load_codec(path, remote) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
     Commands::ListCodecs => {
       if let Err(e) = cmd_list_codecs(remote) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
     Commands::Cleanup => {
       if let Err(e) = cmd_cleanup(remote) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
     Commands::Serve { daemon } => {
       if let Err(e) = cmd_serve(daemon) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
     Commands::Shutdown => {
       if let Err(e) = cmd_shutdown(remote) {
-        eprintln!("error: {}", e);
+        eprintln!("error: {e}");
         std::process::exit(1);
       }
     }
@@ -304,7 +304,7 @@ fn cmd_play(
       let _ = std::fs::read_to_string(&port_file)
         .ok()
         .and_then(|p| p.trim().parse::<u16>().ok())
-        .and_then(|p| TcpStream::connect(format!("127.0.0.1:{}", p)).ok());
+        .and_then(|p| TcpStream::connect(format!("127.0.0.1:{p}")).ok());
       let _ = ipc_handle.join();
       let _ = std::fs::remove_file(&port_file);
       return Err(Box::new(e));
@@ -324,7 +324,7 @@ fn cmd_play(
         let _ = std::fs::read_to_string(&port_file)
           .ok()
           .and_then(|p| p.trim().parse::<u16>().ok())
-          .and_then(|p| TcpStream::connect(format!("127.0.0.1:{}", p)).ok());
+          .and_then(|p| TcpStream::connect(format!("127.0.0.1:{p}")).ok());
         let _ = ipc_handle.join();
         let _ = std::fs::remove_file(&port_file);
         return Err(Box::new(e));
@@ -340,7 +340,7 @@ fn cmd_play(
       let _ = std::fs::read_to_string(&port_file)
         .ok()
         .and_then(|p| p.trim().parse::<u16>().ok())
-        .and_then(|p| TcpStream::connect(format!("127.0.0.1:{}", p)).ok());
+        .and_then(|p| TcpStream::connect(format!("127.0.0.1:{p}")).ok());
       let _ = ipc_handle.join();
       let _ = std::fs::remove_file(&port_file);
       return Err("playback thread panicked".into());
@@ -352,7 +352,7 @@ fn cmd_play(
   let _ = std::fs::read_to_string(&port_file)
     .ok()
     .and_then(|p| p.trim().parse::<u16>().ok())
-    .and_then(|p| TcpStream::connect(format!("127.0.0.1:{}", p)).ok());
+    .and_then(|p| TcpStream::connect(format!("127.0.0.1:{p}")).ok());
   let _ = ipc_handle.join();
 
   let _ = std::fs::remove_file(&port_file);
@@ -397,7 +397,7 @@ fn send_ipc_command(
   let port_path = std::env::temp_dir().join("around.port");
   let port_str = std::fs::read_to_string(&port_path)?;
   let port: u16 = port_str.trim().parse()?;
-  let stream = TcpStream::connect(format!("127.0.0.1:{}", port))?;
+  let stream = TcpStream::connect(format!("127.0.0.1:{port}"))?;
   send_over_tcp_stream(req, stream)
 }
 
@@ -409,20 +409,14 @@ fn send_over_tcp_stream(
   let mut reader = BufReader::new(&stream);
   let mut writer = BufWriter::new(&stream);
 
-  // Write JSON command as length-delimited frame.
   let json = serde_json::to_vec(req)?;
-  writer.write_all(&(json.len() as u64).to_le_bytes())?;
   writer.write_all(&json)?;
+  writer.write_all(b"\n")?;
   writer.flush()?;
 
-  // Read JSON response with length prefix.
-  let mut len_buf = [0u8; 8];
-  reader.read_exact(&mut len_buf)?;
-  let resp_len = u64::from_le_bytes(len_buf) as usize;
-  let mut resp_buf = vec![0u8; resp_len];
-  reader.read_exact(&mut resp_buf)?;
-  let resp: IpcResponse = serde_json::from_slice(&resp_buf)?;
-  Ok(resp)
+  let mut response = String::new();
+  reader.read_line(&mut response)?;
+  Ok(serde_json::from_str(response.trim_end())?)
 }
 
 /// Try to send a command via the Unix domain socket (Linux/macOS).
@@ -436,17 +430,13 @@ fn try_unix_socket_command(req: &IpcCommand) -> Result<IpcResponse, Box<dyn std:
   let mut writer = BufWriter::new(&stream);
 
   let json = serde_json::to_vec(req)?;
-  writer.write_all(&(json.len() as u64).to_le_bytes())?;
   writer.write_all(&json)?;
+  writer.write_all(b"\n")?;
   writer.flush()?;
 
-  let mut len_buf = [0u8; 8];
-  reader.read_exact(&mut len_buf)?;
-  let resp_len = u64::from_le_bytes(len_buf) as usize;
-  let mut resp_buf = vec![0u8; resp_len];
-  reader.read_exact(&mut resp_buf)?;
-  let resp: IpcResponse = serde_json::from_slice(&resp_buf)?;
-  Ok(resp)
+  let mut response = String::new();
+  reader.read_line(&mut response)?;
+  Ok(serde_json::from_str(response.trim_end())?)
 }
 
 /// Resolve the Unix socket path (mirrors engine's resolve_socket_dir).
@@ -467,7 +457,7 @@ fn resolve_unix_socket_path() -> std::path::PathBuf {
 #[cfg(windows)]
 fn try_named_pipe_command(req: &IpcCommand) -> Result<IpcResponse, Box<dyn std::error::Error>> {
   // Windows named pipe implementation for IPC.
-  use std::io::ErrorKind;
+  use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
   use windows::Win32::Foundation::HANDLE;
   use windows::Win32::Storage::FileSystem::CreateFileA;
   use windows::Win32::Storage::FileSystem::FILE_FLAG_OVERLAPPED;
@@ -504,17 +494,13 @@ fn try_named_pipe_command(req: &IpcCommand) -> Result<IpcResponse, Box<dyn std::
     let mut reader = BufReader::new(reader);
 
     let json = serde_json::to_vec(req)?;
-    writer.write_all(&(json.len() as u64).to_le_bytes()).await?;
     writer.write_all(&json).await?;
+    writer.write_all(b"\n").await?;
     writer.flush().await?;
 
-    let mut len_buf = [0u8; 8];
-    reader.read_exact(&mut len_buf).await?;
-    let resp_len = u64::from_le_bytes(len_buf) as usize;
-    let mut resp_buf = vec![0u8; resp_len];
-    reader.read_exact(&mut resp_buf).await?;
-    let resp: IpcResponse = serde_json::from_slice(&resp_buf)?;
-    Ok(resp)
+    let mut response = String::new();
+    reader.read_line(&mut response).await?;
+    Ok(serde_json::from_str(response.trim_end())?)
   })
 }
 
@@ -553,17 +539,24 @@ fn cmd_seek(
   stream_id: Option<u64>,
   remote: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+  if !position.is_finite() {
+    return Err("position must be finite".into());
+  }
   if position < 0.0 {
     return Err("position must be non-negative".into());
   }
-  let position_ms = (position * 1000.0) as u64;
+  let ms_f64 = position * 1000.0;
+  if ms_f64 >= u64::MAX as f64 {
+    return Err("position too large".into());
+  }
+  let position_ms = ms_f64 as u64;
   let req = IpcCommand::Seek {
     position_ms,
     stream_id,
   };
   let resp = send_ipc_command(&req, remote)?;
   match resp.status {
-    ResponseStatus::Ok => println!("Seeked to {}s.", position),
+    ResponseStatus::Ok => println!("Seeked to {position}s."),
     ResponseStatus::Error => eprintln!("Error: {}", resp.message.as_deref().unwrap_or("unknown")),
   }
   Ok(())
@@ -590,7 +583,7 @@ fn cmd_status(
   let resp = send_ipc_command(&req, remote)?;
   if resp.status == ResponseStatus::Ok {
     // Multi-stream output
-    if let Some(ref streams) = resp.streams {
+    if let Some(streams) = resp.streams.as_ref().filter(|streams| !streams.is_empty()) {
       for s in streams {
         println!(
           "Stream {}: {:?} at {}ms (seekable: {}, device_lost: {})",
@@ -601,6 +594,9 @@ fn cmd_status(
             "  Track: {} ({} format, {}ms)",
             track.path, track.format, track.duration_ms
           );
+        }
+        if let Some(content_type) = &s.content_type {
+          println!("  Content-Type: {content_type}");
         }
       }
     } else if let Some(track) = &resp.track {
@@ -613,8 +609,11 @@ fn cmd_status(
       );
       println!("Track: {}", track.path);
       println!("Format: {} ({} ms)", track.format, track.duration_ms);
+      if let Some(content_type) = &resp.content_type {
+        println!("Content-Type: {content_type}");
+      }
       if let Some(pos) = resp.position_ms {
-        println!("Position: {}ms", pos);
+        println!("Position: {pos}ms");
       }
     } else {
       println!("State: idle");
@@ -739,7 +738,7 @@ fn cmd_cleanup(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     ResponseStatus::Ok => {
       if let Some(files) = &resp.removed_files {
         for f in files {
-          println!("removed: {}", f);
+          println!("removed: {f}");
         }
       } else {
         println!("Cleanup complete.");

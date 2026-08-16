@@ -258,6 +258,7 @@ fn stream_status_serialization() {
     position_ms: 5000,
     seekable: true,
     device_lost: false,
+    content_type: Some("audio/wav".into()),
     track: Some(TrackInfo {
       id: 1,
       path: "/tmp/test.wav".into(),
@@ -274,6 +275,7 @@ fn stream_status_serialization() {
   assert_eq!(json["status"], "playing");
   assert_eq!(json["position_ms"], 5000);
   assert_eq!(json["seekable"], true);
+  assert_eq!(json["content_type"], "audio/wav");
 }
 
 #[expect(
@@ -304,6 +306,7 @@ fn response_with_streams_field() {
     position_ms: 5000,
     seekable: true,
     device_lost: false,
+    content_type: Some("audio/flac".into()),
     track: None,
   }]);
 
@@ -322,4 +325,5 @@ fn response_with_streams_field() {
   assert_eq!(streams.len(), 1);
   assert_eq!(json["streams"][0]["stream_id"], 1);
   assert_eq!(json["streams"][0]["status"], "playing");
+  assert_eq!(json["streams"][0]["content_type"], "audio/flac");
 }

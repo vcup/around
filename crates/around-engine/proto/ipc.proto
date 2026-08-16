@@ -58,6 +58,7 @@ message StreamStatus {
   bool seekable = 4;
   bool device_lost = 5;
   optional TrackInfo track = 6;
+  optional string content_type = 7;
 }
 
 message IpcResponse {
@@ -74,6 +75,7 @@ message IpcResponse {
   optional uint64 stream_id = 11;
   optional bool seekable = 12;
   repeated StreamStatus streams = 13;
+  optional string content_type = 14;
 }
 
 message TrackInfo {

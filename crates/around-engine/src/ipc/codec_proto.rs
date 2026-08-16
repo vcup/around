@@ -60,7 +60,7 @@ fn proto_playback_status_from_i32(v: i32) -> std::io::Result<types::PlaybackStat
     4 => Ok(types::PlaybackStatus::Error),
     _ => Err(std::io::Error::new(
       std::io::ErrorKind::InvalidData,
-      format!("unknown PlaybackStatus: {}", v),
+      format!("unknown PlaybackStatus: {v}"),
     )),
   }
 }
@@ -118,6 +118,7 @@ fn ipc_response_to_proto(resp: &IpcResponse) -> proto::IpcResponse {
     removed_files: resp.removed_files.clone().unwrap_or_default(),
     stream_id: resp.stream_id,
     seekable: resp.seekable,
+    content_type: resp.content_type.clone(),
     streams: resp
       .streams
       .as_ref()
@@ -135,6 +136,7 @@ fn ipc_response_to_proto(resp: &IpcResponse) -> proto::IpcResponse {
               format: t.format.clone(),
               duration_ms: t.duration_ms,
             }),
+            content_type: s.content_type.clone(),
           })
           .collect()
       })
@@ -164,7 +166,7 @@ fn decode_varint(buf: &[u8]) -> Option<(u64, usize)> {
   let mut value: u64 = 0;
   let mut shift = 0;
   for (i, &byte) in buf.iter().enumerate() {
-    value |= ((byte & 0x7f) as u64) << shift;
+    value |= u64::from(byte & 0x7f) << shift;
     if byte & 0x80 == 0 {
       return Some((value, i + 1));
     }
@@ -221,7 +223,12 @@ impl IpcCodec for ProtoCodec {
       ));
     }
 
-    let mut msg_buf = vec![0u8; msg_len as usize];
+    let mut msg_buf = vec![
+      0u8;
+      usize::try_from(msg_len).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "message too large")
+      })?
+    ];
     reader.read_exact(&mut msg_buf).await?;
 
     let proto_cmd = <proto::IpcCommand as Message>::decode(msg_buf.as_slice())
@@ -252,5 +259,34 @@ impl IpcCodec for ProtoCodec {
     framed.extend_from_slice(&msg_buf);
 
     writer.write_all(&framed).await
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn response_mapping_preserves_content_type() {
+    let mut response = IpcResponse::ok();
+    response.content_type = Some("audio/wav".into());
+    response.streams = Some(vec![types::StreamStatus {
+      stream_id: 7,
+      status: types::PlaybackStatus::Playing,
+      position_ms: 12,
+      seekable: true,
+      device_lost: false,
+      track: None,
+      content_type: Some("audio/flac".into()),
+    }]);
+
+    let mapped = ipc_response_to_proto(&response);
+
+    assert_eq!(mapped.content_type.as_deref(), Some("audio/wav"));
+    assert_eq!(mapped.streams.len(), 1);
+    assert_eq!(
+      mapped.streams[0].content_type.as_deref(),
+      Some("audio/flac")
+    );
   }
 }

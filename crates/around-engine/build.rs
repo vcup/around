@@ -14,7 +14,7 @@ fn main() -> std::io::Result<()> {
     // from ipc.proto. These types are not constructed until the protobuf IPC
     // codec is fully wired (ADR-0003). Once ProtoCodec is complete and all
     // generated types are used, this attribute can be removed.
-    config.type_attribute(".", "#[expect(dead_code, reason = \"protobuf-generated types from prost-build; fields are read by generated serialize/deserialize code, not directly in hand-written Rust\")]");
+    config.type_attribute(".", "#[allow(dead_code, reason = \"protobuf-generated types from prost-build; fields are read by generated serialize/deserialize code, not directly in hand-written Rust\")]");
     config.compile_protos(&["proto/ipc.proto"], &["proto/"])?;
   }
   Ok(())

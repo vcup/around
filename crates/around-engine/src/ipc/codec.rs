@@ -41,10 +41,10 @@ pub(crate) enum IpcWire {
 }
 
 impl IpcWire {
-  pub(crate) fn select(force_json: bool) -> Self {
+  pub(crate) fn select(_force_json: bool) -> Self {
     #[cfg(all(feature = "protobuf-ipc", feature = "json-ipc"))]
     {
-      if force_json {
+      if _force_json {
         return IpcWire::Json(JsonLineCodec);
       }
       IpcWire::Proto(super::codec_proto::ProtoCodec)
@@ -61,6 +61,24 @@ impl IpcWire {
     #[cfg(not(any(feature = "protobuf-ipc", feature = "json-ipc")))]
     {
       compile_error!("at least one IPC codec feature must be enabled");
+    }
+  }
+  /// Detect a JSON connection from its first non-whitespace byte.
+  ///
+  /// Protobuf's first byte is a varint frame length and has no reserved magic,
+  /// so every non-JSON prefix deliberately falls back to the listener's
+  /// configured codec.
+  pub(crate) fn detect_from_byte(byte: u8) -> Option<Self> {
+    if byte != b'{' {
+      return None;
+    }
+    #[cfg(feature = "json-ipc")]
+    {
+      Some(IpcWire::Json(JsonLineCodec))
+    }
+    #[cfg(not(feature = "json-ipc"))]
+    {
+      None
     }
   }
 }
