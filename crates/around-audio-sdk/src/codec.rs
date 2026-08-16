@@ -40,10 +40,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 // Reader callback types
 // ---------------------------------------------------------------------------
 
-/// Read callback for codec `open()`.  Returns bytes read or negative on error.
+/// Read callback retained by a codec stream. Returns bytes read or negative on error.
 pub type ReadFn = unsafe extern "C" fn(ctx: *mut c_void, buf: *mut u8, len: usize) -> i64;
 
-/// Seek callback for codec `open()`.  Returns new position or negative on error.
+/// Seek callback retained by a codec stream. Returns the new byte position or a negative error.
 pub type SeekFn = unsafe extern "C" fn(ctx: *mut c_void, pos: i64, whence: i32) -> i64;
 
 // ---------------------------------------------------------------------------
@@ -115,9 +115,10 @@ pub trait Codec {
 
   /// Open a stream for decoding.
   ///
-  /// `reader_ctx` + `reader_read` + `reader_seek` provide transient I/O
-  /// callbacks valid only during this call.  All required metadata (header
-  /// parsing, data offset discovery) must be consumed before returning.
+  /// `reader_ctx` + `reader_read` + `reader_seek` provide the stream's I/O.
+  /// The codec MAY retain all three until [`Codec::drop`] is called. The host
+  /// MUST therefore keep the context and callback code valid for that entire
+  /// lifetime and MUST drop the codec stream before releasing the context.
   ///
   /// On success:
   /// - `out_stream` receives the opaque per-stream state pointer allocated by

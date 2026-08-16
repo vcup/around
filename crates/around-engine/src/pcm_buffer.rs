@@ -19,7 +19,9 @@ impl PcmBuffer {
   /// `decoder_max_samples` bounds the decode output per iteration.
   /// `resample_max_samples` bounds the resample/filter output.
   pub fn new(decoder_max_samples: usize, resample_max_samples: usize) -> Self {
-    let total = decoder_max_samples + resample_max_samples;
+    let Some(total) = decoder_max_samples.checked_add(resample_max_samples) else {
+      panic!("PcmBuffer region sizes overflow usize");
+    };
     Self {
       buf: vec![0.0f32; total],
       decoder_max: decoder_max_samples,
@@ -40,6 +42,12 @@ impl PcmBuffer {
   /// The full buffer as a mutable slice.
   pub fn as_mut_slice(&mut self) -> &mut [f32] {
     &mut self.buf
+  }
+}
+
+impl Default for PcmBuffer {
+  fn default() -> Self {
+    Self::new(0, 0)
   }
 }
 
