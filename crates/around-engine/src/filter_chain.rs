@@ -12,6 +12,7 @@
 //! - [`Resample`] — sample rate conversion filter.
 //! - [`Volume`] — gain multiplier filter.
 
+use around_audio_sdk::filter::{AudioBufferC, DynFilterRef, FilterDyn, FilterDynMut};
 use around_core::SampleSpec;
 
 // ---------------------------------------------------------------------------
@@ -63,10 +64,10 @@ pub fn score_format_pair(input: &SampleSpec, output: &SampleSpec) -> u32 {
   // Channel conversion.
   if input.channels > output.channels {
     // Downmixing: 80 per channel removed.
-    score += (input.channels - output.channels) as u32 * PENALTY_DOWNMIX_PER_CH;
+    score += u32::from(input.channels - output.channels) * PENALTY_DOWNMIX_PER_CH;
   } else if output.channels > input.channels {
     // Upmixing: 5 per channel added.
-    score += (output.channels - input.channels) as u32 * PENALTY_UPMIX_PER_CH;
+    score += u32::from(output.channels - input.channels) * PENALTY_UPMIX_PER_CH;
   }
 
   // Interleave conversion.
@@ -115,6 +116,65 @@ pub struct FilterInfo {
   /// Produced output formats (empty = same as input).
   pub formats_out: Vec<SampleSpec>,
 }
+
+// ---------------------------------------------------------------------------
+// StabbyFilterBridge — adapter between stabby Filter and internal Filter
+// ---------------------------------------------------------------------------
+
+/// Wraps a stabby `DynFilterRef` (from `around_audio_sdk::filter::Filter`)
+/// and implements the internal [`Filter`] trait.
+///
+/// Converts between `(&mut [f32], u8)` (internal trait) and [`AudioBufferC`]
+/// (stabby ABI) on every `process()` call.
+pub struct StabbyFilterBridge {
+  inner: DynFilterRef,
+}
+
+impl StabbyFilterBridge {
+  /// Create a new bridge from an owned stabby `DynFilterRef`.
+  pub fn new(inner: DynFilterRef) -> Self {
+    Self { inner }
+  }
+}
+
+impl Filter for StabbyFilterBridge {
+  fn process(&mut self, buf: &mut [f32], channels: u8) -> usize {
+    let mut buf_c = AudioBufferC {
+      data: buf.as_mut_ptr(),
+      len: buf.len(),
+      channels,
+    };
+    let produced = self.inner.process(&mut buf_c) as usize;
+    produced.min(buf.len())
+  }
+
+  fn info(&self) -> FilterInfo {
+    let name_ptr = self.inner.name();
+    let name = if name_ptr.is_null() {
+      "unknown".into()
+    } else {
+      // SAFETY: name() returns a valid null-terminated C string pointer.
+      unsafe {
+        std::ffi::CStr::from_ptr(name_ptr as *const i8)
+          .to_string_lossy()
+          .into_owned()
+      }
+    };
+    FilterInfo {
+      name,
+      formats_in: vec![],
+      formats_out: vec![],
+    }
+  }
+}
+
+// SAFETY: DynFilterRef wraps a stabby Box<dyn Filter + Send + Sync> which is
+// Send + Sync. The vtable dispatch is read-only and thread-safe.
+// SAFETY: See the Send+Sync reasoning for SafeCodecRef in around-audio-sdk's
+// codec.rs — the same applies to DynFilterRef.
+unsafe impl Send for StabbyFilterBridge {}
+// SAFETY: See Send impl reasoning.
+unsafe impl Sync for StabbyFilterBridge {}
 
 // ---------------------------------------------------------------------------
 // FilterChain
@@ -214,7 +274,7 @@ impl Resample {
     Self {
       sample_rate_in,
       sample_rate_out,
-      ratio: sample_rate_in as f64 / sample_rate_out as f64,
+      ratio: f64::from(sample_rate_in) / f64::from(sample_rate_out),
       channels,
       accum: 0.0,
     }
@@ -242,7 +302,7 @@ impl Filter for Resample {
         for c in 0..ch {
           let a = buf[src_frame * ch + c];
           let b = buf[(src_frame + 1) * ch + c];
-          out[out_pos + c] = a as f64 as f32 + ((b - a) as f64 * frac) as f32;
+          out[out_pos + c] = f64::from(a) as f32 + (f64::from(b - a) * frac) as f32;
         }
       } else if src_frame < input_frames {
         for c in 0..ch {
@@ -317,7 +377,34 @@ impl Filter for Volume {
 
 #[cfg(test)]
 mod tests {
+  #![expect(
+    clippy::unwrap_used,
+    reason = "Test code: unwrap is acceptable on construction of test fixtures"
+  )]
   use super::*;
+
+  struct AbiGain;
+
+  impl around_audio_sdk::filter::Filter for AbiGain {
+    extern "C" fn name(&self) -> *const u8 {
+      c"abi-gain".as_ptr().cast()
+    }
+
+    extern "C" fn process(&mut self, buf: &mut AudioBufferC) -> u32 {
+      if buf.data.is_null() {
+        return 0;
+      }
+      // SAFETY: AudioBufferC is constructed by StabbyFilterBridge from a live
+      // mutable slice for exactly buf.len samples.
+      let samples = unsafe { std::slice::from_raw_parts_mut(buf.data, buf.len) };
+      for sample in samples {
+        *sample *= 0.5;
+      }
+      u32::try_from(buf.len).unwrap_or(u32::MAX)
+    }
+
+    extern "C" fn reset(&mut self) {}
+  }
 
   #[test]
   fn empty_chain_passthrough() {
@@ -344,9 +431,8 @@ mod tests {
     let produced = r.process(&mut buf, 1);
     // Downsampling by 2x should produce ~240 samples.
     assert!(
-      produced >= 200 && produced <= 280,
-      "expected ~240 samples, got {}",
-      produced
+      (200..=280).contains(&produced),
+      "expected ~240 samples, got {produced}"
     );
   }
 
@@ -361,8 +447,7 @@ mod tests {
     let produced = r.process(&mut buf, 1);
     assert!(
       produced > 240 && produced <= 500,
-      "expected >240 and <=500 samples, got {}",
-      produced
+      "expected >240 and <=500 samples, got {produced}"
     );
   }
 
@@ -375,6 +460,23 @@ mod tests {
     let mut buf = vec![1.0f32; 20];
     chain.process(&mut buf, 2);
     assert!((buf[0] - 0.5).abs() < 0.001);
+  }
+
+  #[test]
+  fn stabby_filter_bridge_processes_sdk_filter() {
+    let spec = SampleSpec::interleaved(44100, 2, 16).unwrap();
+    let abi_filter = around_audio_sdk::filter::make_dyn_filter(AbiGain);
+    let bridge = StabbyFilterBridge::new(abi_filter);
+    assert_eq!(bridge.info().name, "abi-gain");
+
+    let filters: Vec<Box<dyn Filter>> = vec![Box::new(bridge)];
+    let mut chain = FilterChain::build(spec, filters, spec);
+    let mut samples = [1.0, -1.0, 0.5, -0.5];
+
+    let produced = chain.process(&mut samples, 2);
+
+    assert_eq!(produced, samples.len());
+    assert_eq!(samples, [0.5, -0.5, 0.25, -0.25]);
   }
 
   // ── Format scoring tests ──────────────────────────────────────────────
@@ -391,7 +493,7 @@ mod tests {
     let output = SampleSpec::interleaved(44100, 2, 16).unwrap();
     let score = score_format_pair(&input, &output);
     // 48→44.1: diff = 3.9 kHz, penalty = ceil(3.9 * 100) = 390
-    assert!(score >= 300 && score <= 500, "score = {}", score);
+    assert!((300..=500).contains(&score), "score = {score}");
   }
 
   #[test]
@@ -400,7 +502,7 @@ mod tests {
     let output = SampleSpec::interleaved(48000, 2, 16).unwrap();
     let score = score_format_pair(&input, &output);
     // 44.1→48: diff = 3.9 kHz, penalty = ceil(3.9 * 10) = 39
-    assert!(score >= 30 && score <= 50, "score = {}", score);
+    assert!((30..=50).contains(&score), "score = {score}");
   }
 
   #[test]
@@ -409,7 +511,7 @@ mod tests {
     let b = SampleSpec::interleaved(44100, 2, 16).unwrap();
     let down_score = score_format_pair(&a, &b); // 48→44.1: downsampling
     let up_score = score_format_pair(&b, &a); // 44.1→48: upsampling
-    assert!(down_score > up_score, "down={} up={}", down_score, up_score);
+    assert!(down_score > up_score, "down={down_score} up={up_score}");
   }
 
   #[test]
