@@ -82,12 +82,11 @@ pub struct StreamInfo {
 // Rust's `unsafe` keyword cannot be applied to extern "C" trait method
 // declarations without breaking stabby's vtable generation.
 //
-// The `prefix` argument sets NAME to "around_audio_sdk::Codec" — the honest
-// home for the Codec trait after extraction from around-core.  Existing .so
-// codec files must be recompiled with the new create symbol
-// (around_audio_sdk_codec_codec_create).
+// NAME is auto-generated as `env!("CARGO_CRATE_NAME") + "::" + trait_name`,
+// producing "around_audio_sdk::Codec" in this crate.  The corresponding
+// CREATE_SYM constant defines the export symbol that plugin .so files must
 #[stabby::stabby]
-#[around_extensions_macros::slot(prefix = "around_audio_sdk::Codec")]
+#[around_extensions_macros::slot]
 pub trait Codec {
   /// Probe a file header and filename, returning confidence 0–100.
   ///

@@ -70,14 +70,16 @@ All extension points MUST enforce **zero-overhead abstraction**:
 
 - Extension trait boundaries MUST be resolvable at compile time via static
   dispatch (no `dyn Trait` in hot paths). Use `enum_dispatch`, generics with
-  monomorphization, **fn-pointer vtables** (`AudioStream` pattern), or
-  equivalent compile-time polymorphism.
-- **Codec registration**: Codec crates export a `pub static INFO: CodecInfo`.
-  The engine calls `registry.push(info)` explicitly — no linker magic
-  (`linkme`), no build-script scanning, no `#[ctor]` constructors.
-  A `#[register_codec]` proc macro MAY be used to generate fn-pointer
-  wrappers and the `CodecInfo` static, but the macro performs code generation
-  only; the engine still controls registration explicitly.
+  monomorphization, **fn-pointer vtables** (`AudioStream` pattern), or equivalent compile-time polymorphism.
+- **Codec registration (ADR-0004)**: Codec traits use `#[stabby::stabby]` for
+  ABI-stable dispatch with a single indirect jump per call. Each codec crate
+  exports a `{slot_name}_create` factory function returning a heap-allocated
+  `DynCodecRef`. Registration is explicit: the engine calls the crate's
+  `create` function and stores the resulting fat pointer — no linker magic,
+  no build-script scanning, no `#[ctor]` constructors. The `#[register_codec]`
+  proc macro MAY be used to generate the factory wrapper, but the macro
+  performs code generation only; the engine still controls registration
+  explicitly.
 - Runtime dynamic loading (`libloading`, `dlopen`) is permitted only for
   third-party extensions distributed as binaries. Even then, a compile-time
   shim MUST exist to eliminate virtual dispatch overhead.

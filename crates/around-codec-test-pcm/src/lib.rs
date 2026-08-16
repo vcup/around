@@ -230,7 +230,7 @@ impl around_audio_sdk::codec::Codec for PcmCodec {
 /// returns a null pointer. The returned pointer is a heap-allocated fat
 /// pointer owned by the framework; callers must not free it.
 #[no_mangle]
-pub unsafe extern "C" fn around_audio_sdk_codec_codec_create(index: usize) -> *mut c_void {
+pub unsafe extern "C" fn around_audio_sdk_codec_create(index: usize) -> *mut c_void {
   if index == 0 {
     let codec: around_audio_sdk::codec::DynCodecRef =
       around_audio_sdk::codec::DynCodecRef::from(stabby::boxed::Box::new(PcmCodec));

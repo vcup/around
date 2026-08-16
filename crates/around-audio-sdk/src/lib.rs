@@ -27,15 +27,19 @@ pub use codec::{
 /// test-pcm) need only one SDK dependency for all framework types.
 pub use around_extensions::ExtensionMeta;
 
-/// Compile-time assertion: slot NAME matches the expected prefix.
-/// If this fails, existing compiled .so files will not load because the
-/// create symbol changed.
+/// Compile-time assertion: slot NAME and CREATE_SYM match expected values.
+/// If this fails, the create symbol changed and existing compiled .so files
+/// will not load because their export symbol no longer matches.
 #[test]
 fn slot_name_stability() {
   assert_eq!(
     codec::NAME,
     "around_audio_sdk::Codec",
-    "Changing slot NAME breaks create symbol compatibility with \
-         existing .so codec files. Update #[slot(prefix = ...)] accordingly."
+    "Slot NAME changed — verify CREATE_SYM compatibility with .so plugins."
+  );
+  assert_eq!(
+    codec::CREATE_SYM,
+    "around_audio_sdk_codec_create",
+    "CREATE_SYM changed — plugin .so files must export exactly this symbol."
   );
 }

@@ -23,7 +23,7 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
   parse::{Parse, ParseStream},
-  parse_macro_input, ItemTrait,
+  parse_macro_input, ItemTrait, LitByteStr,
 };
 
 // ---------------------------------------------------------------------------
@@ -41,18 +41,17 @@ enum SlotMode {
 
 struct SlotArgs {
   mode: SlotMode,
-  /// Custom prefix override for the create symbol.
-  /// When None, the default `{module_path_snake}_{trait_snake}` is used.
-  prefix: Option<String>,
+  /// Custom name override. Default: `{crate_name}::{TraitName}`
+  name: Option<String>,
 }
 
 impl Parse for SlotArgs {
   fn parse(input: ParseStream) -> syn::Result<Self> {
     let mut mode = SlotMode::Vec;
-    let mut prefix = None;
+    let mut name = None;
 
     if input.is_empty() {
-      return Ok(SlotArgs { mode, prefix });
+      return Ok(SlotArgs { mode, name });
     }
 
     // Support comma-separated key=value pairs.
@@ -65,27 +64,36 @@ impl Parse for SlotArgs {
         let lit: syn::LitStr = input.parse()?;
         if lit.value() == "map" {
           mode = SlotMode::Map;
+        } else if lit.value() == "vec" {
+          mode = SlotMode::Vec;
         } else {
           return Err(syn::Error::new(
             lit.span(),
-            "expected `\"map\"` for storage parameter",
+            "expected `\"map\"` or `\"vec\"` for storage parameter",
           ));
         }
-      } else if ident == "prefix" {
+      } else if ident == "name" {
         let _eq: syn::Token![=] = input.parse()?;
         let lit: syn::LitStr = input.parse()?;
-        prefix = Some(lit.value());
+        name = Some(lit.value());
+      } else if ident == "prefix" {
+        let _eq: syn::Token![=] = input.parse()?;
+        let _lit: syn::LitStr = input.parse()?;
+        return Err(syn::Error::new(
+          ident.span(),
+          "prefix is removed; use name instead. Example: #[slot(name = \"crate::Trait\")]",
+        ));
       } else {
         return Err(syn::Error::new(
           ident.span(),
-          "expected `storage = \"map\"`, `prefix = \"...\"`, or `manual`",
+          "expected `storage = \"map\"`, `name = \"...\"`, or `manual`",
         ));
       }
       // Consume optional comma.
       let _ = input.parse::<syn::Token![,]>();
     }
 
-    Ok(SlotArgs { mode, prefix })
+    Ok(SlotArgs { mode, name })
   }
 }
 
@@ -108,7 +116,7 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
 
   let register_struct = match args.mode {
     SlotMode::Vec => quote! {
-        /// Vec-based register for #trait_ident entries.
+        #[doc = concat!("Vec-based register for ", stringify!(#trait_ident), " entries.")]
         /// Stores entries as `(vtable: usize, data: usize, meta: usize)` to avoid
         /// raw pointer Send/Sync issues in static contexts.
         ///
@@ -121,7 +129,7 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     },
     SlotMode::Map => quote! {
-        /// HashMap-based register for #trait_ident entries, keyed by (ExtensionMeta pointer, push counter).
+        #[doc = concat!("HashMap-based register for ", stringify!(#trait_ident), " entries, keyed by (ExtensionMeta pointer, push counter).")]
         ///
         /// PERF: When ready to eliminate Mutex contention on probe(), replace
         /// parking_lot::Mutex<HashMap<...>> with arc_swap::ArcSwap<HashMap<...>>.
@@ -190,6 +198,17 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
                   }
               }
 
+              /// Return all registered entries as `(vtable, data)` pointer pairs.
+              pub fn all_entries(&self) -> Vec<(*const (), *mut ())> {
+                  let entries = self.entries.lock();
+                  entries
+                      .iter()
+                      .map(|&(vt_usize, data_usize, _)| {
+                          (vt_usize as *const (), data_usize as *mut ())
+                      })
+                      .collect()
+              }
+
               /// Probe all entries using the given probe function.
               /// Returns (confidence, data_ptr) pairs sorted descending.
               pub fn probe(
@@ -241,11 +260,11 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
                   before - entries.len()
               }
 
-              /// Reconstruct a [`#dyn_ref_ident`] from raw vtable and data pointers.
+              #[doc = concat!("Reconstruct a [`", stringify!(#dyn_ref_ident), "`] from raw vtable and data pointers.")]
               ///
               /// # Safety
               ///
-              /// * `vtable` must point to a valid vtable for the trait [`#trait_ident`],
+              #[doc = concat!("* `vtable` must point to a valid vtable for the trait [`", stringify!(#trait_ident), "`],")]
               ///   obtained from a corresponding `RegisterVTable` instance.
               /// * `data` must point to a valid heap allocation produced by
               ///   `Box::into_raw(Box::new(concrete_type))`.
@@ -270,14 +289,14 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
               ///
               /// * `reg` must point to a valid `Self` allocation with a `'static` lifetime.
               /// * `entry` must be a valid heap allocation produced by
-              ///   `Box::into_raw(Box::new(#dyn_ref_ident))`.
+              #[doc = concat!("  `Box::into_raw(Box::new(", stringify!(#dyn_ref_ident), "))`.")]
               /// * `ext_meta` must point to a valid [`ExtensionMeta`](::around_extensions::ExtensionMeta).
               unsafe extern "C" fn push_raw_impl(
                   reg: *mut (),
                   entry: *mut (),
                   ext_meta: *const ::around_extensions::ExtensionMeta,
               ) {
-                  let reg = &*(reg as *const Self);
+                  let reg = unsafe { &*(reg as *const Self) };
                   reg.push(entry, ext_meta);
               }
 
@@ -289,8 +308,8 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
                   reg: *mut (),
                   meta: *const ::around_extensions::ExtensionMeta,
               ) -> usize {
-                  let reg = &*(reg as *const Self);
-                  let meta = &*meta;
+                  let reg = unsafe { &*(reg as *const Self) };
+                  let meta = unsafe { &*meta };
                   reg.remove_by_meta(meta)
               }
           }
@@ -343,6 +362,17 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
                   }
               }
 
+              /// Return all registered entries as `(vtable, data)` pointer pairs.
+              pub fn all_entries(&self) -> Vec<(*const (), *mut ())> {
+                  let entries = self.entries.lock();
+                  entries
+                      .iter()
+                      .map(|(_, &(vt_usize, data_usize))| {
+                          (vt_usize as *const (), data_usize as *mut ())
+                      })
+                      .collect()
+              }
+
               pub fn probe(
                   &self,
                   header: &[u8],
@@ -389,11 +419,11 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
                   removed
               }
 
-              /// Reconstruct a [`#dyn_ref_ident`] from raw vtable and data pointers.
+              #[doc = concat!("Reconstruct a [`", stringify!(#dyn_ref_ident), "`] from raw vtable and data pointers.")]
               ///
               /// # Safety
               ///
-              /// * `vtable` must point to a valid vtable for the trait [`#trait_ident`],
+              #[doc = concat!("* `vtable` must point to a valid vtable for the trait [`", stringify!(#trait_ident), "`],")]
               ///   obtained from a corresponding `RegisterVTable` instance.
               /// * `data` must point to a valid heap allocation produced by
               ///   `Box::into_raw(Box::new(concrete_type))`.
@@ -418,14 +448,14 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
               ///
               /// * `reg` must point to a valid `Self` allocation with a `'static` lifetime.
               /// * `entry` must be a valid heap allocation produced by
-              ///   `Box::into_raw(Box::new(#dyn_ref_ident))`.
+              #[doc = concat!("  `Box::into_raw(Box::new(", stringify!(#dyn_ref_ident), "))`.")]
               /// * `ext_meta` must point to a valid [`ExtensionMeta`](::around_extensions::ExtensionMeta).
               unsafe extern "C" fn push_raw_impl(
                   reg: *mut (),
                   entry: *mut (),
                   ext_meta: *const ::around_extensions::ExtensionMeta,
               ) {
-                  let reg = &*(reg as *const Self);
+                  let reg = unsafe { &*(reg as *const Self) };
                   reg.push(entry, ext_meta);
               }
 
@@ -437,7 +467,7 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
                   reg: *mut (),
                   meta: *const ::around_extensions::ExtensionMeta,
               ) -> usize {
-                  let reg = &*(reg as *const Self);
+                  let reg = unsafe { &*(reg as *const Self) };
                   let meta = unsafe { &*meta };
                   reg.remove_by_meta(meta)
               }
@@ -466,19 +496,49 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
       pub type #dyn_ref_ident = ::stabby::dynptr!(Box<dyn #trait_ident + Send + Sync>);
   };
 
-  // Build the NAME expression: use custom prefix if provided, otherwise auto-generate
-  // from module_path and trait name.
-  let name_expr: proc_macro2::TokenStream = if let Some(ref prefix) = args.prefix {
-    let lit = syn::LitStr::new(prefix, proc_macro2::Span::call_site());
+  // Build the NAME expression: use custom name if provided, otherwise auto-generate
+  // from CARGO_CRATE_NAME (read at proc-macro time) and trait name.
+  let trait_name_lower = trait_ident.to_string().to_lowercase();
+  let crate_name_raw =
+    std::env::var("CARGO_CRATE_NAME").expect("CARGO_CRATE_NAME must be set by Cargo");
+  let crate_name_lower = crate_name_raw.to_lowercase();
+  let crate_name_lower_lit = syn::LitStr::new(&crate_name_lower, proc_macro2::Span::call_site());
+
+  let name_expr: proc_macro2::TokenStream = if let Some(name) = &args.name {
+    let lit = syn::LitStr::new(name, proc_macro2::Span::call_site());
     quote! { #lit }
   } else {
-    quote! { concat!(module_path!(), "::", stringify!(#trait_ident)) }
+    quote! { concat!(#crate_name_lower_lit, "::", stringify!(#trait_ident)) }
   };
+
+  let create_sym_expr: proc_macro2::TokenStream;
+  let create_sym_nul_expr: proc_macro2::TokenStream;
+  if let Some(name) = &args.name {
+    let name_lower = name.to_lowercase();
+    let create_sym = name_lower.replace("::", "_") + "_create";
+    let create_sym_lit = syn::LitStr::new(&create_sym, proc_macro2::Span::call_site());
+    let nul_bytes: Vec<u8> = create_sym.bytes().chain(std::iter::once(b'\0')).collect();
+    let nul_lit = LitByteStr::new(&nul_bytes, proc_macro2::Span::call_site());
+    create_sym_expr = quote! { #create_sym_lit };
+    create_sym_nul_expr = quote! { #nul_lit };
+  } else {
+    let create_sym = format!("{crate_name_lower}_{trait_name_lower}_create");
+    let create_sym_lit = syn::LitStr::new(&create_sym, proc_macro2::Span::call_site());
+    let nul_bytes: Vec<u8> = create_sym.bytes().chain(std::iter::once(b'\0')).collect();
+    let nul_lit = LitByteStr::new(&nul_bytes, proc_macro2::Span::call_site());
+    create_sym_expr = quote! { #create_sym_lit };
+    create_sym_nul_expr = quote! { #nul_lit };
+  }
+  let test_fn_ident = format_ident!("slot_create_sym_consistency_{}", trait_name_lower);
   let expanded = match args.mode {
     SlotMode::Manual => {
       quote! {
-          #[doc = "Globally-unique slot identifier, derived from module path and trait name."]
+          #[doc = "Globally-unique slot identifier, derived from crate name and trait name."]
           pub const NAME: &'static str = #name_expr;
+          #[doc = "Create-symbol for dynamic loading of this slot's constructor."]
+          pub const CREATE_SYM: &'static str = #create_sym_expr;
+          #[doc = "Null-terminated CREATE_SYM for C ABI interop."]
+          pub const CREATE_SYM_NUL: &'static [u8] = #create_sym_nul_expr;
           #[repr(C)]
           pub struct #vtable_ident {
               pub inner: ::around_extensions::RegisterVTable,
@@ -486,13 +546,13 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
 
           #dyn_ref_type
 
-          /// Reconstruct a [`#dyn_ref_ident`] from raw vtable and data pointers.
+          #[doc = concat!("Reconstruct a [`", stringify!(#dyn_ref_ident), "`] from raw vtable and data pointers.")]
           ///
           /// This reconstructs a `DynRef` from parts, without needing a `Register`.
           ///
           /// # Safety
           ///
-          /// * `vtable` must point to a valid vtable for the trait [`#trait_ident`],
+          #[doc = concat!("* `vtable` must point to a valid vtable for the trait [`", stringify!(#trait_ident), "`],")]
           ///   obtained from a corresponding `RegisterVTable` instance.
           /// * `data` must point to a valid heap allocation produced by
           ///   `Box::into_raw(Box::new(concrete_type))`.
@@ -512,13 +572,23 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
                   result.assume_init()
               }
           }
+          #[doc = concat!("Verifies that CREATE_SYM is consistent with NAME for ", stringify!(#trait_ident), ".")]
+          #[test]
+          fn #test_fn_ident () {
+              let derived = NAME.to_lowercase().replace("::", "_") + "_create";
+              assert_eq!(CREATE_SYM, derived);
+          }
           #input
       }
     }
     _ => {
       quote! {
-          #[doc = "Globally-unique slot identifier, derived from module path and trait name."]
+          #[doc = "Globally-unique slot identifier, derived from crate name and trait name."]
           pub const NAME: &'static str = #name_expr;
+          #[doc = "Create-symbol for dynamic loading of this slot's constructor."]
+          pub const CREATE_SYM: &'static str = #create_sym_expr;
+          #[doc = "Null-terminated CREATE_SYM for C ABI interop."]
+          pub const CREATE_SYM_NUL: &'static [u8] = #create_sym_nul_expr;
 
           /// Typed wrapper for [`RegisterVTable`](::around_extensions::RegisterVTable).
           #[repr(C)]
@@ -534,6 +604,12 @@ pub fn slot(attr: TokenStream, item: TokenStream) -> TokenStream {
 
           #dyn_ref_type
 
+          #[doc = concat!("Verifies that CREATE_SYM is consistent with NAME for ", stringify!(#trait_ident), ".")]
+          #[test]
+          fn #test_fn_ident () {
+              let derived = NAME.to_lowercase().replace("::", "_") + "_create";
+              assert_eq!(CREATE_SYM, derived);
+          }
           #input
       }
     }

@@ -77,7 +77,7 @@ pub struct AudioBufferC {
 // extern "C" methods; the `unsafe` keyword cannot be applied to extern "C"
 // trait method declarations without breaking stabby's vtable generation.
 #[stabby::stabby]
-#[around_extensions_macros::slot(prefix = "around_audio_sdk::Filter")]
+#[around_extensions_macros::slot]
 pub trait Filter: Send + Sync {
   /// Return the human-readable filter name.
   extern "C" fn name(&self) -> *const u8;
@@ -112,7 +112,7 @@ pub trait Filter: Send + Sync {
 /// For plugin filters loaded via [`Framework::load`](crate::Framework),
 /// entries are pushed directly into the [`FilterRegister`] — this helper
 /// is not needed.
-pub fn make_dyn_filter(filter: impl Filter + Send + Sync + 'static) -> DynFilterRef {
+pub fn make_dyn_filter(filter: impl Filter + 'static) -> DynFilterRef {
   let bx = stabby::boxed::Box::new(filter);
   DynFilterRef::from(bx)
 }

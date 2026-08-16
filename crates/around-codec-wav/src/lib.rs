@@ -9,7 +9,7 @@
 //! | Symbol | Purpose |
 //! |---|---|
 //! | `AROUND_META` | Extension metadata (name, version, dependencies) |
-//! | `around_audio_sdk_codec_codec_create` | Factory: `fn(index: usize) -> *mut c_void` |
+//! | `around_audio_sdk_codec_create` | Factory: `fn(index: usize) -> *mut c_void` |
 
 use std::ffi::c_void;
 use std::io;
@@ -443,7 +443,7 @@ impl around_audio_sdk::codec::Codec for WavCodec {
 /// and that the returned pointer is a heap-allocated `DynCodecRef` that the
 /// framework takes ownership of.
 #[no_mangle]
-pub unsafe extern "C" fn around_audio_sdk_codec_codec_create(index: usize) -> *mut c_void {
+pub unsafe extern "C" fn around_audio_sdk_codec_create(index: usize) -> *mut c_void {
   if index == 0 {
     use stabby::boxed::Box as StabbyBox;
     let codec: around_audio_sdk::codec::DynCodecRef =
