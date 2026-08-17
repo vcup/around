@@ -218,7 +218,7 @@ fn ipc_server_creates_port_file_on_play() {
     ..Default::default()
   };
   let server_thread = spawn_server_thread(engine.clone(), ipc_config);
-  let _server_guard = ServerGuard::new(engine.clone(), port_file.clone(), server_thread);
+  let server_guard = ServerGuard::new(engine.clone(), port_file.clone(), server_thread);
   // Give server time to bind.
   // Wait for server to bind (poll for port file).
   {
@@ -252,16 +252,13 @@ fn ipc_server_creates_port_file_on_play() {
   let resp = send_command(&port_file, &serde_json::json!({"command": "status"}));
   assert_eq!(resp["status"], "ok", "status response must contain ok");
 
-  // Manually clean up the port file (IPC server thread keeps running).
-  let _ = std::fs::remove_file(&port_file);
+  // Dropping the server guard performs shutdown, wakes the accept loop and
+  // joins the server thread before checking its cleanup side effect.
+  drop(server_guard);
   assert!(
     !std::path::Path::new(&port_file).exists(),
-    "port file must be deletable after stop"
+    "server should remove the port file during shutdown"
   );
-
-  // Shutdown the engine
-  engine.shutdown();
-  poke_server(&port_file);
 }
 
 #[test]
