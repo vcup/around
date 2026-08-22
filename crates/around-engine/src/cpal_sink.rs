@@ -96,14 +96,21 @@ impl CpalSink {
 
 impl AudioSink for CpalSink {
   fn write(&mut self, samples: &[f32]) -> Result<(), AroundError> {
-    let written = self.producer.push_slice(samples);
-    if written < samples.len() {
-      tracing::warn!(
-        written,
-        total = samples.len(),
-        dropped = samples.len() - written,
-        "CpalSink: ring buffer full, dropping samples"
-      );
+    let mut offset = 0;
+    while offset < samples.len() {
+      if self.device_lost.load(Ordering::SeqCst) {
+        return Err(AroundError::Internal {
+          message: "audio output device lost while buffering samples".into(),
+        });
+      }
+
+      let written = self.producer.push_slice(&samples[offset..]);
+      offset += written;
+      if written == 0 {
+        // Backpressure is required here: decoding faster than the CPAL
+        // callback must not advance playback time while dropping PCM.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+      }
     }
     Ok(())
   }
