@@ -1,17 +1,7 @@
 //! Core type aliases and constants for audio primitives.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
-
-// --- BitDepth ---
-
-pub type BitDepth = u8;
-
-pub const BIT_DEPTH_8: BitDepth = 8;
-pub const BIT_DEPTH_16: BitDepth = 16;
-pub const BIT_DEPTH_24: BitDepth = 24;
-pub const BIT_DEPTH_32: BitDepth = 32;
-pub const BIT_DEPTH_64: BitDepth = 64;
-
 // --- SampleRate ---
 
 pub type SampleRate = u32;
@@ -74,52 +64,173 @@ impl From<String> for ContentType {
   }
 }
 
-/// Channel interleave mode for audio data.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Interleave {
   /// Samples are interleaved: LRLRLR...
   Interleaved,
   /// Samples are planar: LLL...RRR...
   Planar,
 }
+
+/// PCM sample encoding.
+///
+/// Packed 24- and 48-bit variants occupy exactly three and six bytes per
+/// sample. They are deliberately distinct from the four/eight-byte integer
+/// variants; no adapter may silently widen a packed sample.
+/// PCM sample encoding.
+///
+/// Packed 24- and 48-bit variants occupy exactly three and six bytes per
+/// sample; adapters must not silently widen packed samples.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum PcmEncoding {
+  I8,
+  I16,
+  I24,
+  I32,
+  I48,
+  I64,
+  U8,
+  U16,
+  U24,
+  U32,
+  U48,
+  U64,
+  F32,
+  F64,
+}
+
+impl PcmEncoding {
+  pub const fn bits(self) -> u16 {
+    match self {
+      Self::I8 | Self::U8 => 8,
+      Self::I16 | Self::U16 => 16,
+      Self::I24 | Self::U24 => 24,
+      Self::I32 | Self::U32 | Self::F32 => 32,
+      Self::I48 | Self::U48 => 48,
+      Self::I64 | Self::U64 | Self::F64 => 64,
+    }
+  }
+
+  pub const fn bytes_per_sample(self) -> usize {
+    (self.bits() as usize).div_ceil(8)
+  }
+
+  pub const fn is_float(self) -> bool {
+    matches!(self, Self::F32 | Self::F64)
+  }
+
+  pub const fn is_signed(self) -> bool {
+    matches!(
+      self,
+      Self::I8 | Self::I16 | Self::I24 | Self::I32 | Self::I48 | Self::I64
+    )
+  }
+
+  pub const fn is_unsigned(self) -> bool {
+    matches!(
+      self,
+      Self::U8 | Self::U16 | Self::U24 | Self::U32 | Self::U48 | Self::U64
+    )
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ByteOrder {
+  Native,
+  Little,
+  Big,
+}
+
+impl ByteOrder {
+  pub const fn native() -> Self {
+    #[cfg(target_endian = "little")]
+    {
+      Self::Little
+    }
+    #[cfg(target_endian = "big")]
+    {
+      Self::Big
+    }
+  }
+
+  pub fn is_native(self) -> bool {
+    if matches!(self, Self::Native) {
+      return true;
+    }
+    #[cfg(target_endian = "little")]
+    {
+      matches!(self, Self::Little)
+    }
+    #[cfg(target_endian = "big")]
+    {
+      matches!(self, Self::Big)
+    }
+  }
+}
+
 // --- SampleSpec ---
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+// --- SampleSpec ---
+
+/// Complete PCM format: rate, channels, encoding, interleave, and byte order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SampleSpec {
   pub sample_rate: SampleRate,
   pub channels: ChannelLayout,
-  pub bit_depth: BitDepth,
+  pub encoding: PcmEncoding,
   pub interleave: Interleave,
+  pub byte_order: ByteOrder,
 }
-
 impl SampleSpec {
   pub fn new(
     sample_rate: SampleRate,
     channels: ChannelLayout,
-    bit_depth: BitDepth,
+    encoding: PcmEncoding,
     interleave: Interleave,
+    byte_order: ByteOrder,
   ) -> Result<Self, &'static str> {
-    if sample_rate == 0 {
-      return Err("sample_rate must be > 0");
-    }
-    if channels == 0 || channels > 32 {
-      return Err("channels must be in 1..=32");
-    }
-    Ok(Self {
+    let spec = Self {
       sample_rate,
       channels,
-      bit_depth,
+      encoding,
       interleave,
-    })
+      byte_order,
+    };
+    spec.validate()?;
+    Ok(spec)
   }
 
-  /// Convenience: interleaved stereo at standard bit depth.
+  pub fn validate(self) -> Result<(), &'static str> {
+    if self.sample_rate == 0 {
+      return Err("sample_rate must be > 0");
+    }
+    if self.channels == 0 || self.channels > 32 {
+      return Err("channels must be in 1..=32");
+    }
+    Ok(())
+  }
+
+  /// Convenience constructor for interleaved PCM.
   pub fn interleaved(
     sample_rate: SampleRate,
     channels: ChannelLayout,
-    bit_depth: BitDepth,
+    encoding: PcmEncoding,
   ) -> Result<Self, &'static str> {
-    Self::new(sample_rate, channels, bit_depth, Interleave::Interleaved)
+    Self::new(
+      sample_rate,
+      channels,
+      encoding,
+      Interleave::Interleaved,
+      ByteOrder::Native,
+    )
+  }
+
+  pub const fn bytes_per_sample(self) -> usize {
+    self.encoding.bytes_per_sample()
+  }
+
+  pub const fn bytes_per_frame(self) -> usize {
+    self.bytes_per_sample() * self.channels as usize
   }
 }
 
@@ -252,56 +363,65 @@ mod tests {
 
   #[test]
   fn interleaved_accepts_standard_params() {
-    let spec = SampleSpec::interleaved(44100, 2, 16);
+    let spec = SampleSpec::interleaved(44100, 2, PcmEncoding::F32);
     assert!(spec.is_ok());
     let spec = spec.unwrap();
     assert_eq!(spec.sample_rate, 44100);
     assert_eq!(spec.channels, 2);
-    assert_eq!(spec.bit_depth, 16);
+    assert_eq!(spec.encoding, PcmEncoding::F32);
     assert_eq!(spec.interleave, Interleave::Interleaved);
+    assert_eq!(spec.byte_order, ByteOrder::Native);
   }
 
   #[test]
   fn planar_accepts_standard_params() {
-    let spec = SampleSpec::new(44100, 2, 24, Interleave::Planar);
+    let spec = SampleSpec::new(
+      44100,
+      2,
+      PcmEncoding::I24,
+      Interleave::Planar,
+      ByteOrder::Little,
+    );
     assert!(spec.is_ok());
     let spec = spec.unwrap();
     assert_eq!(spec.interleave, Interleave::Planar);
+    assert_eq!(spec.bytes_per_sample(), 3);
+    assert_eq!(spec.bytes_per_frame(), 6);
   }
 
   #[test]
   fn sample_spec_rejects_zero_sample_rate() {
-    let err = SampleSpec::interleaved(0, 2, 16).unwrap_err();
+    let err = SampleSpec::interleaved(0, 2, PcmEncoding::F32).unwrap_err();
     assert!(!err.is_empty());
   }
 
   #[test]
   fn sample_spec_rejects_zero_channels() {
-    let err = SampleSpec::interleaved(44100, 0, 16).unwrap_err();
+    let err = SampleSpec::interleaved(44100, 0, PcmEncoding::F32).unwrap_err();
     assert!(!err.is_empty());
   }
 
   #[test]
   fn sample_spec_rejects_channels_above_max() {
-    let err = SampleSpec::interleaved(44100, 33, 16).unwrap_err();
+    let err = SampleSpec::interleaved(44100, 33, PcmEncoding::F32).unwrap_err();
     assert!(!err.is_empty());
   }
 
   #[test]
   fn sample_spec_accepts_minimum_sample_rate() {
-    let spec = SampleSpec::interleaved(1, 2, 16);
+    let spec = SampleSpec::interleaved(1, 2, PcmEncoding::F32);
     assert!(spec.is_ok());
   }
 
   #[test]
   fn sample_spec_accepts_minimum_channels() {
-    let spec = SampleSpec::interleaved(44100, 1, 16);
+    let spec = SampleSpec::interleaved(44100, 1, PcmEncoding::F32);
     assert!(spec.is_ok());
   }
 
   #[test]
   fn sample_spec_accepts_maximum_channels() {
-    let spec = SampleSpec::interleaved(44100, 32, 16);
+    let spec = SampleSpec::interleaved(44100, 32, PcmEncoding::F32);
     assert!(spec.is_ok());
   }
 

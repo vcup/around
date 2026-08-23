@@ -13,7 +13,3 @@ workspace = true
 [dependencies]
 bitflags = "2"
 serde = { workspace = true, features = ["derive"] }
-parking_lot = { workspace = true, optional = true }
-
-[features]
-test-utils = ["dep:parking_lot"]

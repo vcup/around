@@ -140,7 +140,6 @@ name = "around-core"
 version = "0.0.0"
 dependencies = [
  "bitflags 2.12.1",
- "parking_lot",
  "serde",
 ]
 
