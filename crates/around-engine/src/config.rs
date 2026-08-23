@@ -2,18 +2,15 @@
 use kdl::KdlDocument;
 use std::path::PathBuf;
 
-/// Selects the audio output driver for decode loops.
+/// Selects the output Adapter for decode loops.
 ///
-/// * `Cpal` — real audio device via cpal (default, requires audio hardware)
-/// * `Null` — silent discard (headless/CI)
-///
-/// Custom sinks can be used directly with
-/// [`Engine::run_stream_with_sink`](crate::pipeline::Engine::run_stream_with_sink).
+/// * `Cpal` — native output via the CPAL Adapter (default)
+/// * `Null` — deterministic in-memory discard (headless/CI)
 #[derive(Debug, Clone)]
 pub enum OutputDriver {
-  /// Real audio output via the default cpal device.
+  /// Native output discovered through the CPAL Adapter.
   Cpal,
-  /// Silent discard — no audio hardware needed.
+  /// Deterministic discard through the in-memory Adapter.
   Null,
 }
 
@@ -61,7 +58,6 @@ impl EngineConfig {
   fn parse(input: &str) -> Result<Self, String> {
     let doc: KdlDocument = input.parse().map_err(|e| format!("KDL parse error: {e}"))?;
     let mut cfg = Self::default();
-
     for node in doc.nodes() {
       if node.name().value() == "output" {
         for entry in node.entries() {
@@ -70,11 +66,39 @@ impl EngineConfig {
             Some("auto_reconnect") => {
               cfg.output_auto_reconnect = entry.value().as_bool().unwrap_or(true)
             }
+            Some("driver") => {
+              cfg.output_driver = match entry.value().as_string() {
+                Some("null") => OutputDriver::Null,
+                Some("cpal") => OutputDriver::Cpal,
+                Some(other) => return Err(format!("unknown output driver: {other}")),
+                None => return Err("output driver must be a string".into()),
+              };
+            }
             _ => {}
           }
         }
       }
     }
     Ok(cfg)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  #![expect(
+    clippy::unwrap_used,
+    reason = "configuration parser fixtures are fixed valid KDL"
+  )]
+  use super::*;
+
+  #[test]
+  fn parses_output_driver() {
+    let config = EngineConfig::parse("output driver=\"null\"").unwrap();
+    assert!(matches!(config.output_driver, OutputDriver::Null));
+  }
+
+  #[test]
+  fn rejects_unknown_output_driver() {
+    assert!(EngineConfig::parse("output driver=\"alsa\"").is_err());
   }
 }

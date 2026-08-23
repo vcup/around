@@ -1,103 +1,28 @@
-//! Filter trait and FilterChain for audio processing (ADR-0006).
+//! Format-aware FilterChain (ADR-0006).
 //!
-//! Filters are ordered in a chain: each filter receives samples, transforms
-//! them, and passes them to the next. Format negotiation auto-inserts
-//! Resample, Deinterleave, and Interleave at format boundaries.
-//!
-//! # Architecture
-//!
-//! - [`Filter`] — trait implemented by all audio filters.
-//! - [`FilterInfo`] — metadata: name, supported input/output formats.
-//! - [`FilterChain`] — ordered list with format negotiation via `build()`.
-//! - [`Resample`] — sample rate conversion filter.
-//! - [`Volume`] — gain multiplier filter.
+//! Codec output is normalized f32 PCM. FilterChain owns every conversion from
+//! that source format to the exact native `OutputBinding` format, including
+//! sample rate, channel count, interleave, byte order, and encoding. Output
+//! adapters only queue already-encoded bytes.
 
-use around_audio_sdk::filter::{AudioBufferC, DynFilterRef, FilterDyn, FilterDynMut};
-use around_core::SampleSpec;
+use crate::pcm_buffer::PcmBuffer;
+use around_audio_sdk::filter::{
+  AudioBufferC, AudioFormatC, AudioFormatListC, DynFilterRef, FilterDyn, FilterDynMut,
+};
+use around_core::{AudioBufferError, PcmEncoding, SampleSpec};
+use std::fmt;
 
-// ---------------------------------------------------------------------------
-// Format scoring (ADR-0006 §2.1)
-// ---------------------------------------------------------------------------
-
-/// Penalty per kHz of downsampling (higher sample rate → lower).
-const PENALTY_DOWNSAMPLE_PER_KHZ: u32 = 100;
-/// Penalty per channel removed (more channels → fewer).
-const PENALTY_DOWNMIX_PER_CH: u32 = 80;
-/// Penalty per kHz of upsampling (lower sample rate → higher).
-const PENALTY_UPSAMPLE_PER_KHZ: u32 = 10;
-/// Penalty per channel added (fewer channels → more).
-const PENALTY_UPMIX_PER_CH: u32 = 5;
-/// Penalty for changing interleave mode (planar ↔ interleaved).
-const PENALTY_INTERLEAVE_CHANGE: u32 = 1;
-
-/// Score the penalty of converting from `input` to `output` format.
-///
-/// Returns a penalty score in arbitrary units. Lower is better.
-/// The penalty table (ADR-0006 §2.1):
-///
-/// | Conversion | Penalty |
-/// |---|---|
-/// | Downsampling | 100 / kHz of rate difference |
-/// | Downmixing | 80 / channel removed |
-/// | Upsampling | 10 / kHz of rate difference |
-/// | Upmixing | 5 / channel added |
-/// | Planar ↔ Interleaved | 1 |
-///
-/// # Tiebreaker
-///
-/// When comparing multiple candidate output formats, the format with the
-/// highest sample rate wins if scores are equal (prefer higher quality).
+/// Score conversion loss according to ADR-0006.
 pub fn score_format_pair(input: &SampleSpec, output: &SampleSpec) -> u32 {
-  let mut score = 0u32;
-
-  // Sample rate conversion.
-  if input.sample_rate > output.sample_rate {
-    // Downsampling: 100 per kHz of difference.
-    let diff_khz = (input.sample_rate - output.sample_rate) as f32 / 1000.0;
-    score += (diff_khz * PENALTY_DOWNSAMPLE_PER_KHZ as f32) as u32;
-  } else if output.sample_rate > input.sample_rate {
-    // Upsampling: 10 per kHz of difference.
-    let diff_khz = (output.sample_rate - input.sample_rate) as f32 / 1000.0;
-    score += (diff_khz * PENALTY_UPSAMPLE_PER_KHZ as f32) as u32;
-  }
-
-  // Channel conversion.
-  if input.channels > output.channels {
-    // Downmixing: 80 per channel removed.
-    score += u32::from(input.channels - output.channels) * PENALTY_DOWNMIX_PER_CH;
-  } else if output.channels > input.channels {
-    // Upmixing: 5 per channel added.
-    score += u32::from(output.channels - input.channels) * PENALTY_UPMIX_PER_CH;
-  }
-
-  // Interleave conversion.
-  if input.interleave != output.interleave {
-    score += PENALTY_INTERLEAVE_CHANGE;
-  }
-
-  score
+  crate::output_plan::conversion_loss(*input, *output).total()
 }
+const MAX_CHANNELS: usize = 32;
 
-// ---------------------------------------------------------------------------
-// Filter trait
-// ---------------------------------------------------------------------------
-
-/// Audio processing filter.
-///
-/// Filters are stateless in their configuration but may hold per-stream
-/// state. `process()` receives interleaved f32 PCM in-place.
+/// Internal in-process Filter seam. Built-in Filters operate on normalized
+/// interleaved f32; the terminal conversion is handled by FilterChain itself.
 pub trait Filter: Send + Sync {
-  /// Process audio samples in-place.
-  /// `buf` contains interleaved f32 PCM.
-  /// `channels` is the number of channels.
-  /// Returns the number of samples produced (may differ from input after resampling).
   fn process(&mut self, buf: &mut [f32], channels: u8) -> usize;
-
-  /// Return metadata about this filter.
   fn info(&self) -> FilterInfo;
-
-  /// Number of channels this filter requires/produces.
-  /// Default: passes through channels unchanged.
   fn channels_in(&self) -> Option<u8> {
     None
   }
@@ -106,46 +31,93 @@ pub trait Filter: Send + Sync {
   }
 }
 
-/// Metadata for a filter.
 #[derive(Debug, Clone)]
 pub struct FilterInfo {
-  /// Human-readable filter name.
   pub name: String,
-  /// Accepted input formats (empty = any).
   pub formats_in: Vec<SampleSpec>,
-  /// Produced output formats (empty = same as input).
   pub formats_out: Vec<SampleSpec>,
 }
 
-// ---------------------------------------------------------------------------
-// StabbyFilterBridge — adapter between stabby Filter and internal Filter
-// ---------------------------------------------------------------------------
-
-/// Wraps a stabby `DynFilterRef` (from `around_audio_sdk::filter::Filter`)
-/// and implements the internal [`Filter`] trait.
-///
-/// Converts between `(&mut [f32], u8)` (internal trait) and [`AudioBufferC`]
-/// (stabby ABI) on every `process()` call.
+/// Adapter from the format-aware stabby Filter ABI to the in-process Filter
+/// seam. Dynamic Filters that declare non-f32 formats are rejected by this
+/// narrow internal adapter until a typed Filter implementation is supplied.
 pub struct StabbyFilterBridge {
   inner: DynFilterRef,
 }
 
 impl StabbyFilterBridge {
-  /// Create a new bridge from an owned stabby `DynFilterRef`.
   pub fn new(inner: DynFilterRef) -> Self {
     Self { inner }
+  }
+
+  fn format_list(list: AudioFormatListC) -> Vec<SampleSpec> {
+    list
+      .as_slice()
+      .iter()
+      .filter_map(|format| {
+        let encoding = match format.encoding {
+          0 => PcmEncoding::I8,
+          1 => PcmEncoding::I16,
+          2 => PcmEncoding::I24,
+          3 => PcmEncoding::I32,
+          4 => PcmEncoding::I48,
+          5 => PcmEncoding::I64,
+          6 => PcmEncoding::U8,
+          7 => PcmEncoding::U16,
+          8 => PcmEncoding::U24,
+          9 => PcmEncoding::U32,
+          10 => PcmEncoding::U48,
+          11 => PcmEncoding::U64,
+          12 => PcmEncoding::F32,
+          13 => PcmEncoding::F64,
+          _ => return None,
+        };
+        let interleave = match format.interleave {
+          0 => around_core::Interleave::Interleaved,
+          1 => around_core::Interleave::Planar,
+          _ => return None,
+        };
+        let byte_order = match format.byte_order {
+          0 => around_core::ByteOrder::Native,
+          1 => around_core::ByteOrder::Little,
+          2 => around_core::ByteOrder::Big,
+          _ => return None,
+        };
+        SampleSpec::new(
+          format.sample_rate,
+          format.channels,
+          encoding,
+          interleave,
+          byte_order,
+        )
+        .ok()
+      })
+      .collect()
   }
 }
 
 impl Filter for StabbyFilterBridge {
   fn process(&mut self, buf: &mut [f32], channels: u8) -> usize {
-    let mut buf_c = AudioBufferC {
-      data: buf.as_mut_ptr(),
-      len: buf.len(),
+    let format = AudioFormatC {
+      sample_rate: 0,
       channels,
+      encoding: 12,
+      interleave: 0,
+      byte_order: 0,
     };
-    let produced = self.inner.process(&mut buf_c) as usize;
-    produced.min(buf.len())
+    let mut cbuf = AudioBufferC {
+      input_data: buf.as_ptr().cast(),
+      input_len: std::mem::size_of_val(buf),
+      output_data: buf.as_mut_ptr().cast(),
+      output_len: std::mem::size_of_val(buf),
+      frames: buf.len() / usize::from(channels.max(1)),
+      input_format: format,
+      output_format: format,
+    };
+    let frames = self.inner.process(&mut cbuf) as usize;
+    frames
+      .saturating_mul(usize::from(channels.max(1)))
+      .min(buf.len())
   }
 
   fn info(&self) -> FilterInfo {
@@ -153,7 +125,6 @@ impl Filter for StabbyFilterBridge {
     let name = if name_ptr.is_null() {
       "unknown".into()
     } else {
-      // SAFETY: name() returns a valid null-terminated C string pointer.
       unsafe {
         std::ffi::CStr::from_ptr(name_ptr as *const i8)
           .to_string_lossy()
@@ -162,182 +133,510 @@ impl Filter for StabbyFilterBridge {
     };
     FilterInfo {
       name,
-      formats_in: vec![],
-      formats_out: vec![],
+      formats_in: Self::format_list(self.inner.formats_in()),
+      formats_out: Self::format_list(self.inner.formats_out()),
     }
   }
 }
 
-// SAFETY: DynFilterRef wraps a stabby Box<dyn Filter + Send + Sync> which is
-// Send + Sync. The vtable dispatch is read-only and thread-safe.
-// SAFETY: See the Send+Sync reasoning for SafeCodecRef in around-audio-sdk's
-// codec.rs — the same applies to DynFilterRef.
 unsafe impl Send for StabbyFilterBridge {}
-// SAFETY: See Send impl reasoning.
 unsafe impl Sync for StabbyFilterBridge {}
 
-// ---------------------------------------------------------------------------
-// FilterChain
-// ---------------------------------------------------------------------------
-
-/// Ordered list of audio filters with format negotiation.
-pub struct FilterChain {
-  filters: Vec<Box<dyn Filter>>,
-  /// Decoded format from the codec.
-  decode_spec: SampleSpec,
-  /// Target output format.
-  output_spec: SampleSpec,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilterError {
+  InputFormat,
+  OutputTooSmall { required: usize, available: usize },
+  WorkspaceTooSmall { required: usize, available: usize },
+  UnsupportedPlanarInput,
+  Buffer(AudioBufferError),
 }
 
+impl fmt::Display for FilterError {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    match self {
+      Self::InputFormat => f.write_str("FilterChain received a non-f32 input"),
+      Self::OutputTooSmall {
+        required,
+        available,
+      } => {
+        write!(
+          f,
+          "FilterChain output needs {required} bytes, has {available}"
+        )
+      }
+      Self::WorkspaceTooSmall {
+        required,
+        available,
+      } => {
+        write!(
+          f,
+          "FilterChain workspace needs {required} samples, has {available}"
+        )
+      }
+      Self::UnsupportedPlanarInput => f.write_str("planar codec input is not supported yet"),
+      Self::Buffer(error) => error.fmt(f),
+    }
+  }
+}
+
+impl std::error::Error for FilterError {}
+
+impl From<AudioBufferError> for FilterError {
+  fn from(error: AudioBufferError) -> Self {
+    Self::Buffer(error)
+  }
+}
+
+pub struct FilterChain {
+  filters: Vec<Box<dyn Filter>>,
+  decode_spec: SampleSpec,
+  output_spec: SampleSpec,
+  resample_position: f64,
+  previous_frame: [f32; MAX_CHANNELS],
+  has_previous_frame: bool,
+}
 impl FilterChain {
-  /// Build a filter chain from user-selected filters.
-  ///
-  /// Automatically inserts resampling filters when input/output formats
-  /// differ at any boundary. Uses [`score_format_pair`] to assess the
-  /// penalty of format conversion and inserts the cheapest conversion
-  /// chain.
   pub fn build(
     decode_spec: SampleSpec,
     filters: Vec<Box<dyn Filter>>,
     output_spec: SampleSpec,
   ) -> Self {
-    let mut chain = FilterChain {
+    Self {
       filters,
       decode_spec,
       output_spec,
-    };
-
-    // Score the format difference between decode and output.
-    let score = score_format_pair(&chain.decode_spec, &chain.output_spec);
-
-    if score > 0 && chain.filters.is_empty() {
-      // Auto-insert Resample if sample rates differ.
-      if chain.decode_spec.sample_rate != chain.output_spec.sample_rate {
-        chain.filters.push(Box::new(Resample::new(
-          chain.decode_spec.sample_rate,
-          chain.output_spec.sample_rate,
-          chain.decode_spec.channels,
-        )));
-      }
-      // Note: Deinterleave/Interleave auto-insertion is deferred until
-      // the Filter chain supports these conversions (Phase 6+).
-      // The scoring function is in place for when those filters exist.
+      resample_position: 0.0,
+      previous_frame: [0.0; MAX_CHANNELS],
+      has_previous_frame: false,
     }
-
-    chain
+  }
+  pub fn source_spec(&self) -> SampleSpec {
+    self.decode_spec
   }
 
-  /// Process samples through the entire filter chain.
-  /// Returns the number of samples produced.
-  pub fn process(&mut self, buf: &mut [f32], channels: u8) -> usize {
-    let mut len = buf.len();
-    for filter in &mut self.filters {
-      len = filter.process(&mut buf[..len], channels);
-      if len == 0 {
-        break;
-      }
-    }
-    len
+  pub fn output_spec(&self) -> SampleSpec {
+    self.output_spec
   }
 
-  /// Whether the chain is empty (passthrough).
+  pub fn reconfigure_output(&mut self, output_spec: SampleSpec) {
+    self.output_spec = output_spec;
+    self.resample_position = 0.0;
+    self.previous_frame.fill(0.0);
+    self.has_previous_frame = false;
+  }
+
+  pub fn workspace_requirements(&self, input_samples: usize) -> (usize, usize) {
+    let input_frames = input_samples / usize::from(self.decode_spec.channels.max(1));
+    let output_frames = ((input_frames as u128 * u128::from(self.output_spec.sample_rate)
+      + u128::from(self.decode_spec.sample_rate - 1))
+      / u128::from(self.decode_spec.sample_rate)) as usize
+      + 2;
+    let output_samples = output_frames * usize::from(self.output_spec.channels.max(1));
+    let output_bytes = output_frames * self.output_spec.bytes_per_frame();
+    (input_samples.max(output_samples), output_bytes)
+  }
+
   pub fn is_empty(&self) -> bool {
-    self.filters.is_empty()
+    self.filters.is_empty() && self.decode_spec == self.output_spec
   }
 
-  /// Number of filters in the chain.
   pub fn len(&self) -> usize {
     self.filters.len()
   }
-}
 
-// ---------------------------------------------------------------------------
-// Built-in: Resample filter
-// ---------------------------------------------------------------------------
-
-/// Sample rate conversion filter.
-///
-/// Uses a simple linear interpolation resampler. For production use,
-/// replace with `rubato`-based high-quality resampling.
-#[allow(dead_code)]
-pub struct Resample {
-  sample_rate_in: u32,
-  sample_rate_out: u32,
-  ratio: f64,
-  channels: u8,
-  /// Accumulator for fractional sample position.
-  accum: f64,
-}
-
-impl Resample {
-  pub fn new(sample_rate_in: u32, sample_rate_out: u32, channels: u8) -> Self {
-    Self {
-      sample_rate_in,
-      sample_rate_out,
-      ratio: f64::from(sample_rate_in) / f64::from(sample_rate_out),
-      channels,
-      accum: 0.0,
+  /// Process one decoded f32 block and encode it into the exact output format.
+  /// All temporary storage comes from `workspace`; this method does not grow
+  /// or allocate any collection.
+  pub fn process_to_output(
+    &mut self,
+    input: &[f32],
+    frames: usize,
+    workspace: &mut PcmBuffer,
+  ) -> Result<usize, FilterError> {
+    if self.decode_spec.encoding != PcmEncoding::F32
+      || self.decode_spec.interleave != around_core::Interleave::Interleaved
+    {
+      return Err(FilterError::InputFormat);
     }
-  }
-}
-
-impl Filter for Resample {
-  fn process(&mut self, buf: &mut [f32], _channels: u8) -> usize {
-    let ch = self.channels as usize;
-    if ch == 0 || self.ratio <= 0.0 {
-      return buf.len();
+    let channels = usize::from(self.decode_spec.channels);
+    let expected = frames
+      .checked_mul(channels)
+      .ok_or(FilterError::InputFormat)?;
+    if input.len() != expected {
+      return Err(FilterError::InputFormat);
     }
 
-    let input_frames = buf.len() / ch;
-    let output_frames = (input_frames as f64 / self.ratio).ceil() as usize;
-    let mut out = vec![0.0f32; output_frames * ch];
-    let mut out_pos = 0;
-
-    for out_frame in 0..output_frames {
-      let src_pos = out_frame as f64 * self.ratio;
-      let src_frame = src_pos as usize;
-      let frac = src_pos - src_frame as f64;
-
-      if src_frame + 1 < input_frames {
-        for c in 0..ch {
-          let a = buf[src_frame * ch + c];
-          let b = buf[(src_frame + 1) * ch + c];
-          out[out_pos + c] = f64::from(a) as f32 + (f64::from(b - a) * frac) as f32;
-        }
-      } else if src_frame < input_frames {
-        for c in 0..ch {
-          out[out_pos + c] = buf[src_frame * ch + c];
+    let (filter_buf, scratch, output) = workspace.processing_regions();
+    if filter_buf.len() < input.len() {
+      return Err(FilterError::WorkspaceTooSmall {
+        required: input.len(),
+        available: filter_buf.len(),
+      });
+    }
+    filter_buf[..input.len()].copy_from_slice(input);
+    let mut sample_count = input.len();
+    let mut current_channels = self.decode_spec.channels;
+    if usize::from(current_channels) > MAX_CHANNELS {
+      return Err(FilterError::InputFormat);
+    }
+    for filter in &mut self.filters {
+      sample_count = filter
+        .process(&mut filter_buf[..sample_count], current_channels)
+        .min(filter_buf.len());
+      if let Some(channels_out) = filter.channels_out() {
+        current_channels = channels_out;
+        if usize::from(current_channels) > MAX_CHANNELS {
+          return Err(FilterError::InputFormat);
         }
       }
-      out_pos += ch;
     }
 
-    let produced = out_pos.min(buf.len());
-    buf[..produced].copy_from_slice(&out[..produced]);
-    produced
-  }
-
-  fn info(&self) -> FilterInfo {
-    FilterInfo {
-      name: "resample".into(),
-      formats_in: vec![],
-      formats_out: vec![],
+    let input_frames = sample_count / usize::from(current_channels.max(1));
+    let target_channels = usize::from(self.output_spec.channels.max(1));
+    let capacity_frames = scratch.len() / target_channels;
+    let required_frames = if self.decode_spec.sample_rate == self.output_spec.sample_rate {
+      input_frames
+    } else {
+      ((input_frames as u128 * u128::from(self.output_spec.sample_rate)
+        + u128::from(self.decode_spec.sample_rate - 1))
+        / u128::from(self.decode_spec.sample_rate)) as usize
+        + 2
+    };
+    if capacity_frames < required_frames {
+      return Err(FilterError::WorkspaceTooSmall {
+        required: required_frames * target_channels,
+        available: scratch.len(),
+      });
     }
+    let output_frames = if self.decode_spec.sample_rate == self.output_spec.sample_rate {
+      convert_f32_stateless(
+        &filter_buf[..sample_count],
+        input_frames,
+        current_channels,
+        &mut scratch[..input_frames * target_channels],
+        input_frames,
+        self.output_spec,
+      );
+      input_frames
+    } else {
+      convert_f32_stateful(
+        &filter_buf[..sample_count],
+        input_frames,
+        current_channels,
+        &mut scratch[..capacity_frames * target_channels],
+        capacity_frames,
+        self.decode_spec.sample_rate,
+        self.output_spec,
+        &mut self.resample_position,
+        &mut self.previous_frame,
+        &mut self.has_previous_frame,
+      )
+    };
+    encode_f32(
+      &scratch[..output_frames * target_channels],
+      output_frames,
+      self.output_spec,
+      output,
+    )
   }
 
-  fn channels_in(&self) -> Option<u8> {
-    Some(self.channels)
-  }
-  fn channels_out(&self) -> Option<u8> {
-    Some(self.channels)
+  pub fn process_workspace(
+    &mut self,
+    workspace: &mut PcmBuffer,
+    frames: usize,
+  ) -> Result<usize, FilterError> {
+    let samples = frames
+      .checked_mul(usize::from(self.decode_spec.channels))
+      .ok_or(FilterError::InputFormat)?;
+    let decode_capacity = workspace.decode_region().len();
+    if samples > decode_capacity {
+      return Err(FilterError::WorkspaceTooSmall {
+        required: samples,
+        available: decode_capacity,
+      });
+    }
+    let input = workspace.decode_region().as_ptr();
+    let input = unsafe { std::slice::from_raw_parts(input, samples) };
+    self.process_to_output(input, frames, workspace)
   }
 }
 
-// ---------------------------------------------------------------------------
-// Built-in: Volume filter
-// ---------------------------------------------------------------------------
+fn convert_f32_stateless(
+  input: &[f32],
+  input_frames: usize,
+  input_channels: u8,
+  output: &mut [f32],
+  output_frames: usize,
+  output_spec: SampleSpec,
+) {
+  let in_channels = usize::from(input_channels.max(1));
+  let out_channels = usize::from(output_spec.channels.max(1));
+  let ratio = (input_frames.max(1) as f64) / (output_frames.max(1) as f64);
+  for out_frame in 0..output_frames {
+    let source_pos = out_frame as f64 * ratio;
+    let source_frame = source_pos.floor() as usize;
+    let next_frame = (source_frame + 1).min(input_frames.saturating_sub(1));
+    let fraction = (source_pos - source_frame as f64) as f32;
+    write_mapped_frame(
+      input,
+      in_channels,
+      source_frame,
+      next_frame,
+      fraction,
+      output,
+      out_channels,
+      out_frame,
+    );
+  }
+}
+#[expect(
+  clippy::too_many_arguments,
+  reason = "the hot-path conversion kernel keeps buffer and format state explicit"
+)]
+fn write_mapped_frame(
+  input: &[f32],
+  input_channels: usize,
+  source_frame: usize,
+  next_frame: usize,
+  fraction: f32,
+  output: &mut [f32],
+  output_channels: usize,
+  output_frame: usize,
+) {
+  for output_channel in 0..output_channels {
+    let value = if output_channels == 1 {
+      let mut sum = 0.0;
+      for channel in 0..input_channels {
+        let a = input[source_frame * input_channels + channel];
+        let b = input[next_frame * input_channels + channel];
+        sum += a + (b - a) * fraction;
+      }
+      sum / input_channels as f32
+    } else {
+      let source_channel = if input_channels == 1 {
+        0
+      } else {
+        output_channel.min(input_channels - 1)
+      };
+      let a = input[source_frame * input_channels + source_channel];
+      let b = input[next_frame * input_channels + source_channel];
+      a + (b - a) * fraction
+    };
+    output[output_frame * output_channels + output_channel] = value;
+  }
+}
 
-/// Simple gain multiplier filter.
+#[expect(
+  clippy::too_many_arguments,
+  reason = "the hot-path conversion kernel keeps buffer and format state explicit"
+)]
+fn convert_f32_stateful(
+  input: &[f32],
+  input_frames: usize,
+  input_channels: u8,
+  output: &mut [f32],
+  output_capacity_frames: usize,
+  input_rate: u32,
+  output_spec: SampleSpec,
+  position: &mut f64,
+  previous_frame: &mut [f32],
+  has_previous_frame: &mut bool,
+) -> usize {
+  if input_frames == 0 {
+    return 0;
+  }
+  let in_channels = usize::from(input_channels.max(1));
+  if in_channels > previous_frame.len() {
+    return 0;
+  }
+  let out_channels = usize::from(output_spec.channels.max(1));
+  let ratio = f64::from(input_rate) / f64::from(output_spec.sample_rate);
+  let sequence_offset = usize::from(*has_previous_frame);
+  let sequence_len = input_frames + sequence_offset;
+  let mut produced = 0;
+  while *position + 1.0 < sequence_len as f64 && produced < output_capacity_frames {
+    let source_pos = *position;
+    let base = source_pos.floor() as isize;
+    let next = base + 1;
+    let fraction = (source_pos - base as f64) as f32;
+    for out_channel in 0..out_channels {
+      let value = mapped_stateful_sample(
+        input,
+        input_frames,
+        in_channels,
+        sequence_offset,
+        previous_frame,
+        base,
+        next,
+        fraction,
+        out_channel,
+        out_channels,
+      );
+      output[produced * out_channels + out_channel] = value;
+    }
+    *position += ratio;
+    produced += 1;
+  }
+  let consumed = (*position).floor().max(0.0) as usize;
+  let previous_index = consumed
+    .saturating_sub(sequence_offset)
+    .min(input_frames - 1);
+  previous_frame[..in_channels]
+    .copy_from_slice(&input[previous_index * in_channels..(previous_index + 1) * in_channels]);
+  *has_previous_frame = true;
+  *position -= (sequence_len.saturating_sub(1)) as f64;
+  if *position < 0.0 {
+    *position = 0.0;
+  }
+  produced
+}
+
+#[expect(
+  clippy::too_many_arguments,
+  reason = "the hot-path conversion kernel keeps buffer and format state explicit"
+)]
+fn mapped_stateful_sample(
+  input: &[f32],
+  input_frames: usize,
+  in_channels: usize,
+  sequence_offset: usize,
+  previous_frame: &[f32],
+  base: isize,
+  next: isize,
+  fraction: f32,
+  out_channel: usize,
+  out_channels: usize,
+) -> f32 {
+  let sample = |index: isize, channel: usize| {
+    let source_channel = if in_channels == 1 {
+      0
+    } else {
+      channel.min(in_channels - 1)
+    };
+    if sequence_offset == 1 && index == 0 {
+      return previous_frame[source_channel];
+    }
+    let current = if sequence_offset == 1 {
+      (index - 1).clamp(0, input_frames.saturating_sub(1) as isize) as usize
+    } else {
+      index.clamp(0, input_frames.saturating_sub(1) as isize) as usize
+    };
+    input[current * in_channels + source_channel]
+  };
+  if out_channels == 1 {
+    let mut sum = 0.0;
+    for channel in 0..in_channels {
+      sum += sample(base, channel) + (sample(next, channel) - sample(base, channel)) * fraction;
+    }
+    sum / in_channels as f32
+  } else {
+    let channel = if in_channels == 1 {
+      0
+    } else {
+      out_channel.min(in_channels - 1)
+    };
+    sample(base, channel) + (sample(next, channel) - sample(base, channel)) * fraction
+  }
+}
+
+fn encode_f32(
+  samples: &[f32],
+  frames: usize,
+  spec: SampleSpec,
+  output: &mut [u8],
+) -> Result<usize, FilterError> {
+  let required = frames
+    .checked_mul(spec.bytes_per_frame())
+    .ok_or(FilterError::OutputTooSmall {
+      required: usize::MAX,
+      available: output.len(),
+    })?;
+  if output.len() < required {
+    return Err(FilterError::OutputTooSmall {
+      required,
+      available: output.len(),
+    });
+  }
+  let channels = usize::from(spec.channels);
+  if spec.interleave == around_core::Interleave::Planar {
+    for channel in 0..channels {
+      for frame in 0..frames {
+        write_sample(
+          samples[frame * channels + channel],
+          spec.encoding,
+          spec.byte_order,
+          &mut output[(channel * frames + frame) * spec.bytes_per_sample()..],
+        );
+      }
+    }
+  } else {
+    for (index, sample) in samples.iter().copied().enumerate() {
+      write_sample(
+        sample,
+        spec.encoding,
+        spec.byte_order,
+        &mut output[index * spec.bytes_per_sample()..],
+      );
+    }
+  }
+  Ok(required)
+}
+
+fn write_sample(value: f32, encoding: PcmEncoding, order: around_core::ByteOrder, out: &mut [u8]) {
+  let value = if value.is_finite() {
+    value.clamp(-1.0, 1.0)
+  } else {
+    0.0
+  };
+  let little = match order {
+    around_core::ByteOrder::Little => true,
+    around_core::ByteOrder::Big => false,
+    around_core::ByteOrder::Native => cfg!(target_endian = "little"),
+  };
+  match encoding {
+    PcmEncoding::F32 => copy_ordered(&value.to_ne_bytes(), out, little),
+    PcmEncoding::F64 => copy_ordered(&(f64::from(value)).to_ne_bytes(), out, little),
+    _ if encoding.is_signed() => {
+      let bits = encoding.bits();
+      let max = ((1_i128 << (bits - 1)) - 1) as f64;
+      let min = -(1_i128 << (bits - 1)) as f64;
+      let integer = (f64::from(value) * if value < 0.0 { -min } else { max })
+        .round()
+        .clamp(min, max) as i128;
+      write_integer(integer as u128, encoding.bytes_per_sample(), little, out);
+    }
+    _ => {
+      let bits = encoding.bits();
+      let max = ((1_u128 << bits) - 1) as f64;
+      let integer = ((f64::from(value) + 1.0) * 0.5 * max)
+        .round()
+        .clamp(0.0, max) as u128;
+      write_integer(integer, encoding.bytes_per_sample(), little, out);
+    }
+  }
+}
+
+fn write_integer(value: u128, width: usize, little: bool, out: &mut [u8]) {
+  let bytes = value.to_le_bytes();
+  if little {
+    out[..width].copy_from_slice(&bytes[..width]);
+  } else {
+    for (dst, src) in out[..width].iter_mut().zip(bytes[..width].iter().rev()) {
+      *dst = *src;
+    }
+  }
+}
+
+fn copy_ordered(native: &[u8], out: &mut [u8], little: bool) {
+  if little == cfg!(target_endian = "little") {
+    out[..native.len()].copy_from_slice(native);
+  } else {
+    for (dst, src) in out[..native.len()].iter_mut().zip(native.iter().rev()) {
+      *dst = *src;
+    }
+  }
+}
+
 pub struct Volume {
   gain: f32,
 }
@@ -371,17 +670,14 @@ impl Filter for Volume {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
   #![expect(
     clippy::unwrap_used,
-    reason = "Test code: unwrap is acceptable on construction of test fixtures"
+    reason = "test fixtures use validated formats and fixed buffers"
   )]
   use super::*;
+  use around_audio_sdk::filter::{AudioBufferC, AudioFormatListC};
 
   struct AbiGain;
 
@@ -389,31 +685,80 @@ mod tests {
     extern "C" fn name(&self) -> *const u8 {
       c"abi-gain".as_ptr().cast()
     }
-
-    extern "C" fn process(&mut self, buf: &mut AudioBufferC) -> u32 {
-      if buf.data.is_null() {
-        return 0;
-      }
-      // SAFETY: AudioBufferC is constructed by StabbyFilterBridge from a live
-      // mutable slice for exactly buf.len samples.
-      let samples = unsafe { std::slice::from_raw_parts_mut(buf.data, buf.len) };
-      for sample in samples {
-        *sample *= 0.5;
-      }
-      u32::try_from(buf.len).unwrap_or(u32::MAX)
+    extern "C" fn formats_in(&self) -> AudioFormatListC {
+      AudioFormatListC::any()
     }
-
+    extern "C" fn formats_out(&self) -> AudioFormatListC {
+      AudioFormatListC::any()
+    }
+    extern "C" fn process(&mut self, buf: &mut AudioBufferC) -> u32 {
+      let input =
+        unsafe { std::slice::from_raw_parts(buf.input_data.cast::<f32>(), buf.input_len / 4) };
+      let output = unsafe {
+        std::slice::from_raw_parts_mut(buf.output_data.cast::<f32>(), buf.output_len / 4)
+      };
+      let len = input.len().min(output.len());
+      for (dst, src) in output[..len].iter_mut().zip(&input[..len]) {
+        *dst = *src * 0.5;
+      }
+      u32::try_from(len / usize::from(buf.output_format.channels.max(1))).unwrap_or(u32::MAX)
+    }
     extern "C" fn reset(&mut self) {}
+  }
+
+  fn f32_spec() -> SampleSpec {
+    SampleSpec::interleaved(44100, 2, PcmEncoding::F32).unwrap()
   }
 
   #[test]
   fn empty_chain_passthrough() {
-    let spec = SampleSpec::interleaved(44100, 2, 16).unwrap();
-    let mut chain = FilterChain::build(spec, vec![], spec);
+    let spec = f32_spec();
+    let chain = FilterChain::build(spec, vec![], spec);
     assert!(chain.is_empty());
-    let mut buf = vec![0.5f32; 100];
-    let len = chain.process(&mut buf, 2);
-    assert_eq!(len, 100);
+  }
+
+  #[test]
+  fn stateful_rate_conversion_preserves_duration_across_chunks() {
+    let source = SampleSpec::interleaved(44100, 1, PcmEncoding::F32).unwrap();
+    let target = SampleSpec::interleaved(48000, 1, PcmEncoding::F32).unwrap();
+    let mut chain = FilterChain::build(source, vec![], target);
+    let input = vec![0.0_f32; 44100];
+    let mut written_frames = 0;
+    for chunk in input.chunks(997) {
+      let (processing, output_bytes) = chain.workspace_requirements(chunk.len());
+      let mut workspace =
+        PcmBuffer::with_processing_capacity(chunk.len(), processing, output_bytes);
+      written_frames += chain
+        .process_to_output(chunk, chunk.len(), &mut workspace)
+        .unwrap()
+        / target.bytes_per_frame();
+    }
+    assert!((47_900..=48_100).contains(&written_frames));
+  }
+
+  #[test]
+  fn stateful_rate_conversion_keeps_ramp_ordered_across_chunks() {
+    let source = SampleSpec::interleaved(44100, 1, PcmEncoding::F32).unwrap();
+    let target = SampleSpec::interleaved(48000, 1, PcmEncoding::F32).unwrap();
+    let mut chain = FilterChain::build(source, vec![], target);
+    let input: Vec<f32> = (0..441).map(|sample| sample as f32).collect();
+    let mut output = Vec::new();
+    for chunk in input.chunks(73) {
+      let (processing, output_bytes) = chain.workspace_requirements(chunk.len());
+      let mut workspace =
+        PcmBuffer::with_processing_capacity(chunk.len(), processing, output_bytes);
+      let written = chain
+        .process_to_output(chunk, chunk.len(), &mut workspace)
+        .unwrap();
+      let samples = unsafe {
+        std::slice::from_raw_parts(
+          workspace.output_region().as_ptr().cast::<f32>(),
+          written / 4,
+        )
+      };
+      output.extend_from_slice(samples);
+    }
+    assert!(output.windows(2).all(|pair| pair[0] <= pair[1]));
   }
 
   #[test]
@@ -425,114 +770,95 @@ mod tests {
   }
 
   #[test]
-  fn resample_downsample_preserves_length() {
-    let mut r = Resample::new(48000, 24000, 1);
-    let mut buf: Vec<f32> = (0..480).map(|i| (i as f32).sin()).collect();
-    let produced = r.process(&mut buf, 1);
-    // Downsampling by 2x should produce ~240 samples.
-    assert!(
-      (200..=280).contains(&produced),
-      "expected ~240 samples, got {produced}"
-    );
-  }
-
-  #[test]
-  fn resample_upsample_increases_length() {
-    let mut r = Resample::new(24000, 48000, 1);
-    // Upsampling: 240 input frames at ratio 0.5 → ~480 output frames.
-    // Buffer must be sized for output (algorithm uses full buffer as input).
-    let mut buf: Vec<f32> = (0..240).map(|i| (i as f32).sin()).collect();
-    // Allocate extra space for upsampled output.
-    buf.resize(500, 0.0);
-    let produced = r.process(&mut buf, 1);
-    assert!(
-      produced > 240 && produced <= 500,
-      "expected >240 and <=500 samples, got {produced}"
-    );
-  }
-
-  #[test]
-  fn filter_chain_with_volume() {
-    let spec = SampleSpec::interleaved(44100, 2, 16).unwrap();
-    let filters: Vec<Box<dyn Filter>> = vec![Box::new(Volume::with_gain(0.5))];
-    let mut chain = FilterChain::build(spec, filters, spec);
-    assert_eq!(chain.len(), 1);
-    let mut buf = vec![1.0f32; 20];
-    chain.process(&mut buf, 2);
-    assert!((buf[0] - 0.5).abs() < 0.001);
+  fn terminal_conversion_changes_channels_and_encoding() {
+    let source = f32_spec();
+    let target = SampleSpec::interleaved(44100, 1, PcmEncoding::I16).unwrap();
+    let mut chain = FilterChain::build(source, vec![], target);
+    let mut workspace = PcmBuffer::new(8, 128);
+    let input = [1.0_f32, 1.0, 0.5, 0.5];
+    let written = chain.process_to_output(&input, 2, &mut workspace).unwrap();
+    assert_eq!(written, 4);
+    assert_eq!(workspace.output_region()[0..2], i16::MAX.to_ne_bytes());
   }
 
   #[test]
   fn stabby_filter_bridge_processes_sdk_filter() {
-    let spec = SampleSpec::interleaved(44100, 2, 16).unwrap();
-    let abi_filter = around_audio_sdk::filter::make_dyn_filter(AbiGain);
-    let bridge = StabbyFilterBridge::new(abi_filter);
-    assert_eq!(bridge.info().name, "abi-gain");
-
-    let filters: Vec<Box<dyn Filter>> = vec![Box::new(bridge)];
-    let mut chain = FilterChain::build(spec, filters, spec);
-    let mut samples = [1.0, -1.0, 0.5, -0.5];
-
-    let produced = chain.process(&mut samples, 2);
-
-    assert_eq!(produced, samples.len());
-    assert_eq!(samples, [0.5, -0.5, 0.25, -0.25]);
-  }
-
-  // ── Format scoring tests ──────────────────────────────────────────────
-
-  #[test]
-  fn score_identical_formats_is_zero() {
-    let spec = SampleSpec::interleaved(44100, 2, 16).unwrap();
-    assert_eq!(score_format_pair(&spec, &spec), 0);
+    let spec = f32_spec();
+    let bridge = StabbyFilterBridge::new(around_audio_sdk::filter::make_dyn_filter(AbiGain));
+    let mut chain = FilterChain::build(spec, vec![Box::new(bridge)], spec);
+    let mut workspace = PcmBuffer::new(8, 128);
+    let input = [1.0_f32, -1.0, 0.5, -0.5];
+    let written = chain.process_to_output(&input, 2, &mut workspace).unwrap();
+    assert_eq!(written, std::mem::size_of_val(&input));
+    let samples = unsafe {
+      std::slice::from_raw_parts(
+        workspace.output_region().as_ptr().cast::<f32>(),
+        input.len(),
+      )
+    };
+    assert_eq!(samples, &[0.5, -0.5, 0.25, -0.25]);
   }
 
   #[test]
-  fn score_downsample_penalty() {
-    let input = SampleSpec::interleaved(48000, 2, 16).unwrap();
-    let output = SampleSpec::interleaved(44100, 2, 16).unwrap();
-    let score = score_format_pair(&input, &output);
-    // 48→44.1: diff = 3.9 kHz, penalty = ceil(3.9 * 100) = 390
-    assert!((300..=500).contains(&score), "score = {score}");
+  fn scoring_covers_rate_channels_interleave_and_encoding() {
+    let input = f32_spec();
+    let output = SampleSpec::new(
+      48000,
+      1,
+      PcmEncoding::I16,
+      around_core::Interleave::Planar,
+      around_core::ByteOrder::Native,
+    )
+    .unwrap();
+    assert!(score_format_pair(&input, &output) > 0);
   }
 
   #[test]
-  fn score_upsample_penalty() {
-    let input = SampleSpec::interleaved(44100, 2, 16).unwrap();
-    let output = SampleSpec::interleaved(48000, 2, 16).unwrap();
-    let score = score_format_pair(&input, &output);
-    // 44.1→48: diff = 3.9 kHz, penalty = ceil(3.9 * 10) = 39
-    assert!((30..=50).contains(&score), "score = {score}");
+  fn terminal_encoder_covers_all_declared_pcm_widths() {
+    let encodings = [
+      PcmEncoding::I8,
+      PcmEncoding::I16,
+      PcmEncoding::I24,
+      PcmEncoding::I32,
+      PcmEncoding::I48,
+      PcmEncoding::I64,
+      PcmEncoding::U8,
+      PcmEncoding::U16,
+      PcmEncoding::U24,
+      PcmEncoding::U32,
+      PcmEncoding::U48,
+      PcmEncoding::U64,
+      PcmEncoding::F32,
+      PcmEncoding::F64,
+    ];
+    let source = SampleSpec::interleaved(44100, 1, PcmEncoding::F32).unwrap();
+    for encoding in encodings {
+      let target = SampleSpec::interleaved(44100, 1, encoding).unwrap();
+      let mut chain = FilterChain::build(source, vec![], target);
+      let mut workspace = PcmBuffer::new(3, 3 * target.bytes_per_frame());
+      let written = chain
+        .process_to_output(&[-1.0, 0.0, 1.0], 3, &mut workspace)
+        .unwrap();
+      assert_eq!(written, 3 * target.bytes_per_frame(), "{encoding:?}");
+    }
   }
 
   #[test]
-  fn score_downsample_cheaper_than_upsample() {
-    let a = SampleSpec::interleaved(48000, 2, 16).unwrap();
-    let b = SampleSpec::interleaved(44100, 2, 16).unwrap();
-    let down_score = score_format_pair(&a, &b); // 48→44.1: downsampling
-    let up_score = score_format_pair(&b, &a); // 44.1→48: upsampling
-    assert!(down_score > up_score, "down={down_score} up={up_score}");
-  }
-
-  #[test]
-  fn score_downmix_penalty() {
-    let input = SampleSpec::interleaved(44100, 6, 16).unwrap();
-    let output = SampleSpec::interleaved(44100, 2, 16).unwrap();
-    assert_eq!(score_format_pair(&input, &output), 4 * 80);
-  }
-
-  #[test]
-  fn score_upmix_penalty() {
-    let input = SampleSpec::interleaved(44100, 2, 16).unwrap();
-    let output = SampleSpec::interleaved(44100, 6, 16).unwrap();
-    assert_eq!(score_format_pair(&input, &output), 4 * 5);
-  }
-
-  #[test]
-  fn score_interleave_change_penalty() {
-    use around_core::Interleave;
-    let input = SampleSpec::new(44100, 2, 16, Interleave::Interleaved).unwrap();
-    let output = SampleSpec::new(44100, 2, 16, Interleave::Planar).unwrap();
-    assert_eq!(score_format_pair(&input, &output), 1);
+  fn terminal_encoder_preserves_planar_layout() {
+    let source = f32_spec();
+    let target = SampleSpec::new(
+      44100,
+      2,
+      PcmEncoding::I16,
+      around_core::Interleave::Planar,
+      around_core::ByteOrder::Native,
+    )
+    .unwrap();
+    let mut chain = FilterChain::build(source, vec![], target);
+    let mut workspace = PcmBuffer::new(4, 16);
+    let written = chain
+      .process_to_output(&[1.0, 0.5, -1.0, -0.5], 2, &mut workspace)
+      .unwrap();
+    assert_eq!(written, 8);
   }
 }

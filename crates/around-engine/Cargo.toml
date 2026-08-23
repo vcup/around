@@ -36,7 +36,6 @@ prost-build = { workspace = true, optional = true }
 [dev-dependencies]
 around-source-file = { workspace = true }
 around-codec-test-pcm = { workspace = true }
-around-core = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = ["protobuf-ipc", "json-ipc", "async-decode"]

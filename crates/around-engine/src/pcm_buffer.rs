@@ -1,47 +1,51 @@
-//! PcmBuffer — pre-allocated region layout for zero-allocation decode pipeline.
-//!
-//! The buffer is divided into two contiguous regions:
-//! - Decode region: where the codec writes raw PCM
-//! - Resample region: where resampling/filtering operates
-//!
-//! After construction, no heap allocations occur during use.
+//! PcmBuffer — pre-allocated workspace for decode and terminal conversion.
 
 pub struct PcmBuffer {
-  buf: Vec<f32>,
-  /// End index of the decode region (exclusive).
-  decoder_max: usize,
-  /// Start index of the resample region.
-  resample_offset: usize,
+  decode: Vec<f32>,
+  filter: Vec<f32>,
+  scratch: Vec<f32>,
+  output: Vec<u8>,
 }
 
 impl PcmBuffer {
-  /// Create a new buffer with the given maximum sample counts.
-  /// `decoder_max_samples` bounds the decode output per iteration.
-  /// `resample_max_samples` bounds the resample/filter output.
-  pub fn new(decoder_max_samples: usize, resample_max_samples: usize) -> Self {
-    let Some(total) = decoder_max_samples.checked_add(resample_max_samples) else {
-      panic!("PcmBuffer region sizes overflow usize");
-    };
+  /// Create a workspace. The f32 processing regions are sized from the larger
+  /// of the decoded sample count and the byte output capacity.
+  pub fn new(decoder_max_samples: usize, output_max_bytes: usize) -> Self {
+    let processing = decoder_max_samples.max(output_max_bytes / std::mem::size_of::<f32>());
+    Self::with_processing_capacity(decoder_max_samples, processing, output_max_bytes)
+  }
+
+  pub fn with_processing_capacity(
+    decoder_max_samples: usize,
+    processing_max_samples: usize,
+    output_max_bytes: usize,
+  ) -> Self {
     Self {
-      buf: vec![0.0f32; total],
-      decoder_max: decoder_max_samples,
-      resample_offset: decoder_max_samples,
+      decode: vec![0.0; decoder_max_samples],
+      filter: vec![0.0; processing_max_samples],
+      scratch: vec![0.0; processing_max_samples],
+      output: vec![0; output_max_bytes],
     }
   }
 
-  /// Mutable slice for the decode region: `[0..decoder_max]`.
   pub fn decode_region(&mut self) -> &mut [f32] {
-    &mut self.buf[..self.decoder_max]
+    &mut self.decode
   }
 
-  /// Mutable slice for the resample region: `[decoder_max..]`.
-  pub fn resample_region(&mut self) -> &mut [f32] {
-    &mut self.buf[self.resample_offset..]
+  pub fn output_region(&mut self) -> &mut [u8] {
+    &mut self.output
   }
 
-  /// The full buffer as a mutable slice.
-  pub fn as_mut_slice(&mut self) -> &mut [f32] {
-    &mut self.buf
+  pub fn processing_regions(&mut self) -> (&mut [f32], &mut [f32], &mut [u8]) {
+    (&mut self.filter, &mut self.scratch, &mut self.output)
+  }
+
+  pub fn output_capacity(&self) -> usize {
+    self.output.len()
+  }
+
+  pub fn processing_capacity(&self) -> usize {
+    self.filter.len()
   }
 }
 
@@ -56,18 +60,20 @@ mod tests {
   use super::*;
 
   #[test]
-  fn regions_dont_overlap() {
+  fn regions_are_preallocated_and_separate() {
     let mut buf = PcmBuffer::new(1024, 512);
-    assert_eq!(buf.buf.len(), 1024 + 512);
-    // Verify decode region size.
     assert_eq!(buf.decode_region().len(), 1024);
-    // Verify resample region size.
-    assert_eq!(buf.resample_region().len(), 512);
+    assert_eq!(buf.processing_capacity(), 1024);
+    assert_eq!(buf.output_region().len(), 512);
+    let (filter, scratch, output) = buf.processing_regions();
+    assert_eq!(filter.len(), 1024);
+    assert_eq!(scratch.len(), 1024);
+    assert_eq!(output.len(), 512);
   }
 
   #[test]
-  fn sizes_match_input() {
-    let buf = PcmBuffer::new(4096, 2048);
-    assert_eq!(buf.buf.len(), 4096 + 2048);
+  fn explicit_processing_capacity_supports_rate_expansion() {
+    let buf = PcmBuffer::with_processing_capacity(1024, 4096, 8192);
+    assert_eq!(buf.processing_capacity(), 4096);
   }
 }

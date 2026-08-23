@@ -331,8 +331,8 @@ fn cmd_play(
       }
       tracing::info!(
         "playback complete ({} Hz, {} channels)",
-        prepared.output_format.sample_rate,
-        prepared.output_format.channels
+        prepared.source_format.sample_rate,
+        prepared.source_format.channels
       );
     }
     Err(_panic) => {
