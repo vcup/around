@@ -15,7 +15,8 @@ pub mod filter;
 // because codec also exports them with the same names. Use `around_audio_sdk::filter::NAME`
 // directly, or import with `use around_audio_sdk::filter::{self}`.
 pub use filter::{
-  init_filter, make_dyn_filter, AudioBufferC, DynFilterRef, Filter, FilterDyn, FilterRegister,
+  init_filter, make_dyn_filter, AudioBufferC, AudioFormatC, AudioFormatListC, DynFilterRef, Filter,
+  FilterDyn, FilterRegister,
 };
 // -- Primary re-exports (codec) --
 pub use codec::{
