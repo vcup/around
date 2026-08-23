@@ -258,6 +258,7 @@ fn stream_status_serialization() {
     position_ms: 5000,
     seekable: true,
     device_lost: false,
+    output_spec: around_core::SampleSpec::interleaved(48000, 2, around_core::PcmEncoding::F32).ok(),
     content_type: Some("audio/wav".into()),
     track: Some(TrackInfo {
       id: 1,
@@ -306,6 +307,7 @@ fn response_with_streams_field() {
     position_ms: 5000,
     seekable: true,
     device_lost: false,
+    output_spec: None,
     content_type: Some("audio/flac".into()),
     track: None,
   }]);

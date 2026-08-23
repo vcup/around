@@ -148,7 +148,6 @@ pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> Ipc
 
   match stream_id {
     Some(sid) => {
-      // Single-stream status
       if let Some(ss) = engine.stream_state(sid) {
         resp.state = Some(ss.status());
         resp.position_ms = Some(ss.position_ms.load(std::sync::atomic::Ordering::SeqCst));
@@ -157,9 +156,9 @@ pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> Ipc
         let path = engine.stream_source_path(sid);
         let codec = engine.stream_codec_name(sid);
         let duration = engine.stream_duration_ms(sid);
-        let s = engine.stream_seekable(sid);
-        resp.seekable = s;
+        resp.seekable = engine.stream_seekable(sid);
         resp.content_type = engine.stream_content_type(sid);
+        resp.output_spec = engine.stream_output_spec(sid);
         if let Some(p) = path {
           resp.track = Some(TrackInfo {
             id: sid,
@@ -173,7 +172,6 @@ pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> Ipc
       }
     }
     None => {
-      // All-streams status
       let ids = engine.stream_ids();
       let mut streams: Vec<StreamStatus> = Vec::new();
       for &id in &ids {
@@ -188,6 +186,7 @@ pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> Ipc
             position_ms: ss.position_ms.load(std::sync::atomic::Ordering::SeqCst),
             seekable,
             device_lost: ss.device_lost.load(std::sync::atomic::Ordering::SeqCst),
+            output_spec: engine.stream_output_spec(id),
             track: path.map(|p| TrackInfo {
               id,
               path: p,
@@ -200,7 +199,6 @@ pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> Ipc
       }
       resp.streams = Some(streams);
 
-      // Backward compat: populate legacy flat fields from sole stream.
       if let Some(sole) = engine.sole_stream_id() {
         if let Some(ss) = engine.stream_state(sole) {
           resp.state = Some(ss.status());
@@ -209,6 +207,7 @@ pub(crate) fn handle_status(engine: &Arc<Engine>, stream_id: Option<u64>) -> Ipc
           resp.device_lost = Some(ss.device_lost.load(std::sync::atomic::Ordering::SeqCst));
           resp.seekable = engine.stream_seekable(sole);
           resp.content_type = engine.stream_content_type(sole);
+          resp.output_spec = engine.stream_output_spec(sole);
           let path = engine.stream_source_path(sole);
           let codec = engine.stream_codec_name(sole);
           let duration = engine.stream_duration_ms(sole);

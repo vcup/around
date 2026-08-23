@@ -84,9 +84,11 @@ metadata; distinct from the status enum).
 
 ## SampleSpec
 
-The combination of sample rate, channel layout, and bit depth that
-describes a PCM audio stream. Represented as a struct with `sample_rate:
-u32`, `channels: u8`, `bit_depth: u8`.
+The complete PCM format used at a Stream/FilterChain Seam: sample rate,
+channel count, `PcmEncoding`, `ByteOrder`, and interleave mode. `SampleSpec`
+is the sole format value used by Codec output, Filter declarations,
+OutputPlanner, and OutputBinding validation.
+
 _Avoid_: Audio format, stream config — these are broader concepts.
 
 ## ContentType
@@ -232,16 +234,46 @@ Engine runs independently of any UI — UIs connect to and disconnect from
 it without interrupting playback.
 _Avoid_: Player, daemon, server, around process.
 
+## OutputDevice
+
+An output target known to the Engine, with a stable identity, category,
+priority, and supported native `SampleSpec` modes. An OutputDevice describes
+capabilities, not an active CPAL stream; the active Stream attachment is an
+OutputBinding.
+
+_Avoid_: AudioSink, CpalSink, output config — these describe an Adapter or
+configuration, not the OutputDevice concept.
+
+## OutputBinding
+
+The active attachment between one Stream and one OutputDevice mode. An OutputBinding owns the output stream, callback lifetime, and transport buffer for one binding. It accepts only PCM blocks whose `SampleSpec` exactly matches the bound native mode; it never resamples, changes channels, changes interleave, or changes encoding.
+
+_Avoid_: AudioSink — OutputBinding is the device attachment and its lifecycle.
+
+## OutputPreference
+
+An ordered Stream preference for selecting an OutputDevice and native mode. A preference may select an exact device, name, category, or any device, and may request a mode or recovery policy. Preference order and device priority are evaluated before conversion loss; the original list is retained across fallback migration.
+
+## OutputPlanner
+
+A pure Engine Module that validates a DeviceSnapshot and evaluates OutputPreference values against supported native modes. It returns one immutable OutputPlan containing the exact target `SampleSpec`, preference rank, device priority, conversion loss, and recovery policy. It has no CPAL handles, clocks, locks, or callbacks.
+
+## OutputSession
+
+The Engine Module that coordinates OutputDevice discovery, OutputPlanner, FilterChain construction, OutputBinding ownership, backpressure, and device-loss migration for one Stream. It preserves ordered OutputPreference values and rebuilds the FilterChain and OutputBinding when the selected native mode changes.
+
+_Avoid_: output manager — OutputSession is the Stream’s output lifecycle, not a global device registry.
+
 ## Stream
 
 A single playback context within the Engine: one Source, one decode loop,
-one optional FilterChain, and one output ring buffer. The Engine manages
-0..N concurrent Streams. Each Stream has a unique `StreamId`, an
-optional user-assigned alias, and an `output_spec` — the target
-format for the final resampler, matched to the output device's native
-format and updated on device reconnect. The decode loop is async,
-feeding samples into a lock-free ring buffer consumed by the output
-layer.
+one FilterChain, and one OutputSession owning an OutputBinding. The Engine
+manages 0..N concurrent Streams. Each Stream has a unique `StreamId`, an
+optional user-assigned alias, and an `output_spec` resolved when the
+OutputSession binds a native OutputDevice mode. The decode loop may run on
+the synchronous thread or async runtime; codec I/O and terminal conversion
+retain their explicit scheduling contracts.
+
 _Avoid_: Track, playback session, player instance.
 
 ## StreamId
@@ -255,67 +287,65 @@ _Avoid_: Track ID, handle.
 
 ## FilterChain
 
-An ordered list of audio processing filters applied within the decode
-loop. Format negotiation at construction time auto‑inserts Resample
-and de/interleave filters at boundaries where formats diverge. The
-chain's final output format is guaranteed to match `output_spec`.
-May be empty (plain playback); then a single Resample filter is
-auto‑inserted if decode format ≠ output device format.
+An ordered list of user Filters applied inside one Stream decode loop, followed
+by terminal conversion to the exact `output_spec`. The FilterChain owns sample
+rate conversion, channel mapping, interleave conversion, byte order, and PCM
+encoding. It reuses the Stream's PcmBuffer; it does not hand conversion to an
+OutputBinding.
+
 _Avoid_: Effect chain, audio processing pipeline.
 
 ## SampleSpec
 
-Describes an uncompressed audio format: sample rate (Hz), channel count,
-and interleave mode (interleaved or planar). Used by codec output,
-filter `formats_in`/`formats_out` declarations, and `output_spec` on a
-Stream. The format negotiation engine uses `SampleSpec` lists to find
-globally optimal format assignments across the FilterChain.
+Describes a complete uncompressed PCM format: sample rate (Hz), channel
+count, `PcmEncoding`, `ByteOrder`, and interleave mode (interleaved or
+planar). Used by Codec output, Filter `formats_in`/`formats_out`
+declarations, and `output_spec` on a Stream. The format negotiation Module
+uses `SampleSpec` values to find globally optimal assignments across the
+FilterChain and to validate OutputBinding writes.
+
 _Avoid_: Audio format, output config.
 
 ## AudioBuffer
 
-The C‑ABI processing unit passed to filter `process()` functions.
-A flat `#[repr(C)]` struct with interleave‑mode metadata.
-FFmpeg: `AVFrame.data[]` maps to `AudioBufferC.channels`.
+The in-process byte view passed from FilterChain to OutputBinding. It carries
+an exact `SampleSpec`, frame count, and frame-aligned bytes. The format and
+storage must agree; OutputBinding rejects a mismatched AudioBuffer.
 
 ## PcmBuffer
 
-A pre‑allocated `Vec<f32>` used as the in‑place processing buffer
-inside the decode loop. Split into two regions determined during
-FilterChain negotiation: `[0..decoder_max]` for decode output and
-in‑place filter processing, `[decoder_max..capacity-1]` for resample
-output. Reused every iteration — zero allocation after initialisation.
+A pre-allocated workspace used inside the decode loop. It contains a decode
+region, two f32 processing regions, and an encoded byte region sized from the
+selected output_spec. The workspace is reused every iteration and is rebuilt
+only when an OutputSession changes the native mode.
 
 ## PlanarBuffer
 
-A multi‑channel audio buffer where each channel occupies a contiguous
-memory region (`Vec<Vec<f32>>`). All channels share the same heap
-allocation. The Rust‑side representation of `AudioBufferC`.
+A multi-channel audio buffer where each channel occupies a contiguous region
+within one shared allocation. It is a Rust-side helper for planar Filter
+processing; terminal conversion currently emits planar bytes but Codec output
+is normalized to interleaved f32.
 
-## Resampler
+## TerminalConversion
 
-A Filter that converts sample rate, channel count, or both. Equal
-status with all other filters — not a special pipeline stage.
-Auto‑inserted by the chain builder at boundaries where adjacent
-filters have no common format, and at the chain's end when the
-final filter's output does not match `output_spec`.
-_Avoid_: SRC, sample rate converter, upsampler.
+The format-conversion stage owned by FilterChain after user Filters. It
+converts normalized interleaved f32 into the selected OutputDevice
+`SampleSpec`, including sample rate, channel count, interleave, byte order, and
+PCM encoding. It uses stateful linear interpolation and pre-allocated
+PcmBuffer regions; it is not an OutputBinding responsibility.
 
-## Deinterleave / Interleave
-
-Filters auto‑inserted at chain boundaries where the interleave mode
-changes. Deinterleave: interleaved → planar. Interleave: planar →
-interleaved. Zero‑overhead when absent (all filters share the same
-interleave mode).
+_Avoid_: device resampler, sink conversion.
 
 ## Filter
 
-A single audio‑processing unit (EQ, compressor, resampler, volume,
-deinterleave). Implements the `Filter` Slot: `info()` returns accepted
-input/output `SampleSpec` lists, `open(config)` creates an instance,
-`process(buf)` applies processing. Registered into a `FilterRegister`.
-Stabby ABI‑stable dispatch. Configuration via FFmpeg‑style string
-(optionally KDL‑parsed).
+A single audio-processing unit (EQ, compressor, volume, or another DSP
+operation). The format-aware Filter Slot declares `formats_in` and
+`formats_out`, receives an `AudioBufferC` with explicit input/output
+`AudioFormatC`, and returns produced frames. The Engine owns both byte buffers
+for the call; a Filter may not retain them. Registered dynamic Filters remain
+an explicit follow-up integration, while built-in Filters are held directly by
+FilterChain.
+
 _Avoid_: Plugin, DSP unit, effect.
 
 ## Router

@@ -59,6 +59,15 @@ message StreamStatus {
   bool device_lost = 5;
   optional TrackInfo track = 6;
   optional string content_type = 7;
+  optional SampleSpec output_spec = 8;
+}
+
+message SampleSpec {
+  uint32 sample_rate = 1;
+  uint32 channels = 2;
+  string encoding = 3;
+  string interleave = 4;
+  string byte_order = 5;
 }
 
 message IpcResponse {
@@ -76,6 +85,7 @@ message IpcResponse {
   optional bool seekable = 12;
   repeated StreamStatus streams = 13;
   optional string content_type = 14;
+  optional SampleSpec output_spec = 15;
 }
 
 message TrackInfo {

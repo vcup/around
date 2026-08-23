@@ -9,7 +9,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use super::codec::IpcCodec;
 use super::proto;
 use crate::ipc::types::{self, ErrorCode, IpcResponse, ResponseStatus};
-
 // ---------------------------------------------------------------------------
 // Conversion helpers — map between proto-generated types and hand-written types
 // ---------------------------------------------------------------------------
@@ -19,16 +18,24 @@ fn proto_command_to_ipc(c: proto::ipc_command::Command) -> std::io::Result<types
   match c {
     Command::Play(p) => Ok(types::IpcCommand::Play {
       path: p.path,
-      stream_id: None,
+      stream_id: p.stream_id,
     }),
-    Command::Pause(_) => Ok(types::IpcCommand::Pause { stream_id: None }),
-    Command::Resume(_) => Ok(types::IpcCommand::Resume { stream_id: None }),
+    Command::Pause(p) => Ok(types::IpcCommand::Pause {
+      stream_id: p.stream_id,
+    }),
+    Command::Resume(p) => Ok(types::IpcCommand::Resume {
+      stream_id: p.stream_id,
+    }),
     Command::Seek(s) => Ok(types::IpcCommand::Seek {
       position_ms: s.position_ms,
-      stream_id: None,
+      stream_id: s.stream_id,
     }),
-    Command::Stop(_) => Ok(types::IpcCommand::Stop { stream_id: None }),
-    Command::Status(_) => Ok(types::IpcCommand::Status { stream_id: None }),
+    Command::Stop(p) => Ok(types::IpcCommand::Stop {
+      stream_id: p.stream_id,
+    }),
+    Command::Status(p) => Ok(types::IpcCommand::Status {
+      stream_id: p.stream_id,
+    }),
     Command::ListCodecs(_) => Ok(types::IpcCommand::ListCodecs),
     Command::LoadCodec(d) => Ok(types::IpcCommand::LoadCodec { path: d.path }),
     Command::LoadCodecBytes(d) => Ok(types::IpcCommand::LoadCodecBytes { data: d.data }),
@@ -82,6 +89,15 @@ fn error_code_to_proto(c: ErrorCode) -> String {
     ErrorCode::CodecLoadFailed => "CODEC_LOAD_FAILED".into(),
   }
 }
+fn sample_spec_to_proto(spec: &around_core::SampleSpec) -> proto::SampleSpec {
+  proto::SampleSpec {
+    sample_rate: spec.sample_rate,
+    channels: u32::from(spec.channels),
+    encoding: format!("{:?}", spec.encoding),
+    interleave: format!("{:?}", spec.interleave),
+    byte_order: format!("{:?}", spec.byte_order),
+  }
+}
 
 fn ipc_response_to_proto(resp: &IpcResponse) -> proto::IpcResponse {
   proto::IpcResponse {
@@ -116,6 +132,7 @@ fn ipc_response_to_proto(resp: &IpcResponse) -> proto::IpcResponse {
       .unwrap_or_default(),
     device_lost: resp.device_lost,
     removed_files: resp.removed_files.clone().unwrap_or_default(),
+    output_spec: resp.output_spec.as_ref().map(sample_spec_to_proto),
     stream_id: resp.stream_id,
     seekable: resp.seekable,
     content_type: resp.content_type.clone(),
@@ -130,6 +147,7 @@ fn ipc_response_to_proto(resp: &IpcResponse) -> proto::IpcResponse {
             position_ms: s.position_ms,
             seekable: s.seekable,
             device_lost: s.device_lost,
+            output_spec: s.output_spec.as_ref().map(sample_spec_to_proto),
             track: s.track.as_ref().map(|t| proto::TrackInfo {
               id: t.id,
               path: t.path.clone(),
@@ -264,18 +282,25 @@ impl IpcCodec for ProtoCodec {
 
 #[cfg(test)]
 mod tests {
+  #![expect(
+    clippy::unwrap_used,
+    reason = "the fixed test SampleSpec is valid by construction"
+  )]
   use super::*;
-
   #[test]
-  fn response_mapping_preserves_content_type() {
+  fn response_mapping_preserves_content_type_and_output_specs() {
+    let spec =
+      around_core::SampleSpec::interleaved(48_000, 2, around_core::PcmEncoding::F32).unwrap();
     let mut response = IpcResponse::ok();
     response.content_type = Some("audio/wav".into());
+    response.output_spec = Some(spec);
     response.streams = Some(vec![types::StreamStatus {
       stream_id: 7,
       status: types::PlaybackStatus::Playing,
       position_ms: 12,
       seekable: true,
       device_lost: false,
+      output_spec: Some(spec),
       track: None,
       content_type: Some("audio/flac".into()),
     }]);
@@ -283,10 +308,22 @@ mod tests {
     let mapped = ipc_response_to_proto(&response);
 
     assert_eq!(mapped.content_type.as_deref(), Some("audio/wav"));
+    assert_eq!(
+      mapped.output_spec.as_ref().map(|s| s.sample_rate),
+      Some(48_000)
+    );
+    assert_eq!(mapped.output_spec.as_ref().map(|s| s.channels), Some(2));
     assert_eq!(mapped.streams.len(), 1);
     assert_eq!(
       mapped.streams[0].content_type.as_deref(),
       Some("audio/flac")
+    );
+    assert_eq!(
+      mapped.streams[0]
+        .output_spec
+        .as_ref()
+        .map(|s| s.encoding.as_str()),
+      Some("F32")
     );
   }
 }

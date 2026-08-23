@@ -39,10 +39,9 @@
 
 **⚠️ CRITICAL**: No crate may reference these types until this phase is complete
 
-- [X] T011 [P] Implement BitDepth, SampleRate, ChannelLayout type aliases with well-known constants in crates/around-core/src/types.rs
+- [X] T011 [P] Implement `SampleRate`, `ChannelLayout`, `PcmEncoding`, and `ByteOrder` types with well-known rate/channel constants in `crates/around-core/src/types.rs`.
 - [X] T012 [P] Implement ContentType newtype with well-known string constants (MUSIC, PODCAST, AUDIOBOOK, RADIO, LIVE_STREAM, AMBIENT) in crates/around-core/src/types.rs
-- [X] T013 [P] Implement AudioFormat struct (container, codec, mime_type, sample_spec, bitrate) in crates/around-core/src/types.rs
-- [X] T014 [P] Implement SampleSpec struct (sample_rate, channels, bit_depth) with validation (rate>0, channels 1..=32) in crates/around-core/src/types.rs
+- [X] T014 [P] Implement complete `SampleSpec` (`sample_rate`, `channels`, `PcmEncoding`, `ByteOrder`, `interleave`) with validation in `crates/around-core/src/types.rs`.
 - [X] T015 [P] Implement ExtensionSource type alias with constants (SOURCE_BUILTIN through SOURCE_DISCOVERED) in crates/around-core/src/types.rs
 - [X] T016 [P] Implement PlaybackStatus type alias with constants (PLAYING=0, PAUSED=1, STOPPED=2, BUFFERING=3) in crates/around-core/src/state.rs
 - [X] T017 [P] Implement Metadata struct (title, artist, album, duration, genre) in crates/around-core/src/metadata.rs

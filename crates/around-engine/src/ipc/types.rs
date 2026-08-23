@@ -1,6 +1,7 @@
 //! IPC types: shared between pipeline, IPC server, and CLI. Always compiled.
 
 pub use around_core::PlaybackStatus;
+use around_core::SampleSpec;
 use serde::{Deserialize, Serialize};
 
 /// Response status — binary outcome.
@@ -30,6 +31,8 @@ pub struct StreamStatus {
   pub position_ms: u64,
   pub seekable: bool,
   pub device_lost: bool,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub output_spec: Option<SampleSpec>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub track: Option<TrackInfo>,
   #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,6 +154,8 @@ pub struct IpcResponse {
   #[serde(skip_serializing_if = "Option::is_none")]
   pub seekable: Option<bool>,
   #[serde(skip_serializing_if = "Option::is_none")]
+  pub output_spec: Option<SampleSpec>,
+  #[serde(skip_serializing_if = "Option::is_none")]
   pub streams: Option<Vec<StreamStatus>>,
 }
 
@@ -170,6 +175,7 @@ impl IpcResponse {
       stream_id: None,
       content_type: None,
       seekable: None,
+      output_spec: None,
       streams: None,
     }
   }
@@ -189,6 +195,7 @@ impl IpcResponse {
       stream_id: None,
       content_type: None,
       seekable: None,
+      output_spec: None,
       streams: None,
     }
   }
