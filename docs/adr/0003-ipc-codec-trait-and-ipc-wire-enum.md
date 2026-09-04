@@ -1,9 +1,7 @@
 # ADR 0003: IpcCodec Trait + IpcWire Enum over `Box<dyn IpcCodec>`
 
-The IPC subsystem uses a concrete `IpcWire` enum to dispatch between codec
-implementations rather than a `Box<dyn IpcCodec>` trait object. This preserves
-`Send + Sync` for tokio task spawning while maintaining a clean codec
-abstraction.
+The IPC subsystem uses `IpcWire`, a concrete enum, to dispatch between codecs.
+This keeps tokio tasks `Send + Sync` without heap allocation or vtable dispatch.
 
 ## Status
 

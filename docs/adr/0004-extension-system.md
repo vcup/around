@@ -1,19 +1,13 @@
 # ADR 0004: Unified Extension System
 
-Every `.so` exporting `AROUND_META` is an Extension.  There is no
-architectural distinction between "SDK," "plugin," "singleton," or
-"Slot implementation" — they differ only in which **optional export
-symbols** they provide.  `around-extensions` provides the host‑agnostic
-loading framework: discovery, dependency resolution, lifecycle
-management, and progressive‑trust crash isolation.  Every extension
-trait uses `stabby` for ABI‑stable dispatch — a single indirect jump
-per call.
+Every `.so` exporting `AROUND_META` is an Extension. Exported symbols define
+its capabilities; the host framework handles discovery, dependencies,
+lifecycle, and progressive-trust isolation. Extension traits use `stabby` for
+ABI-stable dispatch.
 
-`around-extensions` is a **library crate**, not a standalone process.
-Binary crates (CLI, GUI, Web‑UI server) link it, create their own
-`Framework`, and wire loaded extensions into their domain‑specific
-registries (e.g. `CodecRegister` → `CodecRegistry`).  The framework
-itself knows no concrete Slot types — it only sees `RegisterVTable`.
+`around-extensions` is a library, not a process. Binaries create a `Framework`
+and connect its loaded entries to domain Registers. The framework sees only
+`RegisterVTable`, never concrete Slots.
 
 ## Status
 

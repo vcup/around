@@ -1,9 +1,8 @@
 # ADR 0001: Documentation Language Convention
 
-English is the default authoring language for all project documentation
-(CONTEXT.md, ADRs, READMEs, specs, doc comments). Agent thinking and code
-output default to English. Agent conversations with the user may be in
-Chinese.
+Project documentation uses English as its authoritative language. User-facing
+agent conversations may use Chinese; a Chinese mirror may be added when its
+maintenance cost is justified.
 
 ## Status
 

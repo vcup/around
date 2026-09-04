@@ -1,9 +1,8 @@
 # ADR 0005: Single-Engine Multi-Stream Architecture
 
-The Engine manages 0..N concurrent playback Streams within a single process.
-Each Stream is an independent decode loop feeding a lock-free ring buffer
-consumed by the CPAL output callback. The Engine is the routing matrix — not
-a single-playback session.
+One Engine manages 0..N concurrent Streams. Each Stream decodes into a
+lock-free ring consumed by its CPAL output callback; the Engine is the routing
+matrix, not a playback-session collection.
 
 ## Status
 
