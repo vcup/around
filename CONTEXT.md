@@ -287,11 +287,14 @@ _Avoid_: Track ID, handle.
 
 ## FilterChain
 
-An ordered list of user Filters applied inside one Stream decode loop, followed
-by terminal conversion to the exact `output_spec`. The FilterChain owns sample
+An ordered list of user Filters applied inside one Stream decode loop. Format
+negotiation propagates through the chain and selects its terminal output. When
+that output differs from `output_spec`, FilterChain adds the required terminal
+conversion; otherwise it forwards the final Filter output directly. With no
+user Filters, the Codec output format is the candidate. FilterChain owns sample
 rate conversion, channel mapping, interleave conversion, byte order, and PCM
-encoding. It reuses the Stream's PcmBuffer; it does not hand conversion to an
-OutputBinding.
+encoding whenever those transformations are needed. It reuses the Stream's
+PcmBuffer; it does not hand conversion to an OutputBinding.
 
 _Avoid_: Effect chain, audio processing pipeline.
 
@@ -329,10 +332,11 @@ is normalized to interleaved f32.
 ## TerminalConversion
 
 The format-conversion stage owned by FilterChain after user Filters. It
-converts normalized interleaved f32 into the selected OutputDevice
-`SampleSpec`, including sample rate, channel count, interleave, byte order, and
-PCM encoding. It uses stateful linear interpolation and pre-allocated
-PcmBuffer regions; it is not an OutputBinding responsibility.
+converts the negotiated terminal format into the selected OutputDevice
+`SampleSpec` when they differ, including sample rate, channel count,
+interleave, byte order, and PCM encoding. It uses stateful linear
+interpolation and pre-allocated PcmBuffer regions; it is not an OutputBinding
+responsibility. Matching final Filter output follows the direct path.
 
 _Avoid_: device resampler, sink conversion.
 

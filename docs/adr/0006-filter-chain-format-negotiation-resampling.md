@@ -1,11 +1,8 @@
 # ADR 0006: FilterChain — Format-Negotiated Audio Processing with Pluggable Filters
 
-The decode pipeline is a FilterChain: an ordered sequence of user Filters
-terminated by a byte OutputBinding. FilterChain owns terminal conversion and
-produces exact native `SampleSpec` bytes before the OutputBinding ring.
-Format planning chooses an OutputDevice mode, then FilterChain adapts Codec
-output to that mode. Runtime-loadable Filters remain a separate integration
-seam; the built-in terminal conversion is always present.
+The FilterChain ends at the bound OutputBinding's `SampleSpec`. It negotiates
+the final Filter format and either forwards matching output or converts it.
+Runtime-loadable Filters remain a separate integration seam.
 
 ## Status
 
@@ -36,69 +33,63 @@ zero-copy FFmpeg filter-graph processing when available.
 
 ### 1. `output_spec` on every Stream
 
-When playback binds an OutputDevice, the Engine obtains a native
-`SampleSpec` containing rate, channels, interleave, encoding, and byte order.
-OutputSession stores the selected OutputPlan and builds the FilterChain so its
-final output equals that exact `output_spec`. If the binding is lost or the
-device capabilities change, OutputSession obtains a fresh snapshot, rebuilds
-the plan, FilterChain, and OutputBinding, then resumes at the next decode
-block. It does not mutate a live binding's format or replay queued PCM.
+Playback obtains the native `SampleSpec` when it binds an OutputDevice.
+OutputSession stores the resulting OutputPlan and builds the FilterChain to
+that spec. On device loss or capability changes, it replans and rebuilds the
+FilterChain and OutputBinding, then resumes at the next decode block. Queued
+PCM is discarded rather than replayed into a different format.
 
 ### 2. FilterChain — ordered filter list with format negotiation
 
 ```
-Decode[file_fmt] → [user Filters] → terminal conversion → ring[output_spec] → CPAL
+Decode[file_fmt] → [user Filters] → terminal step → ring[output_spec] → CPAL
                                       │
-                                      └─ exact rate/channel/layout/encoding bytes
+                                      ├─ matching output: forward
+                                      └─ otherwise: convert
 ```
 
-Resampling, channel conversion, interleave conversion, byte order, and PCM
-encoding are owned by FilterChain. OutputBinding only validates and queues
-bytes already matching its native `SampleSpec`; it never converts them.
-Filter declarations use `formats_in` / `formats_out` through the format-aware
-Filter ABI. Dynamic Filter registration/configuration remains a separate
-integration task; the built-in terminal conversion is always available.
+The last Filter's declared output formats are the terminal candidates; the
+candidate must be reachable through the preceding Filters. With no user
+Filters, the Codec format is the candidate. The terminal step forwards a
+candidate equal to `output_spec`; otherwise it performs the required rate,
+channel, interleave, byte-order, or encoding conversion. FilterChain owns
+these conversions. OutputBinding only validates and queues bytes matching its
+native `SampleSpec`.
 
-The chain builder retains the user Filter list and adds terminal conversion
-when the final format differs from `output_spec`. Conversion loss is scored
-using the table below, and OutputPlanner evaluates that loss only after
-preference rank and device priority.
+The chain retains the user Filter list. Conversion loss is scored over the
+negotiated terminal format, after preference rank and device priority.
 
 #### 2.1 Format scoring
 
-OutputPlanner evaluates each supported native `OutputDevice` mode for the
-ordered `OutputPreference` list. Preference index is the primary ordering,
-then device priority, then `ConversionLoss` over rate, channels, interleave,
-byte order, and encoding. Native mode quality and default-mode status break
-tied scores deterministically.
+OutputPlanner evaluates every supported native mode for the ordered
+`OutputPreference` list. It ranks preference first, device priority second,
+conversion loss third, then quality rank, default-mode status, sample rate,
+device ID, and mode ID.
 
-The planner does not choose a virtual format independently of a device:
-`OutputBinding` supplies the exact native `SampleSpec`, and FilterChain
-terminal conversion adapts Codec output to it.
+The planner selects a device mode, not an independent virtual format. The
+chain negotiates its terminal format against that mode. With the current empty
+user Filter list, the Codec format is the terminal format and the existing
+source-to-target loss calculation applies.
 
 #### 2.2 Examples
 
 ```
 File: 8000 Hz mono f32 → OutputDevice: 44100 Hz stereo i16
-Chain: decode f32 → TerminalConversion(rate + channels + encoding)
+Chain: decode f32 → terminal conversion (rate + channels + encoding)
 
 File: 48000 Hz stereo f32 → OutputDevice: 48000 Hz stereo f32
-Chain: decode f32 → no terminal conversion
+Chain: decode f32 → terminal step forwards
 ```
 
 ### 3. PcmBuffer — pre-allocated workspace
 
-The decode loop owns one `PcmBuffer` workspace per Stream. It contains a
-decoded f32 region, two f32 processing regions, and a byte output region sized
-from the selected `output_spec`. FilterChain reuses these regions for every
-decode block; the workspace is never grown during playback.
+The decode loop owns one `PcmBuffer` per Stream: a decoded f32 region, two
+processing regions, and an output region sized for `output_spec`. FilterChain
+reuses it for every block and never grows it during playback.
 
-The terminal conversion writes exact packed bytes, including three- and
-six-byte integer encodings when such a target is supplied by an Adapter.
-OutputBinding receives only a frame-aligned view of the byte region.
-
-**No per-block collection allocation is permitted in the production path.**
-Stateful resampling history is allocated when FilterChain is built.
+The terminal step writes frame-aligned bytes, including three- and six-byte
+integer encodings. No per-block collection allocation is permitted;
+stateful resampling history is allocated when the chain is built.
 
 ### 4. Ring buffer — byte transport
 
@@ -129,17 +120,15 @@ I/O to `spawn_blocking`. A future async-native Codec contract may replace this
 Adapter while preserving FilterChain and OutputBinding ownership. Synchronous
 backpressure remains an explicit OutputBinding contract.
 
-### 6. Volume is a Filter
+### 6. Volume
 
-A `Volume` Filter lives in the FilterChain (post-fader position). It accepts
-interleaved f32, multiplies every sample by a gain factor, and is zero-copy.
-The terminal conversion remains separate from user Filter state.
+`Volume` is a zero-copy, interleaved-f32 Filter in the post-fader position.
+Terminal processing remains outside user Filter state.
 
 ### 7. Filter trait — `#[stabby::stabby]`
 
-stabby generates an ABI-stable vtable. The Filter ABI carries explicit
-input/output format descriptors and byte buffers; the host owns both buffers
-for the duration of the call and a Filter may not retain either pointer.
+The ABI carries explicit input/output formats and host-owned byte buffers.
+Filters may not retain the buffers.
 ```rust
 #[repr(C)]
 pub struct AudioBufferC {
@@ -164,74 +153,43 @@ pub trait Filter {
 
 ### 7.1 Filter registration
 
-The format-aware Filter ABI is ready for extension loading, but the Engine
-does not yet instantiate dynamic Filter entries into a Stream's production
-FilterChain. Dynamic Filter discovery, configuration, and lifecycle remain a
-separate follow-up; this ADR fixes the ABI contract and terminal conversion
-ownership.
+The format-aware ABI is ready for extension loading. Dynamic Filter discovery,
+configuration, and instantiation into a Stream remain separate integration work.
 
-### 8. ExtensionManager — unified plugin registry
+### 8. ExtensionManager
 
-Registration mechanics are defined in ADR‑0004 §5.  This section describes
-the audio‑specific payloads and how the Engine stores them.
-A single `.so` may export multiple `{slot}_create` functions — one for
-each Slot it implements — enabling distributable bundles that ship a
-codec alongside a suite of filters in one file.
-
-```rust
-// SDK registries store typed trait objects:
-//   CodecRegister → Vec<DynCodecRef>
-//   FilterRegister → Vec<dynptr!(Box<dyn Filter + Send + Sync>)>
-// Lifecycle managed by around‑extensions via RegisterVTable.
-```
-
-Loading follows ADR‑0004 §5.3 (recursive `load()`), which handles
-dependency resolution, Slot definition, entry registration, and
-lifecycle initialisation.  Trait objects are owned by SDK Registries.
-`remove_by_meta` drops them before `dlclose`.
+Registration follows ADR-0004 §5. A single `.so` may export several
+`{slot}_create` functions, so one extension can provide a Codec and Filters.
+SDK Registers own the trait objects; `remove_by_meta` drops them before
+`dlclose`.
 
 
-### 9. Runtime Filter integrations
+### 9. Runtime Filters and configuration
 
-FFmpeg and other runtime Filter bundles are future Adapters. This ADR does
-not commit the repository to a particular FFmpeg allocator, frame ownership
-scheme, or zero-copy implementation. The current committed implementation
-provides the format-aware Filter ABI and built-in terminal conversion only.
+FFmpeg and other runtime Filter bundles, plus Filter configuration and
+instantiation, are future work. The current OutputSession supplies no user
+Filters; the terminal step converts only when the Codec format differs from
+the selected native mode.
 
-### 10. Filter configuration
+### 10. Device-loss recovery
 
-Filter configuration and dynamic Filter instantiation are future work. The
-current OutputSession passes an empty user Filter list and always builds the
-terminal conversion needed for the selected native OutputDevice mode.
-### 11. Device-loss recovery
-
-When an OutputBinding reports `Lost`, the Stream marks the loss and applies
-its `RecoveryPolicy`. With auto-reconnect enabled, OutputSession obtains a
-fresh DeviceSnapshot, plans a new native mode, creates a new OutputBinding,
-resets TerminalConversion state, and resumes at the next decode block. The
-possibly queued block is discarded; PCM is never replayed into a different
-format. If re-planning fails, the Stream enters `Error`.
-
-The current Engine exposes a single ordered OutputPreference per Stream.
-Device categories and richer fallback policy can be added without changing
-the OutputBinding Seam.
+On `Lost`, auto-reconnect replans the native mode, creates a new binding,
+resets terminal state, and resumes at the next decode block. The queued block
+is discarded. Failed replanning enters `Error`. The current Engine exposes one
+ordered `OutputPreference` per Stream.
 
 ## Consequences
 
 ### Code changes
 
-- `pipeline.rs`: sync and async decode loops submit decoded f32 blocks to
-  OutputSession.
-- `filter_chain.rs`: FilterChain owns terminal rate/channel/interleave/byte
-  order/encoding conversion using pre-allocated PcmBuffer regions.
-- `output_plan.rs`: pure OutputDevice capability model, preference ordering,
-  and conversion-loss scoring.
-- `output_session.rs`: OutputSession plus OutputDiscovery, OutputBinder,
-  OutputBinding, and deterministic MemoryOutputAdapter.
-- `cpal_adapter.rs`: CPAL capability discovery and exact native binding;
-  no conversion occurs in the Adapter.
-- `types.rs`: SampleSpec explicitly contains PcmEncoding and ByteOrder.
-- `filter.rs`: Filter ABI carries input/output AudioFormatC and byte buffers.
+- `pipeline.rs`: decode loops submit f32 blocks to OutputSession.
+- `filter_chain.rs`: terminal negotiation and exact output bytes.
+- `output_plan.rs`: native-mode planning and conversion-loss scoring.
+- `output_session.rs`: planning, binding, backpressure, and recovery.
+- `cpal_adapter.rs`: native capability discovery and exact-format binding;
+  no conversion.
+- `types.rs`: complete `SampleSpec`.
+- `filter.rs`: format-aware Filter ABI.
 ### What this ADR does NOT decide
 
 - The Router (multi-consumer fan-out, beyond this branch).

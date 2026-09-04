@@ -1,9 +1,10 @@
 //! Format-aware FilterChain (ADR-0006).
 //!
 //! Codec output is normalized f32 PCM. FilterChain owns every conversion from
-//! that source format to the exact native `OutputBinding` format, including
-//! sample rate, channel count, interleave, byte order, and encoding. Output
-//! adapters only queue already-encoded bytes.
+//! that source format to the exact native `OutputBinding` format when a
+//! conversion is required, including sample rate, channel count, interleave,
+//! byte order, and encoding. A compatible final Filter output may bypass
+//! terminal conversion; Output adapters only queue already-encoded bytes.
 
 use crate::pcm_buffer::PcmBuffer;
 use around_audio_sdk::filter::{
@@ -19,7 +20,7 @@ pub fn score_format_pair(input: &SampleSpec, output: &SampleSpec) -> u32 {
 const MAX_CHANNELS: usize = 32;
 
 /// Internal in-process Filter seam. Built-in Filters operate on normalized
-/// interleaved f32; the terminal conversion is handled by FilterChain itself.
+/// interleaved f32; terminal conversion is conditional on the final format.
 pub trait Filter: Send + Sync {
   fn process(&mut self, buf: &mut [f32], channels: u8) -> usize;
   fn info(&self) -> FilterInfo;
