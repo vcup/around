@@ -1,28 +1,33 @@
-<!-- SPECKIT START -->
-For additional context about technologies to be used, project structure,
-shell commands, and other important information, read the current plan
-<!-- SPECKIT END -->
-<!-- Keep this block below the SPECKIT block. -->
+# Agent guidance
+
+## Project context
+
+Read the current feature's `plan.md` for technologies, project structure,
+commands, and implementation context. Feature docs live under `specs/`;
+`.specify/feature.json` records the selected feature directory.
+
 ## Agent skills
 
 ### Issue tracker
 
-GitHub Issues on `vcup/around`. See `docs/agents/issue-tracker.md`.
+Issues and PRDs: GitHub Issues on `vcup/around`.
+Follow `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
-Default canonical label strings (no overrides). See `docs/agents/triage-labels.md`.
+Use the canonical labels without overrides.
+See `docs/agents/triage-labels.md`.
 
 ### Domain docs
 
-Single-context repo (transitioning to multi-context when bounded contexts
-emerge). See `docs/agents/domain.md`.
+Single-context: root `CONTEXT.md` and `docs/adr/`; split into multiple contexts
+when bounded contexts emerge. Follow `docs/agents/domain.md` for reading order,
+document precedence, terminology, and decision persistence.
 
 ## Comment preservation
 
-Comments are part of the implementation. When editing existing code, preserve
-comments unless the documented behaviour is intentionally removed or the
-comment is rewritten to remain accurate. Deleting comments as incidental
-formatting or refactoring collateral is prohibited. Any intentionally removed
-comment MUST be replaced by updated documentation when the behaviour remains
-relevant.
+Treat comments as implementation. Preserve them unless the documented behavior
+is intentionally removed or the comment is rewritten for accuracy. Never delete
+comments as formatting or refactoring collateral. If a comment is intentionally
+removed but its behavior remains relevant, you MUST replace it with updated
+documentation.

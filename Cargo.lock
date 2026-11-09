@@ -157,6 +157,7 @@ dependencies = [
  "cpal",
  "crossbeam",
  "kdl",
+ "libc",
  "libloading",
  "parking_lot",
  "prost",

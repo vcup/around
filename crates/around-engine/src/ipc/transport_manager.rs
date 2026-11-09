@@ -20,32 +20,23 @@ use tokio::task::JoinHandle;
 pub(crate) struct TransportManager {
   config: IpcConfig,
   port_path: PathBuf,
-  #[cfg(unix)]
-  unix_socket: PathBuf,
   handles: Vec<JoinHandle<()>>,
 }
 
 impl TransportManager {
   /// Create a new manager from config.
   ///
-  /// Resolves the port file path and (on Unix) the socket path eagerly
-  /// so they are available for the running-instance check.
+  /// Resolves the port file path for discovery and cleanup. Unix discovery
+  /// uses the same ordered candidates as binding and the CLI.
   pub fn new(config: IpcConfig) -> Self {
     let port_path = config
       .port_file_path
       .clone()
       .unwrap_or_else(|| std::env::temp_dir().join("around.port"));
-    #[cfg(unix)]
-    let unix_socket = {
-      let (sp, _) = crate::ipc::transport_unix::resolve_socket_dir();
-      sp
-    };
 
     Self {
       config,
       port_path,
-      #[cfg(unix)]
-      unix_socket,
       handles: Vec::new(),
     }
   }
@@ -63,9 +54,10 @@ impl TransportManager {
 
     #[cfg(unix)]
     {
-      use tokio::net::UnixStream;
-      if UnixStream::connect(&self.unix_socket).await.is_ok() {
-        return Err("another engine instance is already running (unix socket)".into());
+      for path in super::transport_unix::socket_paths(self.config.unix_socket_path.as_deref()) {
+        if tokio::net::UnixStream::connect(path).await.is_ok() {
+          return Err("another engine instance is already running (unix socket)".into());
+        }
       }
     }
 
@@ -108,32 +100,32 @@ impl TransportManager {
     if self.config.enable_platform_native {
       #[cfg(unix)]
       {
-        let bind_result =
-          crate::ipc::transport_unix::bind_unix_socket(self.config.unix_socket_path.as_deref())
-            .await;
-        if let Ok(listener) = bind_result {
-          tracing::info!(
-            "IPC server listening on Unix socket at {}",
-            self.unix_socket.display()
-          );
-          native_ok = true;
-          let eng = engine.clone();
-          let sp = self.unix_socket.clone();
-          let force_json = self.config.force_json;
-          let handle = tokio::spawn(async move {
-            let listener = Arc::new(listener);
-            let accept = move || {
-              let l = listener.clone();
-              Box::pin(async move { l.accept().await.map(|(s, _)| s) })
-                as Pin<Box<dyn Future<Output = io::Result<_>> + Send>>
-            };
-            super::connection::serve(&eng, IpcWire::select(force_json), accept).await;
-            // FR-005: clean up socket file on exit.
-            let _ = std::fs::remove_file(&sp);
-          });
-          self.handles.push(handle);
-        } else {
-          tracing::info!("Unix socket unavailable — using TCP fallback");
+        match crate::ipc::transport_unix::bind_unix_socket(self.config.unix_socket_path.as_deref())
+          .await
+        {
+          Ok(listener) => {
+            tracing::info!(
+              "IPC server listening on Unix socket at {}",
+              listener.path().display()
+            );
+            native_ok = true;
+            let eng = engine.clone();
+            let force_json = self.config.force_json;
+            let handle = tokio::spawn(async move {
+              let listener = Arc::new(listener);
+              let accept = move || {
+                let l = listener.clone();
+                Box::pin(async move { l.accept().await })
+                  as Pin<Box<dyn Future<Output = io::Result<_>> + Send>>
+              };
+              super::connection::serve(&eng, IpcWire::select(force_json), accept).await;
+            });
+            self.handles.push(handle);
+          }
+          Err(err) if err.kind() == io::ErrorKind::AddrInUse => return Err(err.into()),
+          Err(_) => {
+            tracing::info!("Unix socket unavailable — using TCP fallback");
+          }
         }
       }
 

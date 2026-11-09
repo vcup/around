@@ -424,8 +424,20 @@ fn send_over_tcp_stream(
 fn try_unix_socket_command(req: &IpcCommand) -> Result<IpcResponse, Box<dyn std::error::Error>> {
   use std::os::unix::net::UnixStream;
 
-  let socket_path = resolve_unix_socket_path();
-  let stream = UnixStream::connect(&socket_path)?;
+  // Use the server's complete candidate order, including bind-time fallback.
+  // Only retry connection failures; never replay a command on another Unix path.
+  let mut connected = None;
+  let mut last_error = std::io::Error::from(std::io::ErrorKind::NotFound);
+  for path in around_engine::ipc::transport_unix::socket_paths(None) {
+    match UnixStream::connect(path) {
+      Ok(stream) => {
+        connected = Some(stream);
+        break;
+      }
+      Err(err) => last_error = err,
+    }
+  }
+  let stream = connected.ok_or(last_error)?;
   let mut reader = BufReader::new(&stream);
   let mut writer = BufWriter::new(&stream);
 
@@ -437,20 +449,6 @@ fn try_unix_socket_command(req: &IpcCommand) -> Result<IpcResponse, Box<dyn std:
   let mut response = String::new();
   reader.read_line(&mut response)?;
   Ok(serde_json::from_str(response.trim_end())?)
-}
-
-/// Resolve the Unix socket path (mirrors engine's resolve_socket_dir).
-#[cfg(unix)]
-fn resolve_unix_socket_path() -> std::path::PathBuf {
-  if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-    return std::path::PathBuf::from(&dir)
-      .join("around")
-      .join("around.sock");
-  }
-  if let Ok(dir) = std::env::var("TMPDIR") {
-    return std::path::PathBuf::from(&dir).join("around.sock");
-  }
-  std::env::temp_dir().join("around.sock")
 }
 
 /// Try to send a command via the Windows named pipe.
@@ -492,7 +490,10 @@ fn cmd_pause(
   let resp = send_ipc_command(&req, remote)?;
   match resp.status {
     ResponseStatus::Ok => println!("Paused."),
-    ResponseStatus::Error => eprintln!("Error: {}", resp.message.as_deref().unwrap_or("unknown")),
+    ResponseStatus::Error => {
+      let msg = resp.message.as_deref().unwrap_or("unknown");
+      return Err(msg.into());
+    }
   }
   Ok(())
 }
@@ -505,7 +506,10 @@ fn cmd_resume(
   let resp = send_ipc_command(&req, remote)?;
   match resp.status {
     ResponseStatus::Ok => println!("Resumed."),
-    ResponseStatus::Error => eprintln!("Error: {}", resp.message.as_deref().unwrap_or("unknown")),
+    ResponseStatus::Error => {
+      let msg = resp.message.as_deref().unwrap_or("unknown");
+      return Err(msg.into());
+    }
   }
   Ok(())
 }
@@ -533,7 +537,10 @@ fn cmd_seek(
   let resp = send_ipc_command(&req, remote)?;
   match resp.status {
     ResponseStatus::Ok => println!("Seeked to {position}s."),
-    ResponseStatus::Error => eprintln!("Error: {}", resp.message.as_deref().unwrap_or("unknown")),
+    ResponseStatus::Error => {
+      let msg = resp.message.as_deref().unwrap_or("unknown");
+      return Err(msg.into());
+    }
   }
   Ok(())
 }
@@ -546,7 +553,10 @@ fn cmd_stop(
   let resp = send_ipc_command(&req, remote)?;
   match resp.status {
     ResponseStatus::Ok => println!("Stopped."),
-    ResponseStatus::Error => eprintln!("Error: {}", resp.message.as_deref().unwrap_or("unknown")),
+    ResponseStatus::Error => {
+      let msg = resp.message.as_deref().unwrap_or("unknown");
+      return Err(msg.into());
+    }
   }
   Ok(())
 }
@@ -595,7 +605,8 @@ fn cmd_status(
       println!("State: idle");
     }
   } else {
-    eprintln!("Error: {}", resp.message.as_deref().unwrap_or("unknown"));
+    let msg = resp.message.as_deref().unwrap_or("unknown");
+    return Err(msg.into());
   }
   Ok(())
 }
@@ -704,9 +715,17 @@ fn cmd_serve(daemon: bool) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_shutdown(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
   let req = IpcCommand::Shutdown;
-  let _resp = send_ipc_command(&req, remote)?;
-  println!("Shutdown sent.");
-  Ok(())
+  let resp = send_ipc_command(&req, remote)?;
+  match resp.status {
+    ResponseStatus::Ok => {
+      println!("Shutdown sent.");
+      Ok(())
+    }
+    ResponseStatus::Error => {
+      let msg = resp.message.as_deref().unwrap_or("unknown error");
+      Err(msg.into())
+    }
+  }
 }
 
 fn cmd_cleanup(remote: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
